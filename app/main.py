@@ -1,0 +1,27 @@
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+
+from app.api import chat, health, recommendations
+from app.config import settings
+from app.logging_config import RequestContextMiddleware, configure_logging
+
+configure_logging(settings.log_level)
+
+app = FastAPI(title="DUA Scent AI Core Backend")
+
+# Nothing in the current architecture calls this service from a browser (Node's Shopify adapter
+# is the only caller, server to server, where CORS doesn't apply) -- allowed_origins defaults to
+# empty (no browser origin allowed) rather than "*", configurable via ALLOWED_ORIGINS should that
+# ever change.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=settings.allowed_origins_list,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+app.add_middleware(RequestContextMiddleware)
+
+app.include_router(health.router)
+app.include_router(chat.router)
+app.include_router(recommendations.router)
