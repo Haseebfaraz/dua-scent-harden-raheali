@@ -1,0 +1,43 @@
+# Render Blueprint for the DUA Scent AI Core Backend. No real secrets here -- every value below
+# is either a placeholder Render will prompt for (sync: false) or a literal, non-sensitive default.
+services:
+  - type: web
+    name: dua-scent-ai-python
+    runtime: python
+    plan: starter
+    buildCommand: pip install --no-cache-dir .
+    startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /health
+    envVars:
+      - key: APP_ENV
+        value: production
+      - key: LOG_LEVEL
+        value: INFO
+      - key: DATABASE_URL
+        sync: false
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: OPENAI_MODEL
+        sync: false
+      - key: OPENAI_TEMPERATURE
+        value: "0.3"
+      - key: OPENAI_TIMEOUT_SECONDS
+        value: "30"
+      - key: OPENAI_COPY_MODEL
+        value: gpt-4.1-mini
+      - key: OPENAI_COPY_TEMPERATURE
+        value: "0.5"
+      - key: ODOO_PING_URL
+        sync: false
+      - key: ODOO_INVENTORY_URL
+        sync: false
+      - key: ODOO_INVENTORY_API_KEY
+        sync: false
+      - key: ODOO_INVENTORY_CACHE_TTL_SECONDS
+        value: "60"
+      - key: CUSTOMER_KEY_HASH_SALT
+        sync: false
+      - key: INTERNAL_API_KEY
+        sync: false
+      - key: ALLOWED_ORIGINS
+        value: ""
