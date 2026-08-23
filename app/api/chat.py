@@ -118,4 +118,8 @@ async def chat_action(body: ChatRequest, session: AsyncSession = Depends(get_ses
             logger.error("Action error: %s", err, exc_info=True)
             yield _sse_line({"type": "error", "error": "Error processing request."})
 
-    return StreamingResponse(_stream(), media_type="text/event-stream")
+    return StreamingResponse(
+        _stream(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
+    )

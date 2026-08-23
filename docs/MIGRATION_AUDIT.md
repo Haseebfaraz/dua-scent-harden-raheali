@@ -84,6 +84,16 @@ Scope this correctly if re-estimating remaining work.
 confirmed as real, currently-emitted events by reading the JS reference's tool dispatcher in full
 (not just `chat.jsx` alone, where a couple of these are only named in a comment).
 
+**Widget consumption note** (found during the Integration & Parity Gate, see §9): the storefront
+widget (`extensions/chat-bubble/assets/chat.js`) only has `switch` cases for `id`, `chunk`,
+`message_complete`, `end_turn`, `error`, `rate_limit_exceeded`, `preview_ready` (handled specially,
+checked before the switch), `auth_required`, `product_results`, `combination_recommendations`,
+`recommendation_refined`, `tool_use`, `new_message`, `content_block_complete`. It has **no case**
+for `profile_progress`, `analysis_progress`, `candidate_products`, or `recommendation_selected` —
+they are real events the tool dispatcher emits, but the widget silently no-ops on them today. This
+is pre-existing JS behavior, not something the Python port changed or should "fix" unasked; noted
+here so a future SSE contract change doesn't mistake "widget ignores it" for "event doesn't exist."
+
 ### Environment variables
 
 See `.env.example` for the full list. Departures from the original generic template worth calling
@@ -132,12 +142,92 @@ than the production data actually is.
 | Tool Executor / Auto-Confirm | `fragranceAgentTools.server.js` | `test_tool_executor_*.py` | Verified against live shared DB; found and fixed a real SQLAlchemy transaction-rollback bug during this pass | Yes |
 | Refinement Adjustments | `fragranceAgentTools.server.js` (`deriveRefinementAdjustments`) | `test_refinement.py` | Verified vs. real fixtures | Yes |
 | Prompt / Early-Phase Gate | `chat.jsx` | `test_prompt.py` | Verified vs. real fixtures | Yes |
-| Chat/SSE (FastAPI endpoint) | `chat.jsx` | `test_chat_api.py` | Verified via TestClient + one real live round trip (real OpenAI call, real DB persistence, through the actual Node proxy) | Yes, pending Phase 9 |
+| Chat/SSE (FastAPI endpoint) | `chat.jsx` | `test_chat_api.py` | Verified via TestClient + one real live round trip (real OpenAI call, real DB persistence, through the actual Node proxy); Integration & Parity Gate (§9) re-confirmed the contract byte-for-byte and fixed two boundary gaps (timeouts, SSE headers) | Yes, pending Phase 9 and DB-backed re-verification |
 
 **Phase 9 (genuine end-to-end against a live Shopify storefront — real customer login, real
 theme, Save Build/Add to Cart)** has not been run by an agent in this environment; it requires a
 live Shopify dev store and tunnel. Everything up to and including the Node↔Python HTTP boundary
 has been proven with a real request/response round trip, not just mocks.
+
+## 9. Integration & Parity Gate (2026-08-24)
+
+Boundary review of the three uncommitted Node-adapter files plus a live contract comparison
+between the committed (pre-Phase-8) `chat.jsx` — the last version that assembled SSE frames
+itself — and the new FastAPI `/internal/chat`. Runtime code was treated as the source of truth
+over any prior doc/comment claims.
+
+**Adapter boundary — confirmed clean.** `chat.jsx` imports only `resolveShopDomain`; no
+recommendation/scoring/OpenAI import exists in the file. `hasConcreteContext` is still exported
+from it, but only so `chatFlow.test.js` keeps passing — it is dead code on the live request path
+(the real gate is `app/ai/prompt.py`'s `has_concrete_context` in this repo). The admin dashboard
+route `app.customers.$conversationId.jsx` reads persisted rows straight from Prisma for display;
+the one hit on "recommendationEngine" there is a comment, not a call. No JS business logic
+executes on the customer-facing path anymore.
+
+**Contract comparison result: byte-level match**, with two real gaps found and fixed in this pass:
+
+| Checklist item | Result |
+|---|---|
+| Request payload compatibility | Match — `ChatRequest` field-for-field vs. the JSON body `chat.jsx` sends |
+| Conversation/session ID handling | Match — same `id` event / mint-if-absent semantics |
+| Internal API-key auth | Match — `X-Internal-Api-Key` / `INTERNAL_API_KEY` both sides; `test_history_rejects_missing_or_wrong_internal_secret` and `test_post_chat_rejects_missing_internal_secret` pass |
+| HTTP status/error propagation | Match — history loader forwards Python's real status; the POST action always returns 200 with an in-band `error` SSE frame on any failure, exactly like the JS original's own catch block |
+| Timeouts | **Gap, fixed** — every Python outbound call (OpenAI/DB/Odoo/geocoding) already had an explicit timeout, but neither of Node's two `fetch()` calls to Python did. Added `signal: AbortSignal.timeout(45_000)` to both in `chat.jsx` |
+| SSE headers | **Gap, fixed** — Node always set `Cache-Control: no-cache` / `Connection: keep-alive` on its own response to the widget (so the widget was never actually affected), but Python's `StreamingResponse` didn't set them on the Node→Python hop. Added explicitly in `app/api/chat.py` |
+| SSE event names | Match — `id`/`chunk`/`message_complete`/`end_turn`/`error`/`preview_ready`/`profile_progress`/`analysis_progress`/`candidate_products`/`recommendation_selected`/`combination_recommendations`, verified against the JS tool dispatcher, not just `chat.jsx` |
+| SSE payload shapes | Match — same camelCase keys preserved verbatim in Python's dict payloads (`missingFields`, `candidateProducts`, `recommendationId`, `previewUrl`, ...) since these are wire keys, not Python identifiers |
+| Streaming/chunk behavior | Match — event order is identical: `id` → tool `sseEvents` in order → `chunk` → `message_complete` → `end_turn` |
+| Client disconnect handling | Not independently tested (needs a live streamed client); both sides use standard async generators/ReadableStreams with no custom disconnect handling, same as the JS original |
+| `preview_ready` | Match — `recommendationId`/`previewId`/`previewUrl` keys identical; the widget's `handlePreviewReady` special-case (checked before its type switch) needs no changes |
+| Recommendation ID propagation | Match — internal ids never appear in model-facing reply text, only in structured SSE fields, in both implementations |
+| Refinement/recreate behavior | Match at the code level (`refinement.py`, `legacy_preview_recovery.py`); full behavioral parity blocked on DB, see below |
+| Persisted conversation/profile rehydration | Match at the code level; blocked on DB for a live-data check, see below |
+
+**Non-DB test results**: 226 passed / 0 failed (after fixing one stale assertion in
+`tests/test_health.py` that predated the `service` field being added to `/health`, and confirming
+the SSE header addition doesn't break anything).
+
+**DB-backed test results**: blocked. The shared Render Postgres instance was unreachable for the
+entire duration of this session (`asyncpg.exceptions.ConnectionDoesNotExistError`), confirmed
+external by an identical failure against the **JS reference repo's own Vitest suite** in the same
+session (144 failures, all `PrismaClientInitializationError: Server has closed the connection` —
+same root cause, not a Python-side regression). This blocks `test_customer_profile.py`,
+`test_location_verification.py`, `test_product_catalog.py`, `test_order_history.py`,
+`test_combination_analysis.py`, `test_recommendation_engine.py`, `test_recommendation_confirmation.py`,
+`test_odoo_inventory.py`, `test_inventory_snapshot.py`, `test_legacy_preview_recovery.py`,
+`test_tool_executor_flow.py`, `test_tool_executor_profile.py`, and two DB-touching cases inside
+`test_chat_api.py` (`test_history_empty_for_unknown_conversation`,
+`test_post_chat_streams_expected_sse_event_sequence`). All of these passed in the first full run
+recorded earlier in this migration (see the parity table above) — this is a re-verification gap,
+not a known regression. **Re-run this set the moment the DB is reachable again before treating
+parity as re-confirmed.**
+
+**End-to-end local test**: partially run. The full flow (profile update → candidate analysis →
+Hybrid/Tribrid/Quadbrid generation → scoring → Odoo feasibility → persistence → `preview_ready` →
+storefront preview page → Save Build/Add to Cart) needs the same live DB on both the Node and
+Python sides (`resolveShopDomain()` itself is a Prisma read), so it could not be exercised while
+the DB was down. What *was* verified live: a full `/internal/chat` request through FastAPI's real
+ASGI stack (via `TestClient`, not mocks) correctly caught the DB outage mid-request and degraded to
+a single in-band `error` SSE frame at HTTP 200 — no crash, no partial/malformed stream, no fallback
+to any JS engine (there is no code path capable of that on the Python side).
+
+**Failure-case results**:
+
+| Case | Result |
+|---|---|
+| Database unavailable | **Live-verified.** Real `ConnectionDoesNotExistError` mid-request, caught by `chat_action`'s outer `try/except`, logged server-side with full traceback, single `error` SSE frame sent, HTTP 200. |
+| OpenAI timeout/failure | Code-verified exact parity: `call_openai_once` returns `None` on `httpx.TimeoutException` or any other error (never raises, never logs the key), and `call_ai` returns the byte-identical fallback text `"Sorry, I'm having trouble reaching the fragrance engine right now."` that the JS reference (`chat.jsx` line 637, pre-Phase-8) also returns. |
+| Invalid internal API key | **Live-verified** via `test_history_rejects_missing_or_wrong_internal_secret` / `test_post_chat_rejects_missing_internal_secret` — 401, no request processed. |
+| Python service unavailable (from Node) | Code-verified: `chat.jsx`'s try/except around both `fetch()` calls degrades to an empty history (`{"messages": []}`) or a single `error` SSE frame — never a crash, never a call into any JS recommendation module. |
+| Malformed Python response | Code-verified: Node passes Python's raw stream body straight through without parsing it; the widget's own per-line `JSON.parse` is wrapped in try/catch and skips unparseable lines without aborting the stream. |
+| SSE stream interruption | Same mechanism as above — a truncated/malformed frame is skipped client-side, not fatal. |
+| Odoo timeout / missing mapping / confirmed-insufficient inventory | Ported and previously verified in `test_odoo_inventory.py`/`test_tool_executor_auto_confirm.py` (WARN semantics: only `CONNECTED`+insufficient counts as confirmed-insufficient); blocked for re-verification by the same DB outage. |
+
+**No silent fallback to the JS engine exists or was added.** Python has no import path to any JS
+recommendation module (impossible across the process/language boundary), and Node's adapter has no
+recommendation/scoring imports left after Phase 8 — every failure path returns either a real
+partial-degradation message or a synthetic `error` event, never a call into `recommendationEngine.server.js`
+or its siblings.
 
 ## Main migration risks (carried over, still relevant)
 
@@ -160,3 +250,7 @@ has been proven with a real request/response round trip, not just mocks.
    with `NullPool` (required for pytest-asyncio's per-test event loop). Fine for correctness:
    revisit with a real connection pool once tests run against a local/CI database under one
    long-lived event loop.
+7. **DB-backed re-verification is outstanding** — the Integration & Parity Gate (§9) ran while the
+   shared Postgres instance was down; 13 DB-backed test files (previously all-passing) and the
+   full profile→recommendation→Odoo→preview end-to-end flow still need one clean re-run against a
+   reachable DB before staging deployment.
