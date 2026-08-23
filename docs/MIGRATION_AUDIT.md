@@ -254,3 +254,37 @@ or its siblings.
    shared Postgres instance was down; 13 DB-backed test files (previously all-passing) and the
    full profile→recommendation→Odoo→preview end-to-end flow still need one clean re-run against a
    reachable DB before staging deployment.
+
+## 10. Staging Readiness Check (2026-08-24)
+
+Attempted the full staging-readiness pass requested for this repo. The shared Render Postgres
+instance was checked again at the start of this pass and was still unreachable (same
+`ConnectionDoesNotExistError` as §9) — this is now confirmed down across two separate sessions, not
+a brief blip; worth checking the instance's status directly in the Render dashboard (e.g. a
+free-tier instance that's been suspended, or a credential/network change) rather than assuming it
+will self-recover. Per instruction, no application code was changed to route around this, and
+nothing DB-dependent below is marked passing on the strength of code review alone.
+
+| Area | Status | Notes |
+|---|---|---|
+| Non-DB Python tests | PASS | 226/226 (unchanged since §9) |
+| DB-backed Python tests (13 files) | BLOCKED | DB unreachable; last known-good run was 100% passing, needs re-run |
+| JS reference DB-backed tests | BLOCKED | Same shared DB; 144 failures in §9 all traced to `PrismaClientInitializationError` |
+| Full Python test suite | BLOCKED | Cannot run to completion without the DB |
+| Prisma vs SQLAlchemy schema/model diff | NOT RUN | Needs a live DB round trip (write via one, read via the other) to confirm, not just static model comparison |
+| Full local end-to-end flow (chat → preview_ready) | BLOCKED | Needs DB on both sides (`resolveShopDomain()` alone is a Prisma read) |
+| Recommendation parity fixture sweep (preference/dislike/type/geography/season matrix) | BLOCKED | Needs the real catalog + order-history data in Postgres; the existing ported test suites (`test_recommendation_engine.py`, `test_order_history.py`, `test_compatibility.py`) already cover most of these dimensions with real fixtures and passed 100% in the last DB-reachable run, but a fresh fixture-by-fixture JS-vs-Python diff run was not possible this session |
+| Odoo validation matrix | BLOCKED for the DB-touching cases | `test_odoo_inventory.py`/`test_tool_executor_auto_confirm.py` cover this exact matrix (WARN semantics, ratio-vs-oil-portion math) and passed previously; Odoo HTTP itself is mocked in these tests so an actual live-Odoo-timeout/auth-failure call was not separately exercised beyond what's mocked |
+| Persistence compatibility (Conversation/Message/CustomerProfileState/FragranceRecommendation/RecommendationInventorySnapshot/RecommendationInventoryComponent) | BLOCKED | Needs a live write-then-read round trip; the earlier Phase 8 real round trip (before this repo's split) proved this once, but wasn't re-run here |
+| Conversation rehydration across a process restart | NOT RUN | Needs DB |
+| Node ↔ FastAPI integration/contract | PASS | Verified in §9 (this session only re-confirmed no regression since) |
+| SSE parity | PASS | Verified in §9 |
+| Secret scan (new repo) | PASS | No `.env`, keys, or credentials ever committed, in any commit — checked full history, not just HEAD |
+| Fresh-clone/install/start/health check | PASS | Clean clone → fresh venv → `pip install -e ".[dev]"` → real `uvicorn app.main:app --host 0.0.0.0 --port $PORT` → `GET /health` → `{"status":"ok","service":"dua-scent-ai-python"}`, HTTP 200. No dependency on any dev-machine-only file. |
+| Render config (`render.yaml`, `Dockerfile`, `.env.example`, `README.md`) | PASS (reviewed) | Matches the settings module field-for-field; `Dockerfile` reviewed but not container-built (Docker isn't available in this environment) |
+| Live Shopify storefront integration (widget → App Proxy → Node → Python → SSE → widget) | BLOCKED — environment limitation, not a code gap | This environment has no Shopify dev store, Partner account, or tunnel; there is no supported way to exercise the real storefront here. This needs to be run from a machine with the actual Shopify CLI/dev-store/tunnel setup. |
+| Save Build | BLOCKED | Depends on the live storefront integration above |
+| Add to Cart | BLOCKED | Depends on the live storefront integration above |
+| Failure chain through the full stack (Storefront → Node → Python) | BLOCKED for most cases | `resolveShopDomain()` in `chat.jsx` hits Postgres before Python is ever called, so almost every full-chain failure case needs the DB up; the Python-only failure paths (OpenAI timeout/malformed response, invalid `X-Internal-Api-Key`, a genuine DB outage caught mid-request) were live- or code-verified in §9 and still hold |
+
+**Verdict: NOT READY FOR STAGING.** Every blocker above is external-infrastructure or external-environment (shared Postgres down; no Shopify dev store/tunnel available here) — nothing in this pass found a code-level migration regression. Once the DB is confirmed reachable, re-run the DB-backed suite and the full local end-to-end flow; the live Shopify/Save-Build/Add-to-Cart checks need to happen on a machine with real Shopify dev-store access, which this sandbox does not have.
