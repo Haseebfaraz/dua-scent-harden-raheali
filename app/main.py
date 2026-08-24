@@ -1,7 +1,10 @@
+from pathlib import Path
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 
-from app.api import chat, health, recommendations
+from app.api import chat, health, preview, recommendations
 from app.config import settings
 from app.logging_config import RequestContextMiddleware, configure_logging
 from app.shopify import webhooks as shopify_webhooks
@@ -27,3 +30,5 @@ app.include_router(health.router)
 app.include_router(chat.router)
 app.include_router(recommendations.router)
 app.include_router(shopify_webhooks.router)
+app.include_router(preview.router)
+app.mount("/static", StaticFiles(directory=str(Path(__file__).resolve().parent / "static")), name="static")

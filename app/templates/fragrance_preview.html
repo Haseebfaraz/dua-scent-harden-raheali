@@ -1,0 +1,101 @@
+<!-- Port of apps.scent-library.fragrance-preview.jsx's default export (FragrancePreview). Same
+     layout, same copy, same three.js bottle, same slider/rename/recreate/save-build/add-to-cart
+     behavior -- server-rendered once here instead of via React SSR + hydration; all interactivity
+     lives in fragrance_preview.js, reading this page's own initial data from
+     window.__PREVIEW_DATA__ the same way the JS original read it from useLoaderData(). -->
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>{{ data.name }} — DUA Scent</title>
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Cormorant+Garamond:wght@400;500;600&family=Work+Sans:wght@300;400;500;600&display=swap" />
+  <link rel="stylesheet" href="/static/css/fragrance_preview.css" />
+  <script type="importmap">
+    {
+      "imports": {
+        "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+        "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+      }
+    }
+  </script>
+</head>
+<body>
+  <div class="cs-page">
+    <div id="preview-loading" class="cs-loading-overlay" style="display: none;">
+      <div class="cs-loading-spinner"></div>
+      <div id="preview-loading-text" class="cs-loading-text"></div>
+    </div>
+
+    <div class="cs-hero">
+      <div class="cs-hero-left">
+        <div class="cs-eyebrow">The Digital Atelier</div>
+        <textarea id="preview-title" class="cs-title-input" aria-label="Fragrance name" rows="1">{{ data.name }}</textarea>
+        <div class="cs-title-edit-hint">&#9998; Click to rename</div>
+
+        <div class="cs-notes">
+          {% for position, label in [("top", "Top Notes"), ("middle", "Middle Notes"), ("base", "Base Notes")] %}
+          <div class="cs-note-row" data-position="{{ position }}">
+            <div class="cs-note-label">
+              <span>{{ label }}</span>
+              <span class="cs-note-pct">{{ data.ratios[position] | round | int }}%</span>
+            </div>
+            <div class="cs-note-notes-text">{{ data.buckets[position] | join(" · ") }}</div>
+            <input type="range" class="cs-slider" min="0" max="100" value="{{ data.ratios[position] | round | int }}" />
+          </div>
+          {% endfor %}
+        </div>
+      </div>
+
+      <div class="cs-bottle-stage">
+        <div id="cs-bottle-3d"></div>
+      </div>
+
+      <div class="cs-profile">
+        <div class="cs-profile-box">
+          <div class="cs-profile-label">Molecular Profile</div>
+          <div class="cs-pill-grid">
+            {% for note in data.profilePills %}
+            <span class="cs-pill">{{ note }}</span>
+            {% endfor %}
+          </div>
+        </div>
+
+        <div class="cs-feature-row">
+          <div class="cs-feature-icon">&#9879;</div>
+          <div>
+            <div class="cs-feature-title">Lab Certified</div>
+            <div class="cs-feature-sub">Phthalate &amp; Paraben Free</div>
+          </div>
+        </div>
+        <div class="cs-feature-row">
+          <div class="cs-feature-icon">&#8734;</div>
+          <div>
+            <div class="cs-feature-title">Infinite Refills</div>
+            <div class="cs-feature-sub">Sustainable Glass Program</div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <p id="preview-error" class="cs-error" style="display: none;"></p>
+
+    <div class="cs-actionbar">
+      <div class="cs-actionbar-price">
+        <span id="preview-price" class="cs-price"></span>
+        <span class="cs-price-size">34ML<br />Parfum</span>
+      </div>
+      <div class="cs-actionbar-left">
+        <button type="button" id="btn-recreate" class="cs-btn-ghost">Recreate</button>
+        <button type="button" id="btn-save-build" class="cs-btn-ghost">Save Build</button>
+      </div>
+      <div class="cs-actionbar-right">
+        <button type="button" id="btn-add-to-cart" class="cs-btn-primary">Add to Cart</button>
+      </div>
+    </div>
+  </div>
+
+  <script>window.__PREVIEW_DATA__ = {{ data_json | safe }};</script>
+  <script type="module" src="/static/js/fragrance_preview.js"></script>
+</body>
+</html>

@@ -1,0 +1,272 @@
+/* Port of apps.scent-library.fragrance-preview.jsx's PAGE_STYLES template literal, byte-identical
+   -- visual design matched to the deployed custom-scent-product.liquid theme section. No visual
+   changes made during this migration; only the file location and delivery mechanism changed
+   (React inline <style> -> a plain stylesheet FastAPI serves as a static file). */
+.cs-page {
+  --cs-cream: #F6F1EA;
+  --cs-ink: #2B2229;
+  --cs-wine: #8C4A3C;
+  --cs-taupe: #C9BEB0;
+  --cs-taupe-light: #E5DED3;
+  --cs-white: #FFFFFF;
+  background: var(--cs-cream);
+  color: var(--cs-ink);
+  font-family: 'Work Sans', sans-serif;
+  min-height: 100vh;
+}
+.cs-hero {
+  display: grid;
+  grid-template-columns: 1.1fr 1.3fr 1fr;
+  gap: 44px;
+  padding: 56px 64px;
+  align-items: start;
+}
+.cs-eyebrow {
+  font-size: 15px;
+  letter-spacing: 0.18em;
+  text-transform: uppercase;
+  color: var(--cs-wine);
+  margin-bottom: 16px;
+  opacity: 0;
+  animation: cs-fade-up 0.7s ease forwards 0.1s;
+}
+.cs-title-input {
+  display: block;
+  font-family: 'Cormorant Garamond', serif;
+  font-size: 68px;
+  line-height: 1.05;
+  font-weight: 500;
+  margin: 0 0 6px;
+  border: none;
+  border-bottom: 1px solid transparent;
+  background: transparent;
+  color: var(--cs-ink);
+  width: 100%;
+  padding: 0;
+  opacity: 0;
+  animation: cs-fade-up 0.7s ease forwards 0.25s;
+  resize: none;
+  overflow: hidden;
+  overflow-wrap: break-word;
+}
+.cs-title-input:focus { outline: none; border-bottom-color: var(--cs-taupe); }
+.cs-title-edit-hint {
+  font-size: 13px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--cs-wine);
+  opacity: 0.75;
+  margin: 0 0 22px;
+}
+.cs-notes {
+  margin-top: 8px;
+  opacity: 0;
+  animation: cs-fade-up 0.7s ease forwards 0.4s;
+}
+.cs-note-row { margin-bottom: 28px; }
+.cs-note-label {
+  display: flex;
+  justify-content: space-between;
+  font-size: 17px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  margin-bottom: 9px;
+}
+.cs-note-pct { font-family: 'Cormorant Garamond', serif; font-size: 19px; letter-spacing: 0; }
+.cs-note-notes-text {
+  font-size: 16px;
+  opacity: 0.68;
+  margin-bottom: 12px;
+  line-height: 1.55;
+}
+
+.cs-slider {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 100%;
+  height: 14px;
+  border-radius: 7px;
+  cursor: pointer;
+}
+.cs-slider::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  width: 22px; height: 22px;
+  border-radius: 50%;
+  background: var(--cs-white);
+  border: 3px solid var(--cs-ink);
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.25);
+  cursor: grab;
+}
+.cs-slider::-moz-range-thumb {
+  width: 22px; height: 22px;
+  border-radius: 50%;
+  background: var(--cs-white);
+  border: 3px solid var(--cs-ink);
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.25);
+  cursor: grab;
+}
+.cs-slider::-moz-range-track { background: transparent; }
+
+.cs-bottle-stage {
+  position: relative;
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  min-height: 78vh;
+  background: var(--cs-taupe-light);
+  border-radius: 12px;
+  opacity: 0;
+  animation: cs-fade-in 0.9s ease forwards 0.3s;
+}
+#cs-bottle-3d { width: 100%; height: 100%; min-height: 480px; cursor: grab; }
+
+.cs-profile { opacity: 0; animation: cs-fade-up 0.7s ease forwards 0.5s; }
+.cs-profile-box {
+  border: 1px solid var(--cs-taupe);
+  border-radius: 10px;
+  padding: 26px;
+  margin-bottom: 26px;
+}
+.cs-feature-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  margin-bottom: 18px;
+}
+.cs-feature-icon {
+  width: 44px;
+  height: 44px;
+  flex-shrink: 0;
+  border: 1px solid var(--cs-taupe);
+  border-radius: 10px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 22px;
+}
+.cs-feature-title { font-size: 15px; font-weight: 500; }
+.cs-feature-sub { font-size: 13px; color: var(--cs-wine); opacity: 0.9; }
+
+.cs-loading-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 100;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 16px;
+  background: rgba(246, 241, 234, 0.92);
+}
+.cs-loading-spinner {
+  width: 40px;
+  height: 40px;
+  border-radius: 50%;
+  border: 3px solid var(--cs-taupe-light);
+  border-top-color: var(--cs-wine);
+  animation: cs-spin 0.9s linear infinite;
+}
+.cs-loading-text {
+  font-family: 'Cormorant Garamond', serif;
+  font-size: 20px;
+  color: var(--cs-ink);
+}
+@keyframes cs-spin { to { transform: rotate(360deg); } }
+.cs-profile-label {
+  font-size: 15px;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  opacity: 0.55;
+  margin-bottom: 12px;
+}
+.cs-pill-grid { display: flex; flex-wrap: wrap; gap: 8px; }
+.cs-pill {
+  border: 1px solid var(--cs-taupe);
+  border-radius: 20px;
+  padding: 6px 13px;
+  font-size: 13px;
+  letter-spacing: 0.05em;
+  text-transform: capitalize;
+}
+
+.cs-products-used { list-style: none; margin: 0; padding: 0; font-size: 14px; opacity: 0.7; }
+.cs-products-used li { margin-bottom: 4px; }
+
+.cs-actionbar {
+  position: sticky;
+  bottom: 28px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 18px 32px;
+  background: var(--cs-white);
+  margin: 40px 64px 0;
+  box-shadow: 0px 20px 32px 4px rgb(181 181 181 / 35%);
+  border: 1px solid #ededed;
+  border-radius: 15px;
+  width: 60%;
+  margin: 0px auto;
+}
+.cs-actionbar-price { display: flex; align-items: baseline; gap: 10px; white-space: nowrap; }
+.cs-actionbar-price .cs-price { font-family: 'Cormorant Garamond', serif; font-size: 38px; }
+.cs-actionbar-price .cs-price-size {
+  font-size: 13px; letter-spacing: 0.05em; text-transform: uppercase; opacity: 0.55;
+}
+.cs-actionbar-left, .cs-actionbar-right { display: flex; gap: 12px; align-items: center; }
+.cs-btn-ghost {
+  padding: 13px 22px;
+  border: 1px solid var(--cs-taupe);
+  background: transparent;
+  color: var(--cs-ink);
+  font-size: 14px;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  border-radius: 2px;
+  cursor: pointer;
+  font-family: 'Work Sans', sans-serif;
+  font-weight: 500;
+}
+.cs-btn-ghost:disabled { opacity: 0.5; cursor: default; }
+.cs-btn-primary {
+  padding: 13px 34px;
+  border: none;
+  background: var(--cs-ink);
+  color: var(--cs-cream);
+  font-size: 14px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  border-radius: 2px;
+  cursor: pointer;
+  transition: background 0.25s ease;
+}
+.cs-btn-primary:hover:not(:disabled) { background: var(--cs-wine); }
+.cs-btn-primary:disabled { opacity: 0.5; cursor: not-allowed; }
+.cs-error { color: var(--cs-wine); margin: 0 64px; }
+
+@keyframes cs-fade-up { from { opacity: 0; transform: translateY(14px); } to { opacity: 1; transform: translateY(0); } }
+@keyframes cs-fade-in { from { opacity: 0; } to { opacity: 1; } }
+
+@media (prefers-reduced-motion: reduce) {
+  .cs-eyebrow, .cs-title-input, .cs-notes, .cs-bottle-stage, .cs-profile { animation: none !important; opacity: 1 !important; }
+}
+
+@media (max-width: 1024px) {
+  .cs-hero { grid-template-columns: 1fr; padding: 32px 24px; }
+  .cs-title-input { font-size: 40px; }
+  .cs-bottle-stage { min-height: 50vh; order: -1; }
+  .cs-profile { grid-column: 1 / -1; }
+}
+@media (max-width: 640px) {
+  .cs-hero { padding: 20px 16px; }
+  .cs-title-input { font-size: 32px; }
+  .cs-actionbar { flex-direction: column; align-items: stretch; margin: 0px auto; width: 78%; }
+  .cs-actionbar-price { justify-content: center; }
+  .cs-actionbar-left, .cs-actionbar-right { justify-content: center; flex-wrap: wrap; }
+  .cs-btn-primary { width: 100%; }
+
+  #cs-bottle-3d canvas {
+    width: 320px;
+    height: 260px;
+  }
+}
