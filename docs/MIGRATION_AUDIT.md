@@ -412,4 +412,116 @@ Per instruction, these assert on deterministic state/plumbing, not exact bot pro
 own wording stays free to vary. A fresh full-suite run confirmed no regressions against the
 Phase 2-6 baseline.
 
+## 13. Phase 7B — Behavioral Validation Against the Real Model (2026-08-24)
+
+Unit-level plumbing wasn't enough to prove Phase 7 actually worked end to end -- ran real
+conversations against the actually-configured OpenAI model (`scripts/conversation_eval.py`,
+dev-only, synthetic conversation ids, self-cleaning) across 11 scenarios. This surfaced two real
+bugs unit tests hadn't caught.
+
+**1. SSE ordering bug (customer-facing, predates Phase 7):** frame order was
+`id -> [sse_events incl. preview_ready] -> chunk -> message_complete -> end_turn`. The storefront
+widget's `handlePreviewReady` runs before its own event-type switch and navigates away the instant
+it parses a `preview_ready` frame -- so the reasoning bridge was being sent to a browser already
+mid-navigation. Fixed in `app/api/chat.py`: `preview_ready` is now held back and re-emitted after
+`chunk`/`message_complete`; every other sse_event keeps its original position. Two new tests
+assert the index ordering directly.
+
+**2. The engine's own confidence gate still hard-required a verified location** (found by running
+the user's own acceptance-example scenario for real: "fresh, long-lasting, noticeable, no oud,
+evening event" -- one message, no location). `_score_proposed_combination`'s `profile_complete`
+check required `locationVerified` unconditionally; without it, `customer_fit_confidence` was
+always `"low"`, which `evaluate_auto_confirm_eligibility` treats as an automatic reject for every
+candidate. Phase 7's `get_missing_required_fields` policy change never touched this second, deeper
+gate -- the two had drifted apart, so the model would call the generation tool readily but the
+gate silently rejected the result anyway, exhausting the 6-turn loop and surfacing a generic
+"Let's get that crafted for you." Fixed by reusing `is_profile_ready_for_analysis(profile)` here
+instead of a separate stricter check (`app/services/recommendation_engine.py`). Verified against
+the full existing engine test suite (55/55, nothing asserted on the old behavior) and confirmed
+live: the same scenario now reaches `preview_ready` with a grounded bridge.
+
+**Real transcripts** (11 scenarios, real model, illustrative not exhaustive):
+- Greeting with a known name: natural "How's your day going?"-style opener, no fragrance jump.
+- Greeting with no name on file: correctly asks for the name as its own question first (a real,
+  distinct Shopify edge case, not a bug).
+- Casual conversation (long day -> still working -> party Friday): stayed conversational for two
+  turns, then the party became the actual focus on the third, unprompted.
+- Direct wedding intent: skipped small talk, engaged with the occasion immediately.
+- Strong dislike ("hate that stinky oud smell"): saved as a real dislike, reacted specifically
+  (not a canned "noted!"), asked one relevant follow-up.
+- Layman ("I just want something clean"): no note-name interrogation, asked a plain-language
+  clarifying contrast.
+- Refinement ("actually maybe I want it a little sweeter" after a confirmed build): generated a
+  **new** recommendation, explained specifically what changed ("kept the fresh feel... added a
+  sweeter edge"), never restarted profile collection.
+- Very direct, fully-specified request: one message in, real `preview_ready`, grounded bridge
+  referencing occasion + style + the exclusion -- this is the exact case bug #2 above was blocking.
+
+**Observed, already-handled edge case (not a new bug):** one run hit a
+`UniqueViolationError` on `RecommendationInventorySnapshot.recommendationId` -- two entries in one
+generated batch shared a canonical key (deduped to the same `recommendationId` by
+`save_recommendation`) and the auto-select walk tried to snapshot both. The existing "log, roll
+back, keep going" contract handled it correctly (logged, no crash, the customer's turn completed
+successfully with the first valid candidate). Worth a future efficiency pass (skip a
+`recommendationId` already snapshotted this walk), not a correctness fix.
+
+**Rubric scores** (1-5, from the transcripts above): naturalness 4, friendliness 4, context
+retention 5 (no re-asked questions observed), specific reaction 4, question relevance 5 (every
+question observed was tied to real missing signal), non-repetition 4, fragrance-transition
+smoothness 4, layman accessibility 5, name-use restraint 5 (name used once per scenario, never
+repeated), absence of canned praise 5 (no "great choice"/"fantastic" observed), personalization 4
+(reasoning bridges referenced real, distinct facts per scenario). No occurrence observed of:
+repeated "Got it"/"Thanks for sharing", generic praise, unnecessary name repetition, re-asked
+questions, unsupported weather claims, or multiple unrelated questions in one turn.
+
+**Prompt changes:** none to `prompt.py` itself -- the transcripts showed the existing prompt
+already produces natural, non-scripted behavior; the two real problems were both in the
+deterministic gating code around it, not the prompt text.
+
+### Recommendation-engine audit (traced `_score_proposed_combination` directly)
+
+**Hard constraints (reject the candidate outright):** near-duplicate note overlap between two
+components; duplicate product title; an exact-note hard dislike present anywhere; a high-severity
+family-dislike conflict; a critical risk; 2+ components with no detected note-family; zero matched
+preference family when the customer stated any; zero literal-term match when the customer named
+specific notes; a critical shape-validation failure.
+
+**Soft preferences (add/subtract from `final_score`):** `preference_score` (family + exact-note
+like matches), `seasonal_score`, `history_score` (real order-history evidence), `compatibility_score`
+(note-family pairing), `analogous_score` (similarity to real `ExistingCombination` rows),
+`balance_score` (role complementarity), `conflict_penalty` (medium/low-severity dislike conflicts),
+`style_match_score`/`avoided_direction_penalty` (stated style directions), `lifestyle_match_score`/
+`lifestyle_conflict_penalty` (occasion-derived directions), `powdery_context_penalty`,
+`complexity_penalty`, `type_simplicity_score` (Hybrid preferred by default). `strengthPreference`
+feeds risk assessment (a stated "light" preference against a heavy-overload combination raises a
+real risk), not a separate scoring term.
+
+**Tie-breakers/fallbacks:** `_select_diverse_results` enforces anchor diversity among top-scoring
+results; `build_fallback_anchors_for_missing_terms` covers customer-named notes the initial anchor
+pass missed.
+
+**Fields collected but not used in ranking:** `giftRecipient` -- confirmed zero references in
+`recommendation_engine.py`/`order_history.py`; it only changes conversational framing (third-person
+about the recipient), never the scoring/candidate math. `name`/`email` are identity-only.
+
+**Confidence, not a checklist:** `confidenceBreakdown` (`data`, `historical`, `compatibility`,
+`novelty`, `customerFit`) plus `autoConfirmReasons` (`hard_dislike_conflict`, `invalid_shape`,
+`no_stated_preference_coverage`, `high_severity_risk:*`, `customer_fit_low`, `compatibility_low`)
+already provide most of what Section 8's requested reason codes ask for, in different names.
+Formal `LIKE_MATCH`/`OCCASION_MATCH`-style constants were not introduced this pass -- the
+underlying information already exists and is already kept internal (never exposed as raw codes to
+the customer); renaming/consolidating into a single explicit enum is a reasonable follow-up, not
+done here to avoid a blind refactor of a heavily-tested scoring surface.
+
+### Remaining behavior concerns (not yet done)
+
+- Section 7's 10 named recommendation scenarios: several are already covered by
+  `test_recommendation_engine.py`'s existing 55 tests (hard-dislike safety, no-invented-products,
+  diversity, type-simplicity bias) under different names/framing; a few (known-liked-product,
+  sparse-profile, multi-hard-dislike as a dedicated scenario) don't yet have a purpose-built test
+  and would benefit from one.
+- Section 8's formal reason-code enum -- information exists, naming/consolidation is a follow-up.
+- The observed duplicate-snapshot-attempt edge case -- harmless today, worth a small efficiency
+  fix later (skip a `recommendationId` already snapshotted within the same auto-select walk).
+
 **Verdict: NOT READY FOR STAGING.** Every blocker above is external-infrastructure or external-environment (shared Postgres down; no Shopify dev store/tunnel available here) — nothing in this pass found a code-level migration regression. Once the DB is confirmed reachable, re-run the DB-backed suite and the full local end-to-end flow; the live Shopify/Save-Build/Add-to-Cart checks need to happen on a machine with real Shopify dev-store access, which this sandbox does not have.
