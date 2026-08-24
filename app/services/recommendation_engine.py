@@ -48,6 +48,7 @@ from app.fragrance.scoring import SCORE_WEIGHTS, classify_dislike_conflict, matc
 from app.fragrance.vocabulary import DIRECTION_VOCABULARY, _js_hash, describe_character, direction_for_role, pick_words
 from app.fragrance.weather import has_season_weather_conflict
 from app.services.copy_generation import apply_customer_facing_copy
+from app.services.customer_profile import is_profile_ready_for_analysis
 
 DEFAULT_MAX_RESULTS = 8
 BOTTLE_ML = 34
@@ -614,13 +615,14 @@ def _score_proposed_combination(
     )
 
     evidence_scope = compute_evidence_scope(anchor, profile)
-    # dislikes must be present as a real array (even empty) -- an empty array means "asked, real
-    # answer was none," a missing key means "never asked," and only the former counts as complete.
-    profile_complete = (
-        bool(profile.get("locationVerified"))
-        and isinstance(profile.get("dislikes"), list)
-        and (bool(profile.get("likes")) or bool(profile.get("preferredStyle")))
-    )
+    # Phase 7B: this used to hard-require a verified location -- meaning no conversation could
+    # ever reach "high" customerFit confidence (and therefore autoConfirmEligible) without one,
+    # regardless of how much other signal existed. That directly undercut Phase 7's own
+    # confidence-based readiness policy: a customer could give occasion + style + hard dislikes
+    # (everything is_profile_ready_for_analysis considers "enough to generate") and still get
+    # stuck at customer_fit_confidence="low" forever. Reusing the same readiness check here keeps
+    # the two policies in sync by construction instead of drifting apart.
+    profile_complete = is_profile_ready_for_analysis(profile)
     season_unresolved = has_season_weather_conflict(profile.get("requestedSeasonStyle"), profile.get("weatherDirection")) and profile.get("seasonStyleConflictResolved") is False
 
     if final_score >= 30 and len(risks) == 0:
