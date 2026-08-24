@@ -1,10 +1,9 @@
-"""FastAPI internal chat endpoint -- the Python side of the Node `/chat` proxy boundary (Phase 8).
-Node keeps the public-facing CORS/OPTIONS handling and the customer-facing contract exactly as it
-is today; it forwards here and re-emits these SSE frames to the storefront widget unchanged.
-
-Mirrors app/routes/chat.jsx's loader (history) and action (POST) as closely as the Node/FastAPI
-split allows. shop_domain is passed in explicitly since Python has no access to the Shopify
-Session table Node's resolveShopDomain() reads from.
+"""FastAPI chat endpoints -- both the internal Node-proxy path (Phase 8) and the direct public
+path the storefront widget calls once Node is no longer in the loop (Phase 6). Same underlying
+logic either way; the only difference is auth (a shared internal key for the server-to-server
+hop vs. nothing, since a browser can't safely hold a shared secret) and where shop_domain comes
+from (Node already resolved it; a direct browser call never sends one, so Python resolves it
+itself the same way shopDomain.server.js always did).
 """
 
 import json
@@ -21,6 +20,7 @@ from app.schemas.chat import ChatRequest
 from app.services.conversation import create_or_update_conversation, save_message
 from app.services.customer_profile import get_customer_profile, save_customer_profile_field
 from app.services.legacy_preview_recovery import resolve_legacy_preview_short_circuit
+from app.shopify.sessions import resolve_shop_domain
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -39,8 +39,7 @@ def _sse_line(obj: dict) -> str:
     return f"data: {json.dumps(obj)}\n\n"
 
 
-@router.get("/internal/chat/history", dependencies=[Depends(require_internal_api_key)])
-async def chat_history(conversation_id: str | None = None, session: AsyncSession = Depends(get_session)) -> dict:
+async def _history_payload(session: AsyncSession, conversation_id: str | None) -> dict:
     history = (await get_conversation(session, conversation_id))["history"] if conversation_id else []
 
     if conversation_id:
@@ -55,16 +54,34 @@ async def chat_history(conversation_id: str | None = None, session: AsyncSession
                 logger.error("Failed to persist recreate re-entry message: %s", err)
             await save_customer_profile_field(session, conversation_id, "pendingRecreateRecommendationId", None)
 
-    messages = [
-        {"role": m["role"], "content": m["content"]}
-        for m in history
-        if m.get("role") in ("user", "assistant") and isinstance(m.get("content"), str) and m["content"].strip()
-    ]
-    return {"messages": messages}
+    return {
+        "messages": [
+            {"role": m["role"], "content": m["content"]}
+            for m in history
+            if m.get("role") in ("user", "assistant") and isinstance(m.get("content"), str) and m["content"].strip()
+        ]
+    }
+
+
+@router.get("/internal/chat/history", dependencies=[Depends(require_internal_api_key)])
+async def chat_history(conversation_id: str | None = None, session: AsyncSession = Depends(get_session)) -> dict:
+    return await _history_payload(session, conversation_id)
+
+
+@router.get("/chat")
+async def public_chat_history(history: str | None = None, conversation_id: str | None = None, session: AsyncSession = Depends(get_session)) -> dict:
+    # Matches chat.jsx's loader: only a genuine ?history=true request returns real history, same
+    # as the widget's own fetchChatHistory() call shape -- anything else gets an empty list.
+    if history != "true":
+        return {"messages": []}
+    return await _history_payload(session, conversation_id)
 
 
 @router.post("/internal/chat", dependencies=[Depends(require_internal_api_key)])
+@router.post("/chat")
 async def chat_action(body: ChatRequest, session: AsyncSession = Depends(get_session)) -> StreamingResponse:
+    shop_domain = body.shop_domain or await resolve_shop_domain(session)
+
     async def _stream():
         try:
             user_message = body.message or ""
@@ -79,7 +96,7 @@ async def chat_action(body: ChatRequest, session: AsyncSession = Depends(get_ses
             known_customer_email = body.customer_email.strip() if body.customer_email and "@" in body.customer_email else None
             known_customer_name = body.customer_name.strip() if body.customer_name and body.customer_name.strip() else None
 
-            legacy_short_circuit = await resolve_legacy_preview_short_circuit(session, conversation_id, user_message, known_customer_name, known_customer_email, body.shop_domain)
+            legacy_short_circuit = await resolve_legacy_preview_short_circuit(session, conversation_id, user_message, known_customer_name, known_customer_email, shop_domain)
 
             if legacy_short_circuit:
                 reply_text = "Pulling up your fragrance preview now."
@@ -89,7 +106,7 @@ async def chat_action(body: ChatRequest, session: AsyncSession = Depends(get_ses
                 }]
                 updated_messages = [*history, {"role": "assistant", "content": reply_text}]
             else:
-                result = await call_ai(session, history, conversation_id, known_customer_email, known_customer_name, body.shop_domain)
+                result = await call_ai(session, history, conversation_id, known_customer_email, known_customer_name, shop_domain)
                 reply_text, sse_events, updated_messages = result["replyText"], result["sseEvents"], result.get("updatedMessages")
 
             set_conversation_cache(conversation_id, updated_messages or history)

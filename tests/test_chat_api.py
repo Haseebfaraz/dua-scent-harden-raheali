@@ -73,3 +73,43 @@ def test_post_chat_rejects_missing_internal_secret():
     with TestClient(app) as client:
         response = client.post("/internal/chat", json={"shop_domain": SHOP_DOMAIN, "message": "hi"})
         assert response.status_code == 401
+
+
+# ---- Phase 6: /chat is the direct, public storefront-facing route (no internal key at all) ----
+
+def test_public_chat_history_requires_history_true_flag():
+    with TestClient(app) as client:
+        response = client.get("/chat", params={"conversation_id": f"pytest-public-{uuid.uuid4().hex}"})
+    assert response.status_code == 200
+    assert response.json() == {"messages": []}  # no ?history=true -- matches chat.jsx's loader default
+
+
+def test_public_chat_history_returns_real_history_when_flagged():
+    with TestClient(app) as client:
+        response = client.get("/chat", params={"history": "true", "conversation_id": f"pytest-public-{uuid.uuid4().hex}"})
+    assert response.status_code == 200
+    assert response.json() == {"messages": []}  # unknown conversation -- empty, not an error
+
+
+def test_public_chat_accepts_no_internal_key_at_all(monkeypatch):
+    async def _fake_call_openai_once(messages, use_tools):
+        return {"choices": [{"finish_reason": "stop", "message": {"content": "Hi! What's your name?"}}]}
+
+    monkeypatch.setattr(conversation_flow, "call_openai_once", _fake_call_openai_once)
+
+    conversation_id = f"pytest-public-{time.time()}-{uuid.uuid4().hex[:8]}"
+    with TestClient(app) as client:
+        # No X-Internal-Api-Key header and no shop_domain -- exactly what a direct browser call
+        # looks like once Node is out of the loop.
+        response = client.post("/chat", json={"conversation_id": conversation_id, "message": "hello"})
+    assert response.status_code == 200
+    events = _parse_sse(response.text)
+    assert [e["type"] for e in events] == ["id", "chunk", "message_complete", "end_turn"]
+
+
+def test_internal_route_still_requires_the_key_even_though_public_route_does_not():
+    if not settings.internal_api_key:
+        return
+    with TestClient(app) as client:
+        assert client.post("/internal/chat", json={"message": "hi"}).status_code == 401
+        assert client.post("/chat", json={"message": "hi"}).status_code != 401
