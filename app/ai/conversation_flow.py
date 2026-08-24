@@ -110,16 +110,22 @@ async def call_ai(
                 messages.append({"role": "tool", "tool_call_id": tool_call["id"], "content": result["modelContent"]})
 
                 if (result.get("sseEvent") or {}).get("type") == "preview_ready":
-                    final_text = result["sseEvent"].get("reasoningBridge") or "I've got the blend ready — take a look."
-                    messages.append({"role": "assistant", "content": final_text})
-                    logger.info("CHAT_NEXT_ACTION %s", json.dumps({
-                        "conversationId": conversation_id, "action": "GENERATE", "reason": "preview_ready",
-                        "calledTools": called_tool_names, "profilingQuestionCountBefore": profiling_question_count_before,
-                        "profilingQuestionCountAfter": profiling_question_count_before,
-                    }))
                     preview_ready = True
                     break
             if preview_ready:
+                # The tool-call turn itself carried no text (the model spent its turn calling the
+                # tool) -- one more completion, tools disabled, lets it actually write the
+                # grounded reasoning bridge the tool result just asked for, instead of a canned
+                # line that ignores what the customer said and what got selected.
+                bridge_data = await call_openai_once(messages, False)
+                bridge_message = (bridge_data["choices"][0]["message"] if bridge_data else {})
+                final_text = bridge_message.get("content") or "I've got the blend ready — take a look."
+                messages.append({"role": "assistant", "content": final_text})
+                logger.info("CHAT_NEXT_ACTION %s", json.dumps({
+                    "conversationId": conversation_id, "action": "GENERATE", "reason": "preview_ready",
+                    "calledTools": called_tool_names, "profilingQuestionCountBefore": profiling_question_count_before,
+                    "profilingQuestionCountAfter": profiling_question_count_before,
+                }))
                 persisted_messages = [m for m in messages if m.get("role") != "system"]
                 return {"replyText": final_text, "sseEvents": sse_events, "updatedMessages": persisted_messages}
             continue

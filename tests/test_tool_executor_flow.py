@@ -61,6 +61,12 @@ async def test_generate_emits_preview_ready_for_best_recommendation(db_session):
 
         record = await db_session.scalar(select(FragranceRecommendation).where(FragranceRecommendation.id == result["sseEvent"]["recommendationId"]))
         assert record.status == "confirmed"
+
+        # Phase 7: the model must be handed real, grounded facts about the winning combination so
+        # it can write an actual reasoning bridge -- not just told to say nothing further.
+        assert "whySuits" in result["modelContent"]
+        assert "bestUse" in result["modelContent"]
+        assert "reasoning bridge" in result["modelContent"].lower()
     finally:
         await _cleanup(db_session, conversation_id)
 

@@ -78,7 +78,7 @@ FRAGRANCE_AGENT_TOOLS = [
         "type": "function",
         "function": {
             "name": "get_customer_profile",
-            "description": "Get the customer's current structured fragrance profile and which required fields (city, country, likes-or-preferredStyle) are still missing before analysis can run.",
+            "description": "Get the customer's current structured fragrance profile and, if not yet ready, the single highest-value thing still missing before analysis can run (confidence-based, not a fixed checklist -- a real style direction plus one other high-value signal is enough; city/country are never individually required).",
             "parameters": {"type": "object", "properties": {}},
         },
     },
@@ -86,7 +86,7 @@ FRAGRANCE_AGENT_TOOLS = [
         "type": "function",
         "function": {
             "name": "analyze_customer_product_candidates",
-            "description": "Deterministically score real DUA products against the customer's current profile using real order-history evidence (region, season/weather direction, likes/dislikes, repeat-purchase and popularity signals). Returns up to 10 real ProductCandidate results. Requires city (verified), country, and at least one like or preferredStyle to already be saved on the profile.",
+            "description": "Deterministically score real DUA products against the customer's current profile using real order-history evidence (region, season/weather direction, likes/dislikes, repeat-purchase and popularity signals). Returns up to 10 real ProductCandidate results. Requires a real style direction (likes or preferredStyle) plus at least one other high-value signal (occasion, dislikes, gift context, strength preference, or a verified location) -- city/country alone are never required, and a verified location only helps when one is already known.",
             "parameters": {"type": "object", "properties": {}},
         },
     },

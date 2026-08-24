@@ -242,9 +242,25 @@ async def _auto_select_and_confirm_best(session: AsyncSession, with_ids: list[di
         preview_url = build_preview_url(context["shopDomain"], candidate["recommendationId"])
         _log_preview_event("BEST_RECOMMENDATION_SELECTED", conversation_id=conversation_id, recommendation_id=candidate["recommendationId"], preview_id=candidate["recommendationId"], event_type="preview_ready", preview_url=preview_url)
         _log_preview_event("PREVIEW_READY_EMITTED", conversation_id=conversation_id, recommendation_id=candidate["recommendationId"], preview_id=candidate["recommendationId"], event_type="preview_ready", preview_url=preview_url)
+        grounded_facts = {
+            "type": candidate.get("type"),
+            "whySuits": candidate.get("customerFacingWhySuits"),
+            "bestUse": candidate.get("customerFacingBestUse"),
+            "strength": candidate.get("customerFacingStrength"),
+            "weatherSuitability": candidate.get("customerFacingWeatherSuitability"),
+            "risk": candidate.get("customerFacingRisk"),
+        }
         return {
             "ok": True,
-            "modelContent": f"The best recommendation (recommendationId {candidate['recommendationId']}) was selected and confirmed automatically. The preview page is opening on its own right now — do NOT list any combinations, do NOT ask the customer to pick one, do NOT ask \"how do these sound\", and do NOT say anything further about this turn.",
+            "modelContent": (
+                f"The best recommendation (recommendationId {candidate['recommendationId']}) was selected and confirmed "
+                f"automatically. Real grounded facts about it, and only these: {json.dumps(grounded_facts)}. The preview "
+                "page is opening on its own right now. In this reply, write ONE short, warm reasoning bridge (2-3 "
+                "sentences) that connects 2-3 real details the customer actually told you earlier in this conversation "
+                "to 2-3 real characteristics of this selected blend from the facts above -- grounded only in those, "
+                "never invented. Then stop. Do NOT list multiple combinations, do NOT ask the customer to pick one, do "
+                "NOT ask \"how do these sound\", do NOT ask for confirmation of any kind."
+            ),
             "sseEvent": {"type": "preview_ready", "recommendationId": candidate["recommendationId"], "previewId": candidate["recommendationId"], "previewUrl": preview_url},
         }
 
@@ -514,7 +530,7 @@ async def _handle_analyze_candidates(session: AsyncSession, conversation_id: str
     profile = await get_customer_profile(session, conversation_id)
     missing = get_missing_required_fields(profile)
     if missing:
-        return _fail(f'profile is missing required fields ({", ".join(missing)}) — ask the customer for these before analyzing.')
+        return _fail(f"not enough signal to analyze yet -- still missing: {missing[0]}. Ask a natural follow-up to learn this before calling this tool again.")
     candidate_products = await analyze_customer_product_candidates(session, {**profile, "season": _effective_query_season(profile)})
     _get_scratch(conversation_id, profile)["candidateProducts"] = candidate_products
     if not candidate_products:

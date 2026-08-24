@@ -112,18 +112,33 @@ async def save_customer_profile_fields(
 
 
 def get_missing_required_fields(profile: dict[str, Any]) -> list[str]:
-    missing = []
-    if not profile.get("city") or not profile.get("locationVerified"):
-        missing.append("city")
-    if not profile.get("country"):
-        missing.append("country")
-    if not (profile.get("likes") and len(profile["likes"]) > 0) and not profile.get("preferredStyle") and not profile.get("inferredStyle"):
-        missing.append("likes or preferredStyle")
-    if not profile.get("dislikesAsked"):
-        missing.append("dislikesAsked (ask about dislikes, even if the real answer is none)")
-    if not profile.get("occasionAsked"):
-        missing.append("occasionAsked (ask about occasion, even if the real answer is just everyday)")
-    return missing
+    """Confidence-based readiness, not a fixed checklist (Phase 7): generate as soon as a real
+    style direction plus at least one other high-value signal exists, rather than requiring every
+    specific field to be individually filled in. The recommendation engine itself already
+    produces real results from likes/style alone with zero region/season signal -- city/country
+    were never a technical requirement, only a policy one, and that policy was blocking a
+    confident recommendation on customers who'd already given plenty to go on.
+
+    dislikesAsked/occasionAsked stay as real signals (a deliberately-confirmed "no dislikes" is
+    still worth something) but are no longer individually mandatory -- any one high-value signal
+    is enough once a style direction is known.
+    """
+    has_style_direction = bool(profile.get("likes")) or bool(profile.get("preferredStyle")) or bool(profile.get("inferredStyle"))
+    if not has_style_direction:
+        return ["likes or preferredStyle"]
+
+    high_value_signal_present = any([
+        bool(profile.get("occasion")),
+        bool(profile.get("dislikes")) or bool(profile.get("dislikesAsked")),
+        bool(profile.get("occasionAsked")),
+        bool(profile.get("giftRecipient")),
+        bool(profile.get("strengthPreference")),
+        bool(profile.get("requestedSeasonStyle")),
+        bool(profile.get("city")) and bool(profile.get("locationVerified")),
+    ])
+    if not high_value_signal_present:
+        return ["at least one more high-value signal (occasion, dislikes, gift context, strength preference, or a verified location)"]
+    return []
 
 
 def is_profile_ready_for_analysis(profile: dict[str, Any]) -> bool:
