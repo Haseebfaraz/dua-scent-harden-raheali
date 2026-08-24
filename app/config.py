@@ -34,6 +34,17 @@ class Settings(BaseSettings):
 
     customer_key_hash_salt: str = ""
 
+    # Real names from the reference app's shopify.server.js / shopify.app.toml -- not invented.
+    # Empty defaults so import never fails where these aren't needed yet (e.g. non-Shopify tests);
+    # every real call site must check for a real value before trusting it.
+    shopify_api_key: str = ""
+    shopify_api_secret: str = ""
+    shopify_app_url: str = ""
+    scopes: str = ""
+    # Node hardcodes ApiVersion.October25; shopify.app.toml's [webhooks] separately says 2025-04 --
+    # picking one canonical value here rather than porting that mismatch.
+    shopify_api_version: str = "2025-04"
+
     # Shared secret for the Node Shopify adapter -> this service hop (never customer-facing).
     # Enforced only when set, so local dev without it configured still works.
     internal_api_key: str = ""

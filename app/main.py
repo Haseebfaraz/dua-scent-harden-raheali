@@ -4,6 +4,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.api import chat, health, recommendations
 from app.config import settings
 from app.logging_config import RequestContextMiddleware, configure_logging
+from app.shopify import webhooks as shopify_webhooks
 
 configure_logging(settings.log_level)
 
@@ -25,3 +26,4 @@ app.add_middleware(RequestContextMiddleware)
 app.include_router(health.router)
 app.include_router(chat.router)
 app.include_router(recommendations.router)
+app.include_router(shopify_webhooks.router)

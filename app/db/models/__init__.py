@@ -1,7 +1,10 @@
 """SQLAlchemy models mirroring prisma/schema.prisma exactly (Phase 1: no schema changes).
 
-Only the fragrance/recommendation domain models are ported here -- Session, CustomerToken and
-CodeVerifier stay Prisma/Node-owned (Shopify auth), per the migration audit.
+CustomerToken and CodeVerifier stay unmirrored -- they only ever back the dead customer-account-
+OAuth/MCP cluster (app/auth.server.js, app/mcp-client.js), never imported by any live Node route,
+per the Shopify-port migration audit. Session IS mirrored (read-only from Python's side): the
+merchant's offline access token already lives there from the one real OAuth install Node already
+did, and Python's Shopify Admin GraphQL calls just read it -- no OAuth flow reimplemented.
 
 Prisma has no @@map directives in this schema, so table names are the exact PascalCase model
 names below; most cross-model links are logical string matches, not enforced FKs, exactly as in
@@ -40,6 +43,26 @@ class Message(Base):
     createdAt: Mapped[datetime]
 
     conversation: Mapped["Conversation"] = relationship(back_populates="messages")
+
+
+class Session(Base):
+    __tablename__ = "Session"
+
+    id: Mapped[str] = mapped_column(primary_key=True)
+    shop: Mapped[str]
+    state: Mapped[str]
+    isOnline: Mapped[bool] = mapped_column(default=False)
+    scope: Mapped[str | None]
+    expires: Mapped[datetime | None]
+    accessToken: Mapped[str]
+    userId: Mapped[int | None]
+    firstName: Mapped[str | None]
+    lastName: Mapped[str | None]
+    email: Mapped[str | None]
+    accountOwner: Mapped[bool] = mapped_column(default=False)
+    locale: Mapped[str | None]
+    collaborator: Mapped[bool | None] = mapped_column(default=False)
+    emailVerified: Mapped[bool | None] = mapped_column(default=False)
 
 
 class CustomerAccountUrls(Base):
