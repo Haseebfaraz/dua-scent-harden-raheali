@@ -87,8 +87,10 @@ async def call_ai(
         "customerEmail": confirmed_customer_email, "shopDomain": shop_domain,
     }
 
-    # Up to 6 tool-resolution turns.
-    for turn in range(6):
+    # Up to 10 tool-resolution turns -- 6 wasn't enough headroom for the model to save several
+    # profile fields one at a time (it doesn't batch parallel tool calls) and still reach
+    # analyze_customer_product_candidates/generate_new_product_combinations in the same turn.
+    for turn in range(10):
         data = await call_openai_once(messages, True)
         if not data:
             return {"replyText": "Sorry, I'm having trouble reaching the fragrance engine right now.", "sseEvents": sse_events}

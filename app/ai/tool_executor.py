@@ -538,7 +538,11 @@ async def _handle_analyze_candidates(session: AsyncSession, conversation_id: str
             "No real product candidates found for this profile yet — there may be limited historical data for this exact region/season combination.",
             {"type": "analysis_progress", "candidateProducts": []},
         )
-    return _ok(f"Real product candidates (highest relevance first): {json.dumps(candidate_products)}", {"type": "candidate_products", "candidateProducts": candidate_products})
+    return _ok(
+        f"Real product candidates (highest relevance first): {json.dumps(candidate_products)}\n\n"
+        "Call generate_new_product_combinations now to build real Hybrid/Tribrid/Quadbrid combinations from these candidates -- do not stop here.",
+        {"type": "candidate_products", "candidateProducts": candidate_products},
+    )
 
 
 async def _handle_generate_combinations(session: AsyncSession, conversation_id: str, args: dict, context: dict) -> dict:
