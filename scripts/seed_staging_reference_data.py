@@ -41,11 +41,6 @@ logger = logging.getLogger("seed_staging")
 
 TABLES_IN_ORDER = ["FragranceProduct", "OdooOilMapping", "ExistingCombination", "ProductRegionSummary"]
 
-# jsonb columns on these tables -- verified against prisma/migrations/, no others exist on these
-# four tables. Passed through as raw text with an explicit ::jsonb cast (see _jsonb_param) so the
-# JSON is never re-serialized/re-ordered by a Python json.loads/dumps round trip.
-JSON_COLUMNS = {"FragranceProduct": {"notesJson"}, "ExistingCombination": {"componentProductsJson"}}
-
 DEFAULT_EXPECTED_STAGING_DATABASE = "dua_scent_ai_staging"
 
 
@@ -121,13 +116,25 @@ async def check_staging_empty(conn: asyncpg.Connection, table: str) -> None:
 
 
 def _jsonb_param(value):
+    """Only ever called for a column Postgres itself reported as json/jsonb (see
+    get_jsonb_columns) -- never applied by guessing from the Python value's own type."""
     if value is None or isinstance(value, str):
         return value
     return json.dumps(value)  # only reached if asyncpg ever hands back a decoded object instead of text
 
 
-def _build_insert_sql(table: str, columns: list[str]) -> str:
-    json_cols = JSON_COLUMNS.get(table, set())
+async def get_jsonb_columns(conn: asyncpg.Connection, table: str) -> set[str]:
+    """Schema-driven, not a hardcoded guess -- asks Postgres itself which columns on this table
+    are json/jsonb, so a future migration adding/removing one never silently goes stale here."""
+    rows = await conn.fetch(
+        "SELECT column_name FROM information_schema.columns "
+        "WHERE table_schema = 'public' AND table_name = $1 AND data_type IN ('json', 'jsonb')",
+        table,
+    )
+    return {r["column_name"] for r in rows}
+
+
+def _build_insert_sql(table: str, columns: list[str], json_cols: set[str]) -> str:
     placeholders = [f"${i}::jsonb" if col in json_cols else f"${i}" for i, col in enumerate(columns, start=1)]
     col_list = ", ".join(f'"{c}"' for c in columns)
     return f'INSERT INTO "{table}" ({col_list}) VALUES ({", ".join(placeholders)})'
@@ -150,9 +157,13 @@ async def copy_table(source_conn: asyncpg.Connection, dest_conn: asyncpg.Connect
         logger.info('%s: source has 0 rows -- nothing to copy.', table)
         return 0, 0
 
+    json_cols = await get_jsonb_columns(source_conn, table)
     columns = list(rows[0].keys())
-    insert_sql = _build_insert_sql(table, columns)
-    records = [tuple(_jsonb_param(r[c]) for c in columns) for r in rows]
+    insert_sql = _build_insert_sql(table, columns, json_cols)
+    # Only json/jsonb columns (per the live schema check above) get encoded -- every other
+    # column (datetime, str, int, float, bool, None, ...) is passed through as the native value
+    # asyncpg already fetched, so it round-trips through asyncpg's own type codecs unchanged.
+    records = [tuple(_jsonb_param(r[c]) if c in json_cols else r[c] for c in columns) for r in rows]
 
     try:
         async with dest_conn.transaction():

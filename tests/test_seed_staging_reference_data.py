@@ -2,6 +2,7 @@
 credentials needed -- every asyncpg call is a fake in-memory stand-in."""
 
 import json
+from datetime import datetime
 
 import pytest
 
@@ -13,6 +14,7 @@ from scripts.seed_staging_reference_data import (
     check_staging_empty,
     connect_readonly,
     copy_table,
+    get_jsonb_columns,
     normalize_dsn,
     run_integrity_checks,
     safe_host,
@@ -76,11 +78,17 @@ def test_jsonb_param_passthrough_and_encoding():
     assert _jsonb_param({"a": 1}) == json.dumps({"a": 1})
 
 
-def test_build_insert_sql_casts_only_known_json_columns():
-    sql = _build_insert_sql("FragranceProduct", ["id", "title", "notesJson"])
+def test_build_insert_sql_casts_only_given_json_columns():
+    sql = _build_insert_sql("FragranceProduct", ["id", "title", "notesJson"], {"notesJson"})
     assert sql == 'INSERT INTO "FragranceProduct" ("id", "title", "notesJson") VALUES ($1, $2, $3::jsonb)'
-    sql2 = _build_insert_sql("OdooOilMapping", ["id", "odooSku"])
+    sql2 = _build_insert_sql("OdooOilMapping", ["id", "odooSku"], set())
     assert "::jsonb" not in sql2
+
+
+async def test_get_jsonb_columns_reads_live_schema_not_a_hardcoded_guess():
+    conn = FakeConn(fetch_queue=[[{"column_name": "notesJson"}, {"column_name": "otherJsonCol"}]])
+    cols = await get_jsonb_columns(conn, "FragranceProduct")
+    assert cols == {"notesJson", "otherJsonCol"}
 
 
 # ---------------------------------------------------------------------------
@@ -162,7 +170,9 @@ async def test_copy_table_empty_source_is_a_noop():
 
 async def test_copy_table_successful_copy():
     row = {"id": "p1", "title": "Test", "notesJson": {"top": ["rose"]}}
-    source = FakeConn(fetch_queue=[[row]])
+    # copy_table issues a second `fetch` (get_jsonb_columns) after the row fetch -- both come off
+    # the same FakeConn.fetch_queue, in call order.
+    source = FakeConn(fetch_queue=[[row], [{"column_name": "notesJson"}]])
     dest = FakeConn(fetchval_queue=[1])  # post-copy COUNT(*) == source_count
     result = await copy_table(source, dest, "FragranceProduct")
     assert result == (1, 1)
@@ -172,15 +182,34 @@ async def test_copy_table_successful_copy():
     assert records[0][2] == json.dumps({"top": ["rose"]})  # jsonb column encoded, not passed as dict
 
 
+async def test_copy_table_regression_datetime_and_jsonb_columns_together():
+    """Regression for the real bug: _jsonb_param used to be applied to every column, so a plain
+    datetime value hit json.dumps() and crashed with 'Object of type datetime is not JSON
+    serializable'. Only the column Postgres reports as jsonb may be encoded; the datetime column
+    must survive as a native datetime, not a JSON/ISO string."""
+    created_at = datetime(2026, 1, 1, 12, 30, 0)
+    row = {"id": "p1", "notesJson": {"top": ["rose"]}, "createdAt": created_at}
+    source = FakeConn(fetch_queue=[[row], [{"column_name": "notesJson"}]])
+    dest = FakeConn(fetchval_queue=[1])
+
+    result = await copy_table(source, dest, "FragranceProduct")  # must not raise
+
+    assert result == (1, 1)
+    _, records = dest.executemany_calls[0]
+    columns = list(row.keys())
+    assert records[0][columns.index("notesJson")] == json.dumps({"top": ["rose"]})
+    assert records[0][columns.index("createdAt")] is created_at  # untouched, still a datetime
+
+
 async def test_copy_table_partial_failure_is_rolled_back_and_raises():
-    source = FakeConn(fetch_queue=[[{"id": "p1"}]])
+    source = FakeConn(fetch_queue=[[{"id": "p1"}], []])
     dest = FakeConn(executemany_error=RuntimeError("unique_violation"))
     with pytest.raises(SeedAbort, match="rolled back"):
         await copy_table(source, dest, "FragranceProduct")
 
 
 async def test_copy_table_row_count_mismatch_aborts():
-    source = FakeConn(fetch_queue=[[{"id": "p1"}, {"id": "p2"}]])
+    source = FakeConn(fetch_queue=[[{"id": "p1"}, {"id": "p2"}], []])
     dest = FakeConn(fetchval_queue=[1])  # only 1 landed, source had 2
     with pytest.raises(SeedAbort, match="row-count mismatch"):
         await copy_table(source, dest, "FragranceProduct")
