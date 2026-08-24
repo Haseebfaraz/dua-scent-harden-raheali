@@ -214,3 +214,31 @@ async def mark_recommendation_shopify_product(session: AsyncSession, recommendat
     if record:
         record.shopifyProductId = shopify_product_id
         await session.commit()
+
+
+async def mark_recommendation_draft(session: AsyncSession, recommendation_id: str, *, name: str | None, ratios: dict | None) -> FragranceRecommendation | None:
+    """Port of fragranceBuild.server.js's markRecommendationDraft -- an internal-draft save (no
+    Shopify product/variant, no cart addition), fired every time the preview page's
+    recreate/save_build/add_to_cart action runs, before any Shopify call."""
+    record = await get_recommendation(session, recommendation_id)
+    if not record:
+        return None
+    record.buildStatus = "draft"
+    if name is not None:
+        record.draftName = name
+    if ratios is not None:
+        record.draftRatiosJson = ratios
+    await session.commit()
+    return record
+
+
+async def mark_recommendation_saved(session: AsyncSession, recommendation_id: str, *, shopify_product_id: str, shopify_variant_id: str | None) -> FragranceRecommendation | None:
+    """Port of fragranceBuild.server.js's markRecommendationSaved."""
+    record = await get_recommendation(session, recommendation_id)
+    if not record:
+        return None
+    record.buildStatus = "saved"
+    record.shopifyProductId = shopify_product_id
+    record.shopifyVariantId = shopify_variant_id
+    await session.commit()
+    return record

@@ -7,7 +7,13 @@ from sqlalchemy import delete, select
 from app.db.ids import new_id
 from app.db.models import FragranceProduct, FragranceRecommendation
 from app.db.time import utcnow
-from app.services.recommendation_confirmation import confirm_recommendation, get_recommendation, save_recommendation
+from app.services.recommendation_confirmation import (
+    confirm_recommendation,
+    get_recommendation,
+    mark_recommendation_draft,
+    mark_recommendation_saved,
+    save_recommendation,
+)
 
 
 async def _base_combination(session):
@@ -51,6 +57,55 @@ async def _save_test_recommendation(session, overrides=None):
 async def _cleanup(session, *ids):
     await session.execute(delete(FragranceRecommendation).where(FragranceRecommendation.id.in_(ids)))
     await session.commit()
+
+
+@pytest.mark.asyncio
+async def test_mark_recommendation_draft_sets_build_status_name_and_ratios(db_session):
+    recommendation_id, _, _ = await _save_test_recommendation(db_session)
+    try:
+        record = await mark_recommendation_draft(db_session, recommendation_id, name="My Draft Name", ratios={"top": 40, "middle": 30, "base": 30})
+        assert record.buildStatus == "draft"
+        assert record.draftName == "My Draft Name"
+        assert record.draftRatiosJson == {"top": 40, "middle": 30, "base": 30}
+
+        reloaded = await get_recommendation(db_session, recommendation_id)
+        assert reloaded.draftName == "My Draft Name"
+    finally:
+        await _cleanup(db_session, recommendation_id)
+
+
+@pytest.mark.asyncio
+async def test_mark_recommendation_draft_leaves_name_and_ratios_untouched_when_none(db_session):
+    recommendation_id, _, _ = await _save_test_recommendation(db_session)
+    try:
+        await mark_recommendation_draft(db_session, recommendation_id, name="First Name", ratios={"top": 34, "middle": 33, "base": 33})
+        record = await mark_recommendation_draft(db_session, recommendation_id, name=None, ratios=None)
+        assert record.draftName == "First Name"
+        assert record.draftRatiosJson == {"top": 34, "middle": 33, "base": 33}
+    finally:
+        await _cleanup(db_session, recommendation_id)
+
+
+@pytest.mark.asyncio
+async def test_mark_recommendation_draft_returns_none_for_unknown_id():
+    from app.db.session import SessionLocal
+
+    async with SessionLocal() as session:
+        assert await mark_recommendation_draft(session, "does-not-exist", name="x", ratios=None) is None
+
+
+@pytest.mark.asyncio
+async def test_mark_recommendation_saved_sets_build_status_and_shopify_ids(db_session):
+    recommendation_id, _, _ = await _save_test_recommendation(db_session)
+    try:
+        record = await mark_recommendation_saved(
+            db_session, recommendation_id, shopify_product_id="gid://shopify/Product/1", shopify_variant_id="gid://shopify/ProductVariant/1"
+        )
+        assert record.buildStatus == "saved"
+        assert record.shopifyProductId == "gid://shopify/Product/1"
+        assert record.shopifyVariantId == "gid://shopify/ProductVariant/1"
+    finally:
+        await _cleanup(db_session, recommendation_id)
 
 
 @pytest.mark.asyncio
