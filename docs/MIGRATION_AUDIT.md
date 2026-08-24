@@ -331,12 +331,29 @@ Jinja2 + vanilla JS in FastAPI, not React.
 | Phase 3 | 22 | all passing (httpx mocked at the `admin_graphql` boundary) |
 | Phase 4 | 11 | all passing (7 pure/mocked, 4 live-DB) |
 | Phase 5 | 8 | all passing, against the live DB + `TestClient` (real page render, all three POST intents, one Shopify-failure path) |
+| Phase 6 | 14 | all passing (public GET history-flag behavior, a full public POST streaming round trip with no internal key present, confirmation the internal route still enforces its key, `resolve_shop_domain` against the live DB) |
 
-Full-suite runs after each phase: 417 → 439 (Phase 3) passed, 0 failed each time. A combined Phase 3+4+5 full-suite run was in progress at the time of this update; report its result before treating this section as fully closed.
+Full-suite runs: 417 → 439 (Phase 3) → 450 (Phase 3+4) passed, 0 failed each time. A final combined run covering Phases 2-6 together was in progress at the time of this update.
+
+### Phase 6 — direct storefront-to-Python chat
+
+Added public `GET /chat` and `POST /chat` (no `X-Internal-Api-Key`) alongside the existing
+`/internal/chat` routes -- same handler logic, registered under both paths, differing only in
+their `dependencies=` (the internal-key check applies to `/internal/chat` only) and in where
+`shop_domain` comes from. `ChatRequest.shop_domain` is now optional; when a caller doesn't supply
+it (every direct browser call, since the widget never has one), `app.shopify.sessions.resolve_shop_domain`
+reads the merchant's offline `Session` row itself -- a direct port of `shopDomain.server.js`,
+same query (`isOnline: false`, most recent by id), same hardcoded fallback domain.
+
+`/internal/chat` is left completely intact for Node to keep using during the staged cutover.
+Switching the storefront widget's `appBaseUrl` to point at `/chat` on the Python service instead
+of Node is a separate, later, deployment-level change (theme/extension config) -- not made as
+part of this backend work, and not something to flip before staging parity is fully proven.
 
 ### Remaining before "Node required in production = NO"
 
-- Phase 6 (direct storefront → Python chat integration, removing the Node hop) — not started.
+- Switching the storefront widget's `appBaseUrl` to the Python service's `/chat` (deployment
+  config, not backend code) -- deliberately not done yet.
 - Merchant embedded-admin OAuth (`/auth`, `/auth/login`, the four `app.*` dashboard routes) — explicitly deferred; not part of the customer-facing Definition of Done, but still required before Node can retire completely.
 - Odoo 401 — deferred by explicit instruction; `inventoryValidated=false` semantics preserved throughout, never fixed to false-positive "confirmed" during this phase.
 - Live Shopify dev-store E2E (Save Build/Add to Cart against a real store) — still environment-blocked, same as §9/§10.
