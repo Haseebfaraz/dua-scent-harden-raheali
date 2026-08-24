@@ -120,16 +120,26 @@ async def chat_action(body: ChatRequest, session: AsyncSession = Depends(get_ses
             except Exception as err:
                 logger.error("Failed to persist chat log: %s", err)
 
+            # preview_ready makes the widget navigate away the instant it's parsed
+            # (handlePreviewReady runs before chat.js's own event-type switch) -- so it must
+            # never reach the client before the reasoning bridge that explains the pick. Every
+            # other sse_event keeps its original position ahead of the chunk; preview_ready alone
+            # is held back until after the text is fully delivered.
+            preview_ready_event = None
             yield _sse_line({"type": "id", "conversation_id": conversation_id})
             for event in sse_events or []:
                 if event.get("type") == "preview_ready":
-                    logger.info("CHAT_PREVIEW_EVENT %s", json.dumps({
-                        "conversationId": conversation_id, "recommendationId": event.get("recommendationId"),
-                        "eventType": event["type"], "previewUrl": event.get("previewUrl"),
-                    }))
+                    preview_ready_event = event
+                    continue
                 yield _sse_line(event)
             yield _sse_line({"type": "chunk", "chunk": reply_text})
             yield _sse_line({"type": "message_complete"})
+            if preview_ready_event:
+                logger.info("CHAT_PREVIEW_EVENT %s", json.dumps({
+                    "conversationId": conversation_id, "recommendationId": preview_ready_event.get("recommendationId"),
+                    "eventType": preview_ready_event["type"], "previewUrl": preview_ready_event.get("previewUrl"),
+                }))
+                yield _sse_line(preview_ready_event)
             yield _sse_line({"type": "end_turn"})
         except Exception as err:
             logger.error("Action error: %s", err, exc_info=True)
