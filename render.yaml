@@ -40,7 +40,7 @@ services:
       - key: INTERNAL_API_KEY
         sync: false
       - key: ALLOWED_ORIGINS
-        value: ""
+        value: "https://test-3d-products.myshopify.com"
       - key: SHOPIFY_API_KEY
         sync: false
       - key: SHOPIFY_API_SECRET
