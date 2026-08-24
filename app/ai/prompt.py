@@ -105,6 +105,8 @@ If their very first message already expresses a fragrance need, occasion, prefer
 
 If they reveal any fragrance need, occasion, preference, dislike, gift, or meaningful context in a later message, follow that information immediately instead of continuing generic small talk.
 
+If something they say is vague or has more than one plausible reading (a mood word, a color, a style word with no clear fragrance meaning yet), do NOT guess what they meant and do NOT treat it as a saved preference. Respond to it naturally as part of the conversation, or ask one short, genuine question about what they meant -- never a multiple-choice menu, and never invent an interpretation just to keep things moving.
+
 Do not use generic praise such as:
 - "great choice"
 - "fantastic"
@@ -145,18 +147,30 @@ async def build_system_prompt(
     else:
         customer_name_usage_instruction = ""
 
-    profile_status_line = (
-        f"\nProfile fields already saved (from save_customer_profile_field — do not ask again for these): {json.dumps(profile)}\n"
-        f"Still missing before analysis can run: {', '.join(missing_fields) if missing_fields else 'nothing — ready to analyze.'}\n"
-    )
-
     user_messages = [m for m in history if m.get("role") == "user"]
     has_conversation_context = any(has_concrete_context(m.get("content")) for m in user_messages)
+    has_high_signal_message = any(detect_high_signal_flags(m.get("content")) for m in user_messages)
     has_saved_fragrance_signal = bool(
         profile.get("occasion") or profile.get("preferredStyle") or profile.get("giftRecipient")
         or profile.get("requestedSeasonStyle") or profile.get("likes") or profile.get("dislikes")
     )
-    early_phase_locked = len(user_messages) <= 1 and not has_conversation_context and not has_saved_fragrance_signal
+    # Gated purely on whether real fragrance intent has ever surfaced -- NOT on message count.
+    # A rigid "only the first message counts as early phase" cutoff was the actual bug behind
+    # jumping straight from a bare name to a fragrance question: the customer's second message
+    # (their name, nothing else) already fell outside the cutoff, so the full fragrance-consultant
+    # prompt took over and treated "likes/preferredStyle" as the next thing to fill in. Small talk
+    # now stays small talk for as many turns as it takes until the customer actually says something
+    # fragrance-relevant.
+    early_phase_locked = not has_conversation_context and not has_high_signal_message and not has_saved_fragrance_signal
+
+    # The "still missing" readiness line is a recommendation-generation concept -- showing it
+    # during plain small talk (verified live: right after the model saved a bare name) reads to
+    # the model as an implicit to-do list and pulled it straight into a fragrance question despite
+    # the early template explicitly saying not to. Only surface it once fragrance is actually on
+    # the table.
+    profile_status_line = f"\nProfile fields already saved (from save_customer_profile_field — do not ask again for these): {json.dumps(profile)}\n"
+    if not early_phase_locked:
+        profile_status_line += f"Still missing before analysis can run: {', '.join(missing_fields) if missing_fields else 'nothing — ready to analyze.'}\n"
 
     if early_phase_locked:
         name_line = (
@@ -404,6 +418,15 @@ PROFILE FIELD RULES
   dislikes: ["Strong"]
 
   Never save only the positive half of a mixed preference and discard the negative half.
+
+EXTRACTION CONFIDENCE
+
+Before calling save_customer_profile_field for a like/dislike/style/preference, judge how confident you actually are in what the customer meant:
+- Explicit or high confidence (the fragrance-relevant meaning is clear) -> save it.
+- Reasonable but genuinely uncertain, more than one plausible reading -> ask one short, natural clarifying question before saving anything.
+- Ambiguous, or no reliable fragrance meaning at all (a color, a mood word, small talk) -> do not save it and do not invent an interpretation; just respond to what they actually said.
+
+Never save a guess. It is always fine to keep chatting for another turn without saving anything.
 
 GENERATION READINESS
 

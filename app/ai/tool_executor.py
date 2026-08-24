@@ -436,6 +436,15 @@ async def _handle_save_customer_profile_field(session: AsyncSession, conversatio
             extra = " No real conflict with today's weather — do not mention season at all, just continue naturally."
         return _ok(base + extra, {"type": "profile_progress", "profile": profile, "missingFields": missing})
 
+    if field in ("name", "email"):
+        # Identity fields never factor into recommendation readiness (get_missing_required_fields
+        # only looks at fragrance-preference signals) -- appending "missing before analysis" here
+        # was a live bug: right after the model saved a bare name during small talk, this line put
+        # "likes or preferredStyle" in front of it as the very next thing to do, and the model
+        # jumped straight to a fragrance question despite the system prompt explicitly saying not
+        # to. Saving identity has nothing to do with fragrance readiness, so don't imply it does.
+        return _ok("Saved.", {"type": "profile_progress", "profile": profile, "missingFields": missing})
+
     return _ok(
         f'Saved. Missing required fields before analysis: {", ".join(missing) if missing else "none — ready to analyze."}',
         {"type": "profile_progress", "profile": profile, "missingFields": missing},

@@ -57,6 +57,19 @@ async def test_bare_greeting_gets_the_short_early_phase_prompt(db_session):
     assert "Do NOT manufacture several rounds of small talk" in prompt
 
 
+async def test_bare_name_reply_after_greeting_still_gets_the_early_phase_prompt(db_session):
+    conversation_id = _conversation_id("name-only")
+    # The exact regression this guards: a customer's SECOND message being nothing but their name
+    # must not, by message count alone, exit small talk into the full fragrance-consultant prompt.
+    history = [
+        {"role": "user", "content": "hey"},
+        {"role": "assistant", "content": "Hey! How's your day going?"},
+        {"role": "user", "content": "Haseeb"},
+    ]
+    prompt = await build_system_prompt(db_session, history, conversation_id, None, None)
+    assert "Keep this reply short and natural" in prompt
+
+
 async def test_direct_fragrance_intent_skips_the_early_phase_small_talk_prompt(db_session):
     conversation_id = _conversation_id("direct-intent")
     history = [{"role": "user", "content": "I need something fresh for my wedding"}]
