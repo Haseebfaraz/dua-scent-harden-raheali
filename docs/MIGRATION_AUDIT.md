@@ -287,4 +287,58 @@ nothing DB-dependent below is marked passing on the strength of code review alon
 | Add to Cart | BLOCKED | Depends on the live storefront integration above |
 | Failure chain through the full stack (Storefront → Node → Python) | BLOCKED for most cases | `resolveShopDomain()` in `chat.jsx` hits Postgres before Python is ever called, so almost every full-chain failure case needs the DB up; the Python-only failure paths (OpenAI timeout/malformed response, invalid `X-Internal-Api-Key`, a genuine DB outage caught mid-request) were live- or code-verified in §9 and still hold |
 
+## 11. Full-standalone Shopify port (2026-08-24) — scope change
+
+The Node app is no longer a permanent adapter; `dua-scent-ai-python` is becoming the complete
+standalone backend, with `shop-chat-agent-python` as a read-only reference implementation only.
+See the Phase A audit for the full remaining-responsibilities matrix, the authentication strategy
+(Python reads the merchant's already-obtained offline `Session` token rather than reimplementing
+OAuth), and the one open frontend decision (the preview page), now resolved: reproduce it as
+Jinja2 + vanilla JS in FastAPI, not React.
+
+### Phase 2 — Shopify integration foundation
+
+| Node source | Python replacement | Status |
+|---|---|---|
+| `shopify.server.js` (config only) | `app/config.py` (Shopify settings added: `SHOPIFY_API_KEY`, `SHOPIFY_API_SECRET`, `SHOPIFY_APP_URL`, `SCOPES`, `SHOPIFY_API_VERSION`) | done |
+| `PrismaSessionStorage` (read side) | `app/db/models.Session` (newly mirrored — previously deliberately excluded) + `app/shopify/sessions.py` | done |
+| `authenticate.webhook`'s HMAC check | `app/shopify/hmac.py::verify_webhook_hmac` | done |
+| `authenticate.public.appProxy`'s signature check | `app/shopify/hmac.py::verify_app_proxy_signature` + `app/shopify/app_proxy.py` (FastAPI dependency) | done |
+| `admin.graphql(...)` | `app/shopify/admin_client.py::admin_graphql` (raw httpx, token from `Session`) | done |
+| `api.webhooks.jsx` | `app/shopify/webhooks.py` (`POST /shopify/webhooks`, `app/uninstalled` only) | done |
+
+**Finding**: `registerWebhooks` is exported by `shopify.server.js` but never called anywhere in the reference app, and `shopify.app.toml` has no `[[webhooks.subscriptions]]` block — there is no live webhook-registration behavior to port. Not built; would be manufactured scope.
+
+### Phase 3 — Admin GraphQL product/metafield/publishing primitives
+
+`app/shopify/products.py` (create product, attach media, get/set variant price, rename, get handle, get-product-for-pricing, create variant, untrack inventory item), `app/shopify/metafields.py` (note_composition/internal_components/customer-identity metafield builders, customer-email metafield definition), `app/shopify/publishing.py` (publish-to-all-channels). `app/services/fragrance_build.py` carries the pure/DB-read parts of `fragranceBuild.server.js` (note bucketing, default ratios, per-position $/5ml pricing) — kept out of `app/shopify/` since it has no HTTP in it, shared by Save Build and the preview route.
+
+### Phase 4 — Save Build orchestration
+
+`app/shopify/builds.py`: `create_shopify_build_product` (first-time creation, port of `fragranceBuild.server.js`) and `reprice_existing_build` (port of `api.save-build.jsx`'s ±3% tolerance-match/new-variant logic). `mark_recommendation_draft`/`mark_recommendation_saved` added to `recommendation_confirmation.py`.
+
+### Phase 5 — Preview page migration
+
+`apps.scent-library.fragrance-preview.jsx` (React/React-Router SSR + three.js) → `app/api/preview.py` (GET/POST, App-Proxy verified) + `app/templates/fragrance_preview.html` (Jinja2) + `app/static/css/fragrance_preview.css` (byte-identical stylesheet) + `app/static/js/fragrance_preview.js` (vanilla JS: `adjustRatios` slider redistribution ported verbatim, the three.js bottle ported near-verbatim, fetch-based recreate/save_build/add_to_cart submission with the same loading/error states). Same preview URL, same response shapes (`{status: "recreate"|"saved"|"added", ...}` / `{error}`), same visual design — no redesign.
+
+**Packaging finding, fixed**: `pyproject.toml` had no `package-data` entry, so a real (non-editable) `pip install .` — what Render actually runs — would have silently shipped the app without `app/templates/` or `app/static/`, working locally under `-e` install but 404ing on Render. Added `[tool.setuptools.package-data]` and verified with a real (non-`-e`) fresh-clone install + a live `uvicorn` process serving `/static/css/...` and `/static/js/...` with real 200s, not just file-existence checks.
+
+### Test results (Phases 2–5)
+
+| Phase | New tests | Result |
+|---|---|---|
+| Phase 2 | 20 | all passing (mix of pure HMAC/signature logic and live-DB session/webhook tests) |
+| Phase 3 | 22 | all passing (httpx mocked at the `admin_graphql` boundary) |
+| Phase 4 | 11 | all passing (7 pure/mocked, 4 live-DB) |
+| Phase 5 | 8 | all passing, against the live DB + `TestClient` (real page render, all three POST intents, one Shopify-failure path) |
+
+Full-suite runs after each phase: 417 → 439 (Phase 3) passed, 0 failed each time. A combined Phase 3+4+5 full-suite run was in progress at the time of this update; report its result before treating this section as fully closed.
+
+### Remaining before "Node required in production = NO"
+
+- Phase 6 (direct storefront → Python chat integration, removing the Node hop) — not started.
+- Merchant embedded-admin OAuth (`/auth`, `/auth/login`, the four `app.*` dashboard routes) — explicitly deferred; not part of the customer-facing Definition of Done, but still required before Node can retire completely.
+- Odoo 401 — deferred by explicit instruction; `inventoryValidated=false` semantics preserved throughout, never fixed to false-positive "confirmed" during this phase.
+- Live Shopify dev-store E2E (Save Build/Add to Cart against a real store) — still environment-blocked, same as §9/§10.
+
 **Verdict: NOT READY FOR STAGING.** Every blocker above is external-infrastructure or external-environment (shared Postgres down; no Shopify dev store/tunnel available here) — nothing in this pass found a code-level migration regression. Once the DB is confirmed reachable, re-run the DB-backed suite and the full local end-to-end flow; the live Shopify/Save-Build/Add-to-Cart checks need to happen on a machine with real Shopify dev-store access, which this sandbox does not have.
