@@ -358,4 +358,58 @@ part of this backend work, and not something to flip before staging parity is fu
 - Odoo 401 — deferred by explicit instruction; `inventoryValidated=false` semantics preserved throughout, never fixed to false-positive "confirmed" during this phase.
 - Live Shopify dev-store E2E (Save Build/Add to Cart against a real store) — still environment-blocked, same as §9/§10.
 
+## 12. Phase 7 — Conversation & Recommendation Intelligence (2026-08-24)
+
+Priority shift: the primary business reason for this migration was conversation/recommendation
+*quality*, not just infrastructure parity. This phase audited the existing (already mature,
+many-iteration) `app/ai/*` orchestration before touching anything, per explicit instruction, and
+found most of the requested behavior (dynamic action selection, high-signal detection, banned
+generic phrases, layman vocabulary, gift-recipient handling, refinement via deterministic
+adjustments, structured `CHAT_PROFILE_STATE`/`CHAT_NEXT_ACTION` logging) already present --
+`app/ai/prompt.py` is a byte-faithful port of a JS system prompt that had already been through many
+real-bug fix iterations. Two concrete, code-level gaps were found and fixed:
+
+**1. The recommendation-readiness gate was a fixed checklist, not confidence-based.**
+`get_missing_required_fields()` (`app/services/customer_profile.py`) required verified city,
+country, likes-or-style, AND both `dislikesAsked`/`occasionAsked` flags -- all mandatory -- before
+`analyze_customer_product_candidates` would run at all (`app/ai/tool_executor.py`'s
+`_handle_analyze_candidates` hard-failed the tool call otherwise). The engine itself already
+produces real results from likes/style alone with zero region/season signal (existing, passing
+tests) -- the checklist was a policy layered on top, not a technical requirement, and it forced
+extra turns even when a customer had already given enough to go on (e.g. "fresh for my wedding"
+still couldn't generate without a location and an explicit "did you ask about dislikes" flag).
+Replaced with: a real style direction (likes or preferredStyle) plus at least one other high-value
+signal (occasion, dislikes, gift context, strength preference, or a verified location) is enough.
+Two tool-schema descriptions in `app/ai/tools.py` that still described the old requirement were
+updated to match.
+
+**2. `preview_ready`'s reasoning bridge was always a canned line, never the model's own text.**
+Traced `conversation_flow.py`'s `call_ai`: when the auto-select-and-confirm tool call resolves to
+`preview_ready`, that same turn's assistant message carries no text at all (the model spent its
+turn calling the tool) -- so `final_text = result["sseEvent"].get("reasoningBridge") or "I've got
+the blend ready — take a look."` always hit the fallback, since no code path ever set
+`reasoningBridge`. Worse, the tool's own `modelContent` explicitly said "do NOT say anything
+further about this turn," so even a follow-up turn would have been told to stay silent. Fixed by
+(a) handing the model the winning combination's real `customerFacing*` fields (already
+precomputed by the recommendation engine specifically for this purpose) in the tool result, (b)
+asking for a short, grounded 2-3 sentence bridge instead of silence, and (c) giving the model one
+more completion (tools disabled, so it can't loop into another tool call) to actually write it.
+Falls back to the generic line only if that follow-up completion itself fails.
+
+**Not changed**: Shopify/UI infrastructure, database schema, Odoo (still deferred,
+`inventoryValidated=false` preserved), the recommendation engine's scoring/ranking/eligibility
+logic (LLM still never invents products -- Python remains authoritative for retrieval,
+exclusions, scoring, and ranking; the two fixes above are entirely on the conversation side).
+
+### Tests
+
+70 targeted tests across `test_customer_profile.py`, `test_tool_executor_flow.py`,
+`test_tool_executor_profile.py`, `test_tool_executor_auto_confirm.py`, and the new
+`test_conversation_intelligence.py` (confidence-based readiness, the two-call reasoning-bridge
+plumbing including its fallback path, refinement's dislike-preservation, high-signal detection,
+early-phase vs. direct-intent prompt selection, full-context profile injection) -- all passing.
+Per instruction, these assert on deterministic state/plumbing, not exact bot prose, so the model's
+own wording stays free to vary. A fresh full-suite run confirmed no regressions against the
+Phase 2-6 baseline.
+
 **Verdict: NOT READY FOR STAGING.** Every blocker above is external-infrastructure or external-environment (shared Postgres down; no Shopify dev store/tunnel available here) — nothing in this pass found a code-level migration regression. Once the DB is confirmed reachable, re-run the DB-backed suite and the full local end-to-end flow; the live Shopify/Save-Build/Add-to-Cart checks need to happen on a machine with real Shopify dev-store access, which this sandbox does not have.
