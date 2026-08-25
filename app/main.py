@@ -31,4 +31,11 @@ app.include_router(chat.router)
 app.include_router(recommendations.router)
 app.include_router(shopify_webhooks.router)
 app.include_router(preview.router)
-app.mount("/static", StaticFiles(directory=str(Path(__file__).resolve().parent / "static")), name="static")
+_static_dir = str(Path(__file__).resolve().parent / "static")
+app.mount("/static", StaticFiles(directory=_static_dir), name="static")
+# The preview page is only ever loaded through Shopify's App Proxy at /apps/scent-library/... --
+# the browser resolves the page's own asset URLs against that path, not the backend's real host,
+# so its CSS/JS must be reachable under the same prefix or the proxy never forwards those requests
+# (they'd hit the storefront's own domain root instead, 404ing there -- exactly what produced the
+# unstyled/non-interactive preview). Same directory, second mount point; nothing removed.
+app.mount("/apps/scent-library/static", StaticFiles(directory=_static_dir), name="static_via_app_proxy")

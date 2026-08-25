@@ -80,6 +80,45 @@ async def test_preview_renders_recommendation_data():
         await _cleanup(recommendation_id, conversation_id)
 
 
+async def test_preview_asset_urls_stay_under_the_app_proxy_path():
+    # The page is only ever loaded through Shopify's App Proxy (test-shop.myshopify.com/apps/
+    # scent-library/...) -- an asset URL starting with a bare /static/... resolves, in the
+    # browser, against the STOREFRONT's own domain root instead of being forwarded to this
+    # backend at all, which is exactly what produced a fully unstyled, non-interactive page live.
+    recommendation_id, conversation_id = await _make_recommendation()
+    try:
+        with TestClient(app) as client:
+            response = client.get("/apps/scent-library/fragrance-preview", params=_proxy_params(recommendationId=recommendation_id))
+        assert response.status_code == 200
+        assert '/apps/scent-library/static/css/fragrance_preview.css' in response.text
+        assert '/apps/scent-library/static/js/fragrance_preview.js' in response.text
+        assert 'href="/static/css' not in response.text
+        assert 'src="/static/js' not in response.text
+    finally:
+        await _cleanup(recommendation_id, conversation_id)
+
+
+def test_preview_css_is_reachable_under_the_app_proxy_path_with_correct_content_type():
+    with TestClient(app) as client:
+        response = client.get("/apps/scent-library/static/css/fragrance_preview.css")
+    assert response.status_code == 200
+    assert "css" in response.headers["content-type"]
+
+
+def test_preview_js_is_reachable_under_the_app_proxy_path_with_correct_content_type():
+    with TestClient(app) as client:
+        response = client.get("/apps/scent-library/static/js/fragrance_preview.js")
+    assert response.status_code == 200
+    assert "javascript" in response.headers["content-type"]
+
+
+def test_original_static_mount_still_works_unchanged():
+    with TestClient(app) as client:
+        response = client.get("/static/css/fragrance_preview.css")
+    assert response.status_code == 200
+    assert "css" in response.headers["content-type"]
+
+
 async def test_preview_returns_404_for_unknown_recommendation():
     with TestClient(app) as client:
         response = client.get("/apps/scent-library/fragrance-preview", params=_proxy_params(recommendationId="does-not-exist"))

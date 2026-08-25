@@ -10,7 +10,10 @@
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>{{ data.name }} — DUA Scent</title>
   <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Cormorant+Garamond:wght@400;500;600&family=Work+Sans:wght@300;400;500;600&display=swap" />
-  <link rel="stylesheet" href="/static/css/fragrance_preview.css" />
+  <!-- Path-relative to wherever this page was actually loaded from (Shopify's App Proxy at
+       /apps/scent-library/...) -- never the backend's own host directly, so this keeps working
+       unchanged if the backend URL behind the proxy changes later (staging -> production). -->
+  <link rel="stylesheet" href="/apps/scent-library/static/css/fragrance_preview.css" />
   <script type="importmap">
     {
       "imports": {
@@ -96,6 +99,6 @@
   </div>
 
   <script>window.__PREVIEW_DATA__ = {{ data_json | safe }};</script>
-  <script type="module" src="/static/js/fragrance_preview.js"></script>
+  <script type="module" src="/apps/scent-library/static/js/fragrance_preview.js"></script>
 </body>
 </html>
