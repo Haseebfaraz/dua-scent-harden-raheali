@@ -195,13 +195,26 @@ def evaluate_auto_confirm_eligibility(candidate: dict, profile: dict | None) -> 
 async def _auto_select_and_confirm_best(session: AsyncSession, with_ids: list[dict], conversation_id: str, context: dict) -> dict:
     _log_preview_event("RECOMMENDATIONS_RANKED", conversation_id=conversation_id, recommendation_id=None, preview_id=None, event_type="generate_new_product_combinations", preview_url=None)
 
+    def _reject(candidate_index: int, candidate: dict, stage: str, reason: str, inventory: dict | None = None) -> None:
+        logger.info("AUTOSELECT_CANDIDATE_REJECTED %s", json.dumps({
+            "conversationId": conversation_id, "recommendationId": candidate.get("recommendationId"), "candidateIndex": candidate_index,
+            "inventoryValidated": (inventory or {}).get("inventoryValidated"), "buildable": (inventory or {}).get("buildable"),
+            "rejectionStage": stage, "rejectionReason": reason,
+        }))
+
+    eligible_candidate_count = 0
+    buildable_candidate_count = 0
     any_confidence_gated = False
     any_inventory_rejected = False
+    any_identity_missing = False
+    other_rejection_reason = None
 
     for candidate_index, candidate in enumerate(with_ids):
         if not candidate.get("autoConfirmEligible"):
             any_confidence_gated = True
+            _reject(candidate_index, candidate, "confidence_gate", "not autoConfirmEligible")
             continue
+        eligible_candidate_count += 1
 
         inventory = await evaluate_candidate_inventory(session, candidate, candidate_index)
         logger.info("INVENTORY_CANDIDATE_RESULT %s", json.dumps({
@@ -230,12 +243,23 @@ async def _auto_select_and_confirm_best(session: AsyncSession, with_ids: list[di
 
         if not inventory["buildable"]:
             any_inventory_rejected = True
+            _reject(candidate_index, candidate, "inventory", inventory.get("limitingSku") or "not buildable from current inventory", inventory)
             continue
+        buildable_candidate_count += 1
 
         confirm_result = await confirm_recommendation(
             session, recommendation_id=candidate["recommendationId"], customer_name=context.get("customerName"), customer_email=context.get("customerEmail")
         )
         if not confirm_result["ok"]:
+            reason_code = confirm_result.get("reasonCode") or "unknown"
+            _reject(candidate_index, candidate, f"confirmation:{reason_code}", confirm_result.get("reason", ""), inventory)
+            # identity_missing is a systemic gate (checked before any candidate-specific logic in
+            # confirm_recommendation) -- every remaining buildable candidate will fail it identically,
+            # so it must never be masked by whatever generic reason the loop would otherwise settle on.
+            if reason_code == "identity_missing":
+                any_identity_missing = True
+            else:
+                other_rejection_reason = other_rejection_reason or confirm_result.get("reason")
             continue
 
         await save_customer_profile_fields(session, conversation_id, {"selectedRecommendationId": candidate["recommendationId"]})
@@ -264,6 +288,29 @@ async def _auto_select_and_confirm_best(session: AsyncSession, with_ids: list[di
             "sseEvent": {"type": "preview_ready", "recommendationId": candidate["recommendationId"], "previewId": candidate["recommendationId"], "previewUrl": preview_url},
         }
 
+    # Priority matters: identity_missing is a systemic gate that fails every remaining buildable
+    # candidate identically (it's checked before any candidate-specific logic in
+    # confirm_recommendation) -- it must never be reported as an availability/inventory problem,
+    # which is a real, different, and misleading claim when buildable candidates actually exist.
+    if any_identity_missing:
+        failure_reason = "identity_missing"
+    elif any_confidence_gated:
+        failure_reason = "confidence_gated"
+    elif any_inventory_rejected:
+        failure_reason = "inventory_rejected"
+    else:
+        failure_reason = "verification_failed"
+
+    logger.info("AUTOSELECT_FAILED %s", json.dumps({
+        "conversationId": conversation_id, "reason": failure_reason,
+        "eligibleCandidateCount": eligible_candidate_count, "buildableCandidateCount": buildable_candidate_count,
+    }))
+
+    if any_identity_missing:
+        return {
+            "ok": False,
+            "modelContent": "a real, buildable combination exists, but the customer's account name and email aren't available yet to attach it to. Do NOT claim this is a stock shortage or that we're waiting on inventory/supply -- that would be false, real buildable stock exists. Tell the customer honestly that we need their Shopify account signed in (with name and email available) before locking in a build, and ask them to make sure they're signed in.",
+        }
     if any_confidence_gated:
         return {
             "ok": False,
@@ -276,7 +323,7 @@ async def _auto_select_and_confirm_best(session: AsyncSession, with_ids: list[di
         }
     return {
         "ok": False,
-        "modelContent": "every generated combination failed re-verification (catalog changed, ratio drift, or a dislike conflict) — tell the customer there was a temporary issue preparing their fragrance and ask if they'd like to try again.",
+        "modelContent": f"every generated combination failed re-verification (catalog changed, ratio drift, or a dislike conflict — {other_rejection_reason or 'reason unavailable'}) — tell the customer there was a temporary issue preparing their fragrance and ask if they'd like to try again.",
     }
 
 

@@ -1,3 +1,4 @@
+import json
 import time
 import uuid
 
@@ -72,6 +73,65 @@ async def test_generate_emits_preview_ready_for_best_recommendation(db_session):
         assert "whySuits" in result["modelContent"]
         assert "bestUse" in result["modelContent"]
         assert "reasoning bridge" in result["modelContent"].lower()
+    finally:
+        await _cleanup(db_session, conversation_id)
+
+
+@pytest.mark.asyncio
+async def test_missing_customer_identity_is_never_reported_as_an_availability_problem(db_session):
+    # The exact live bug this guards: buildable candidates existed (inventoryValidated=true,
+    # buildable=true, real maxBuildableBottles) but confirm_recommendation's identity check --
+    # checked before any candidate-specific logic -- rejected every one of them identically, and
+    # the generic post-loop fallback used to collapse that into a misleading "availability snag"
+    # message. Missing customer identity must surface as its own distinct, honest reason.
+    conversation_id = _conversation_id("no-identity")
+    ctx = {"conversationId": conversation_id, "customerName": None, "customerEmail": None, "shopDomain": SHOP_DOMAIN}
+    try:
+        await _verify_los_angeles_without_network(db_session, conversation_id)
+        await execute_fragrance_tool(db_session, "save_customer_profile_field", '{"field": "likes", "value": ["Fruity"]}', ctx)
+
+        result = await execute_fragrance_tool(db_session, "generate_new_product_combinations", "{}", ctx)
+
+        # Asserting on the internal guidance text's exact wording (which necessarily names the
+        # wrong framing in order to warn against it) is the wrong layer to test -- what matters is
+        # that it correctly identifies THIS as an identity problem with real buildable stock,
+        # never as a stock/inventory shortage.
+        assert result["modelContent"].startswith("Error")
+        assert "buildable combination exists" in result["modelContent"].lower()
+        assert "sign" in result["modelContent"].lower() or "account" in result["modelContent"].lower()
+        assert not result["sseEvent"]
+    finally:
+        await _cleanup(db_session, conversation_id)
+
+
+@pytest.mark.asyncio
+async def test_identity_rejection_is_logged_with_stage_reason_and_counts(db_session, caplog):
+    import logging
+
+    conversation_id = _conversation_id("identity-logs")
+    ctx = {"conversationId": conversation_id, "customerName": None, "customerEmail": None, "shopDomain": SHOP_DOMAIN}
+    try:
+        await _verify_los_angeles_without_network(db_session, conversation_id)
+        await execute_fragrance_tool(db_session, "save_customer_profile_field", '{"field": "likes", "value": ["Fruity"]}', ctx)
+
+        with caplog.at_level(logging.INFO, logger="app.ai.tool_executor"):
+            await execute_fragrance_tool(db_session, "generate_new_product_combinations", "{}", ctx)
+
+        rejected_records = [r for r in caplog.records if "AUTOSELECT_CANDIDATE_REJECTED" in r.message]
+        assert rejected_records, "expected at least one AUTOSELECT_CANDIDATE_REJECTED log line"
+        rejected_payload = json.loads(rejected_records[0].message.split("AUTOSELECT_CANDIDATE_REJECTED ", 1)[1])
+        # buildable is the field that actually matters here (Odoo is unreachable in this test
+        # environment, so inventoryValidated legitimately comes back false per the established
+        # "never claim inventory confirmed, but don't block on it" policy -- buildable=true is
+        # what the live bug report showed too).
+        assert rejected_payload["buildable"] is True
+        assert rejected_payload["rejectionStage"] == "confirmation:identity_missing"
+
+        failed_records = [r for r in caplog.records if "AUTOSELECT_FAILED" in r.message]
+        assert failed_records, "expected a final AUTOSELECT_FAILED log line"
+        failed_payload = json.loads(failed_records[0].message.split("AUTOSELECT_FAILED ", 1)[1])
+        assert failed_payload["reason"] == "identity_missing"
+        assert failed_payload["buildableCandidateCount"] >= 1
     finally:
         await _cleanup(db_session, conversation_id)
 

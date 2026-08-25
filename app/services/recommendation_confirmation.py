@@ -149,35 +149,41 @@ async def confirm_recommendation(
     """Re-verifies everything deterministically before Shopify product creation is allowed to
     proceed -- never trusts the generation-time snapshot for any of these checks.
     """
+    # reasonCode categorizes WHY, distinct from the human-readable "reason" string -- callers (see
+    # _auto_select_and_confirm_best) use this to pick the right customer-facing framing instead of
+    # collapsing every non-inventory failure into one generic "temporary issue" message. In
+    # particular "identity_missing" is a completely different, easily-fixable blocker (the
+    # customer isn't signed in / their account info hasn't loaded yet) from a real scoring or
+    # catalog problem, and must never be described to the customer as an availability issue.
     record = await get_recommendation(session, recommendation_id)
     if not record:
-        return {"ok": False, "reason": "Recommendation not found."}
+        return {"ok": False, "reasonCode": "not_found", "reason": "Recommendation not found."}
     if record.status == "confirmed":
-        return {"ok": False, "reason": "This recommendation has already been confirmed."}
+        return {"ok": False, "reasonCode": "already_confirmed", "reason": "This recommendation has already been confirmed."}
     if record.status == "expired":
-        return {"ok": False, "reason": "This recommendation has expired — please generate a new one."}
+        return {"ok": False, "reasonCode": "expired", "reason": "This recommendation has expired — please generate a new one."}
 
     if utcnow() - record.createdAt > RECOMMENDATION_EXPIRY:
         record.status = "expired"
         await session.commit()
-        return {"ok": False, "reason": "This recommendation has expired — please generate a new one."}
+        return {"ok": False, "reasonCode": "expired", "reason": "This recommendation has expired — please generate a new one."}
 
     if not customer_name or not customer_email:
-        return {"ok": False, "reason": "Customer name and email must be available from the Shopify account before creating a product."}
+        return {"ok": False, "reasonCode": "identity_missing", "reason": "Customer name and email must be available from the Shopify account before creating a product."}
 
     products = record.productsJson if isinstance(record.productsJson, list) else []
     expected_count = COMPONENT_COUNT_BY_TYPE.get(record.combinationType)
     if not expected_count or len(products) != expected_count:
-        return {"ok": False, "reason": f"Product count ({len(products)}) doesn't match {record.combinationType} (expects {expected_count})."}
+        return {"ok": False, "reasonCode": "shape_mismatch", "reason": f"Product count ({len(products)}) doesn't match {record.combinationType} (expects {expected_count})."}
 
     for p in products:
         catalog_product = await session.scalar(
             select(FragranceProduct).where(FragranceProduct.normalizedTitle == normalize_product_name(p["title"]))
         )
         if not catalog_product:
-            return {"ok": False, "reason": f'Product "{p["title"]}" no longer exists in the catalog.'}
+            return {"ok": False, "reasonCode": "catalog_missing", "reason": f'Product "{p["title"]}" no longer exists in the catalog.'}
         if not isinstance(catalog_product.notesJson, list) or len(catalog_product.notesJson) == 0:
-            return {"ok": False, "reason": f'Product "{p["title"]}" has no notes data.'}
+            return {"ok": False, "reasonCode": "catalog_missing", "reason": f'Product "{p["title"]}" has no notes data.'}
 
     # Must not already exist as a real combination now -- this engine only ever proposes genuinely
     # new combinations, so re-confirm it's still new (the catalog could have changed since).
@@ -185,22 +191,22 @@ async def confirm_recommendation(
     if component_key:
         existing = await session.scalar(select(ExistingCombination).where(ExistingCombination.componentKey == component_key))
         if existing:
-            return {"ok": False, "reason": f'"{existing.title}" already exists as a real combination now — cannot create a duplicate.'}
+            return {"ok": False, "reasonCode": "duplicate_combination", "reason": f'"{existing.title}" already exists as a real combination now — cannot create a duplicate.'}
 
     ratios = record.ratiosJson if isinstance(record.ratiosJson, list) else []
     pct_sum = sum(r.get("ratioPercent") or 0 for r in ratios)
     if pct_sum != 100:
-        return {"ok": False, "reason": f"Ratios sum to {pct_sum}%, not 100%."}
+        return {"ok": False, "reasonCode": "ratio_invalid", "reason": f"Ratios sum to {pct_sum}%, not 100%."}
 
     # Recompute dislike-conflict severity against the CURRENT profile's dislikes -- never trusts
     # the generation-time snapshot for this safety check.
     split = split_dislikes_by_exactness((record.customerProfileJson or {}).get("dislikes") or [])
     for p in products:
         if literal_note_match_count(p.get("notes"), split["exactNoteDislikes"]) > 0:
-            return {"ok": False, "reason": f'"{p["title"]}" contains a note the customer explicitly disliked — cannot confirm.'}
+            return {"ok": False, "reasonCode": "dislike_conflict", "reason": f'"{p["title"]}" contains a note the customer explicitly disliked — cannot confirm.'}
         conflict = classify_dislike_conflict(p.get("notes"), split["explicitFamilyDislikes"])
         if conflict["severity"] == "high":
-            return {"ok": False, "reason": f'"{p["title"]}" has a high-severity conflict with a disliked note/family — cannot confirm.'}
+            return {"ok": False, "reasonCode": "dislike_conflict", "reason": f'"{p["title"]}" has a high-severity conflict with a disliked note/family — cannot confirm.'}
 
     record.status = "confirmed"
     record.confirmedAt = utcnow()

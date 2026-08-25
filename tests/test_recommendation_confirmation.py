@@ -122,7 +122,7 @@ async def test_confirm_succeeds_for_fresh_valid_recommendation(db_session):
 @pytest.mark.asyncio
 async def test_confirm_rejects_nonexistent_recommendation(db_session):
     result = await confirm_recommendation(db_session, recommendation_id="nonexistent-id", customer_name="X", customer_email="x@example.com")
-    assert result == {"ok": False, "reason": "Recommendation not found."}
+    assert result == {"ok": False, "reasonCode": "not_found", "reason": "Recommendation not found."}
 
 
 @pytest.mark.asyncio
@@ -143,6 +143,7 @@ async def test_confirm_rejects_missing_customer_info(db_session):
     try:
         result = await confirm_recommendation(db_session, recommendation_id=recommendation_id, customer_name=None, customer_email=None)
         assert result["ok"] is False
+        assert result["reasonCode"] == "identity_missing"
         assert "Customer name and email" in result["reason"]
     finally:
         await _cleanup(db_session, recommendation_id)
