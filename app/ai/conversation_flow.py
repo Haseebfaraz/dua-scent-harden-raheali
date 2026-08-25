@@ -15,10 +15,12 @@ from app.ai.prompt import (
     build_system_prompt,
     count_assistant_question_turns,
     detect_high_signal_flags,
+    determine_conversation_mode,
     extract_email_from_history,
     get_known_profile_field_names,
 )
 from app.ai.tool_executor import execute_fragrance_tool
+from app.ai.tools import FRAGRANCE_AGENT_TOOLS, GENERAL_CONVERSATION_TOOLS
 from app.services.customer_profile import get_customer_profile, get_missing_required_fields
 from app.services.conversation import get_conversation_history
 
@@ -87,11 +89,20 @@ async def call_ai(
         "customerEmail": confirmed_customer_email, "shopDomain": shop_domain,
     }
 
+    # Deterministic, not left to the model: while conversationMode is GENERAL_CONVERSATION the
+    # fragrance-discovery tools (analyze/generate/verify_location/etc.) are not even offered, so a
+    # fragrance question or an analysis call during small talk is structurally impossible, not just
+    # discouraged by prompt wording (verified live that wording alone was not reliable at
+    # temperature > 0). save_customer_profile_field stays available so a volunteered name/email can
+    # still be saved.
+    conversation_mode = determine_conversation_mode(history, profile_for_identity)
+    tools_for_turn = GENERAL_CONVERSATION_TOOLS if conversation_mode == "GENERAL_CONVERSATION" else FRAGRANCE_AGENT_TOOLS
+
     # Up to 10 tool-resolution turns -- 6 wasn't enough headroom for the model to save several
     # profile fields one at a time (it doesn't batch parallel tool calls) and still reach
     # analyze_customer_product_candidates/generate_new_product_combinations in the same turn.
     for turn in range(10):
-        data = await call_openai_once(messages, True)
+        data = await call_openai_once(messages, tools_for_turn)
         if not data:
             return {"replyText": "Sorry, I'm having trouble reaching the fragrance engine right now.", "sseEvents": sse_events}
 
@@ -119,7 +130,7 @@ async def call_ai(
                 # tool) -- one more completion, tools disabled, lets it actually write the
                 # grounded reasoning bridge the tool result just asked for, instead of a canned
                 # line that ignores what the customer said and what got selected.
-                bridge_data = await call_openai_once(messages, False)
+                bridge_data = await call_openai_once(messages, None)
                 bridge_message = (bridge_data["choices"][0]["message"] if bridge_data else {})
                 final_text = bridge_message.get("content") or "I've got the blend ready — take a look."
                 messages.append({"role": "assistant", "content": final_text})

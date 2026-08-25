@@ -70,6 +70,30 @@ def detect_high_signal_flags(text: str | None) -> list[str]:
     return [flag for pattern, flag in _HIGH_SIGNAL_PATTERNS if pattern.search(value)]
 
 
+def determine_conversation_mode(history: list[dict], profile: dict) -> str:
+    """Deterministic Python-level gate -- NOT left for the model to infer from prompt framing.
+
+    Root cause this replaced: relying on the model to *choose* to stay conversational (via prompt
+    wording alone) is inherently probabilistic at temperature > 0 -- verified live that the exact
+    same rendered prompt sometimes still produced a fragrance question right after a bare name.
+    conversation_flow.py uses this same return value to decide which tools are even offered to the
+    model (see GENERAL_CONVERSATION_TOOLS in tools.py), so during GENERAL_CONVERSATION the
+    fragrance-discovery tools are not just discouraged, they are physically absent from the
+    request -- the model cannot call analyze_customer_product_candidates or
+    generate_new_product_combinations even if it wanted to.
+    """
+    user_messages = [m for m in history if m.get("role") == "user"]
+    has_conversation_context = any(has_concrete_context(m.get("content")) for m in user_messages)
+    has_high_signal_message = any(detect_high_signal_flags(m.get("content")) for m in user_messages)
+    has_saved_fragrance_signal = bool(
+        profile.get("occasion") or profile.get("preferredStyle") or profile.get("giftRecipient")
+        or profile.get("requestedSeasonStyle") or profile.get("likes") or profile.get("dislikes")
+    )
+    if has_conversation_context or has_high_signal_message or has_saved_fragrance_signal:
+        return "FRAGRANCE_DISCOVERY"
+    return "GENERAL_CONVERSATION"
+
+
 _EMAIL_PATTERN = re.compile(r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}")
 
 
@@ -84,6 +108,10 @@ def extract_email_from_history(history: list[dict]) -> str | None:
 
 _EARLY_PHASE_TEMPLATE = """
 You are Dua Scent Agent, a warm, knowledgeable fragrance consultant having a natural text conversation.
+
+conversationMode = GENERAL_CONVERSATION
+
+While conversationMode is GENERAL_CONVERSATION: asking about perfume, scent, fragrance preferences, notes, occasion-for-fragrance, longevity, projection, or style is INVALID -- not merely discouraged. Continue ordinary conversation and follow the customer's latest topic instead. A name by itself is not fragrance intent and does not change the mode. This mode switches to FRAGRANCE_DISCOVERY automatically, in code, only once the customer's own words actually contain fragrance/occasion/gift/preference intent -- you do not decide the switch yourself, and you cannot call fragrance-discovery tools while in this mode (they are not offered to you right now).
 
 {profile_status_line}
 
@@ -147,21 +175,8 @@ async def build_system_prompt(
     else:
         customer_name_usage_instruction = ""
 
-    user_messages = [m for m in history if m.get("role") == "user"]
-    has_conversation_context = any(has_concrete_context(m.get("content")) for m in user_messages)
-    has_high_signal_message = any(detect_high_signal_flags(m.get("content")) for m in user_messages)
-    has_saved_fragrance_signal = bool(
-        profile.get("occasion") or profile.get("preferredStyle") or profile.get("giftRecipient")
-        or profile.get("requestedSeasonStyle") or profile.get("likes") or profile.get("dislikes")
-    )
-    # Gated purely on whether real fragrance intent has ever surfaced -- NOT on message count.
-    # A rigid "only the first message counts as early phase" cutoff was the actual bug behind
-    # jumping straight from a bare name to a fragrance question: the customer's second message
-    # (their name, nothing else) already fell outside the cutoff, so the full fragrance-consultant
-    # prompt took over and treated "likes/preferredStyle" as the next thing to fill in. Small talk
-    # now stays small talk for as many turns as it takes until the customer actually says something
-    # fragrance-relevant.
-    early_phase_locked = not has_conversation_context and not has_high_signal_message and not has_saved_fragrance_signal
+    conversation_mode = determine_conversation_mode(history, profile)
+    early_phase_locked = conversation_mode == "GENERAL_CONVERSATION"
 
     # The "still missing" readiness line is a recommendation-generation concept -- showing it
     # during plain small talk (verified live: right after the model saved a bare name) reads to
@@ -200,6 +215,8 @@ async def build_system_prompt(
     )
 
     return f"""You are Dua Scent Agent, a high-end, empathetic, and knowledgeable fragrance expert — the voice of a real, experienced perfumer with the warmth and conversational flair of a passionate expert at a high-end counter — observant, a little playful, genuinely curious about each customer. You help customers discover which real DUA fragrances suit them, and — when a genuinely new combination of real DUA products would suit them even better — recommend that too, always backed by real historical order data and real product notes, never invented. (That "counter" description is about your tone and expertise only — you are having a text conversation, not standing anywhere physical, so never actually tell the customer you're located somewhere or that they've walked into a shop.)
+
+conversationMode = FRAGRANCE_DISCOVERY (real fragrance/occasion/gift/preference intent has already appeared in this conversation)
 {profile_status_line}
 {customer_name_usage_instruction}
 

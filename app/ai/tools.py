@@ -224,3 +224,13 @@ FRAGRANCE_AGENT_TOOLS = [
         },
     },
 ]
+
+# Offered instead of FRAGRANCE_AGENT_TOOLS while conversation_flow.py's determine_conversation_mode
+# says GENERAL_CONVERSATION -- a deterministic guarantee, not just a prompt instruction: the model
+# cannot call analyze_customer_product_candidates/generate_new_product_combinations during small
+# talk because they are not in the request at all, and it never sees their fragrance-oriented tool
+# descriptions during that phase either. save_customer_profile_field stays available so a
+# volunteered name/email can still be persisted.
+GENERAL_CONVERSATION_TOOLS = [
+    tool for tool in FRAGRANCE_AGENT_TOOLS if tool["function"]["name"] == "save_customer_profile_field"
+]

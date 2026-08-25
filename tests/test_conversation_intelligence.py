@@ -70,6 +70,46 @@ async def test_bare_name_reply_after_greeting_still_gets_the_early_phase_prompt(
     assert "Keep this reply short and natural" in prompt
 
 
+async def test_general_conversation_mode_deterministically_withholds_fragrance_tools(db_session, monkeypatch):
+    # The structural guarantee behind conversationMode = GENERAL_CONVERSATION: even if the model
+    # wanted to call analyze_customer_product_candidates or generate_new_product_combinations, it
+    # cannot -- they are not in the request at all. Prompt wording alone was verified live to be
+    # unreliable at temperature > 0; this asserts the actual tools payload, not the prose.
+    from app.ai.tools import GENERAL_CONVERSATION_TOOLS
+
+    captured_tools = []
+
+    async def _fake_call_openai_once(messages, tools):
+        captured_tools.append(tools)
+        return {"choices": [{"finish_reason": "stop", "message": {"content": "Nice to meet you! What are you up to today?"}}]}
+
+    monkeypatch.setattr(conversation_flow, "call_openai_once", _fake_call_openai_once)
+    conversation_id = _conversation_id("mode-general")
+    history = [
+        {"role": "user", "content": "Hello"},
+        {"role": "assistant", "content": "Hey! How's your day going?"},
+        {"role": "user", "content": "Haseeb"},
+    ]
+    await call_ai(db_session, history, conversation_id, None, None, SHOP_DOMAIN)
+    assert captured_tools[0] == GENERAL_CONVERSATION_TOOLS
+
+
+async def test_fragrance_discovery_mode_gets_the_full_tool_set(db_session, monkeypatch):
+    from app.ai.tools import FRAGRANCE_AGENT_TOOLS
+
+    captured_tools = []
+
+    async def _fake_call_openai_once(messages, tools):
+        captured_tools.append(tools)
+        return {"choices": [{"finish_reason": "stop", "message": {"content": "Let's find you something fresh for the wedding."}}]}
+
+    monkeypatch.setattr(conversation_flow, "call_openai_once", _fake_call_openai_once)
+    conversation_id = _conversation_id("mode-fragrance")
+    history = [{"role": "user", "content": "I need a fresh scent for my wedding"}]
+    await call_ai(db_session, history, conversation_id, None, None, SHOP_DOMAIN)
+    assert captured_tools[0] == FRAGRANCE_AGENT_TOOLS
+
+
 async def test_direct_fragrance_intent_skips_the_early_phase_small_talk_prompt(db_session):
     conversation_id = _conversation_id("direct-intent")
     history = [{"role": "user", "content": "I need something fresh for my wedding"}]
@@ -159,7 +199,7 @@ async def test_call_ai_gives_the_model_a_second_turn_to_write_the_reasoning_brid
     history = [{"role": "user", "content": "I need something fresh for my wedding, no oud."}]
     result = await call_ai(db_session, history, conversation_id, None, None, SHOP_DOMAIN)
 
-    assert calls == [True, False]  # first turn: tools enabled; follow-up: tools disabled
+    assert calls[0] and calls[1] is None  # first turn: tools enabled; follow-up: tools disabled
     assert result["replyText"] == "You wanted something fresh for the wedding with no oud, so I kept the opening bright and the base clean."
     assert result["sseEvents"][0]["type"] == "preview_ready"
 

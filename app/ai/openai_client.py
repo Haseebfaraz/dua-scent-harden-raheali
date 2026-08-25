@@ -7,20 +7,19 @@ import logging
 
 import httpx
 
-from app.ai.tools import FRAGRANCE_AGENT_TOOLS
 from app.config import settings
 
 logger = logging.getLogger(__name__)
 
 
-async def call_openai_once(messages: list[dict], use_tools: bool) -> dict | None:
+async def call_openai_once(messages: list[dict], tools: list[dict] | None) -> dict | None:
     payload = {
         "model": settings.openai_model,
         "messages": messages,
         "temperature": settings.openai_temperature,
     }
-    if use_tools:
-        payload["tools"] = FRAGRANCE_AGENT_TOOLS
+    if tools:
+        payload["tools"] = tools
 
     try:
         async with httpx.AsyncClient(timeout=settings.openai_timeout_seconds) as client:
