@@ -62,6 +62,18 @@ def _shopify_secret(monkeypatch):
     monkeypatch.setattr(settings, "shopify_api_secret", SECRET)
 
 
+@pytest.fixture(autouse=True)
+def _fake_offline_token(monkeypatch):
+    # Default baseline for every test in this file: a token exists, so save_build/add_to_cart
+    # tests reach their own mocked create_shopify_build_product/reprice_existing_build instead of
+    # short-circuiting on the new pre-flight session check. Tests that specifically exercise the
+    # missing-token/rejected-token paths override this within the test body.
+    async def _fake(*_args, **_kwargs):
+        return "fake-offline-token-for-tests"
+
+    monkeypatch.setattr(preview_module, "get_offline_access_token", _fake)
+
+
 async def test_preview_rejects_missing_app_proxy_signature():
     with TestClient(app) as client:
         response = client.get("/apps/scent-library/fragrance-preview", params={"shop": SHOP, "recommendationId": "x"})
@@ -208,6 +220,95 @@ async def test_preview_save_build_reports_shopify_failure_as_json_error(monkeypa
             )
         assert response.status_code == 200
         assert response.json() == {"error": "Failed to save the build."}
+    finally:
+        await _cleanup(recommendation_id, conversation_id)
+
+
+async def test_save_build_reports_missing_session_as_a_connection_problem_not_generic_failure(monkeypatch, caplog):
+    import logging
+
+    recommendation_id, conversation_id = await _make_recommendation()
+    try:
+        async def _no_token(*_a, **_kw):
+            return None
+
+        monkeypatch.setattr(preview_module, "get_offline_access_token", _no_token)
+
+        with TestClient(app) as client, caplog.at_level(logging.INFO, logger="app.api.preview"):
+            response = client.post(
+                "/apps/scent-library/fragrance-preview", params=_proxy_params(),
+                json={"intent": "save_build", "recommendationId": recommendation_id, "ratios": {"top": 40, "middle": 30, "base": 30}},
+            )
+        assert response.status_code == 200
+        body = response.json()
+        # The exact live bug this guards: a missing/invalid Shopify session must never surface as
+        # the generic "Failed to save the build." -- it's a distinct, actionable problem.
+        assert body["error"] != "Failed to save the build."
+        assert "connect" in body["error"].lower() or "reconnect" in body["error"].lower()
+        assert "token" not in body["error"].lower()  # customer-safe -- never mentions internals
+
+        assert any("SHOPIFY_SESSION_MISSING" in r.message for r in caplog.records)
+        lookup_records = [r for r in caplog.records if "SHOPIFY_SESSION_LOOKUP" in r.message]
+        assert lookup_records and "hasOfflineToken\": false" in lookup_records[0].message
+    finally:
+        await _cleanup(recommendation_id, conversation_id)
+
+
+async def test_save_build_reports_shopify_401_as_a_connection_problem(monkeypatch, caplog):
+    import logging
+
+    import httpx
+
+    recommendation_id, conversation_id = await _make_recommendation()
+    try:
+        async def _unauthorized(*_a, **_kw):
+            request = httpx.Request("POST", f"https://{SHOP}/admin/api/2025-04/graphql.json")
+            response = httpx.Response(401, request=request, text='{"errors":"[API] Invalid API key or access token"}')
+            raise httpx.HTTPStatusError("401", request=request, response=response)
+
+        monkeypatch.setattr(preview_module, "create_shopify_build_product", _unauthorized)
+
+        with TestClient(app) as client, caplog.at_level(logging.INFO, logger="app.api.preview"):
+            response = client.post(
+                "/apps/scent-library/fragrance-preview", params=_proxy_params(),
+                json={"intent": "save_build", "recommendationId": recommendation_id, "ratios": {"top": 40, "middle": 30, "base": 30}},
+            )
+        assert response.status_code == 200
+        body = response.json()
+        assert body["error"] != "Failed to save the build."
+        assert "connect" in body["error"].lower() or "reconnect" in body["error"].lower()
+
+        failed_records = [r for r in caplog.records if "SHOPIFY_PRODUCT_CREATE_FAILED" in r.message]
+        assert failed_records
+        assert "\"status\": 401" in failed_records[0].message
+    finally:
+        await _cleanup(recommendation_id, conversation_id)
+
+
+async def test_save_build_non_auth_shopify_error_gets_a_distinct_message(monkeypatch):
+    import httpx
+
+    recommendation_id, conversation_id = await _make_recommendation()
+    try:
+        async def _server_error(*_a, **_kw):
+            request = httpx.Request("POST", f"https://{SHOP}/admin/api/2025-04/graphql.json")
+            response = httpx.Response(500, request=request, text="internal error")
+            raise httpx.HTTPStatusError("500", request=request, response=response)
+
+        monkeypatch.setattr(preview_module, "create_shopify_build_product", _server_error)
+
+        with TestClient(app) as client:
+            response = client.post(
+                "/apps/scent-library/fragrance-preview", params=_proxy_params(),
+                json={"intent": "save_build", "recommendationId": recommendation_id, "ratios": {"top": 40, "middle": 30, "base": 30}},
+            )
+        assert response.status_code == 200
+        body = response.json()
+        # Distinct from both the generic fallback AND the connection/auth message -- a real
+        # Shopify-side error that isn't about this app's credentials shouldn't be misreported as
+        # either.
+        assert body["error"] != "Failed to save the build."
+        assert "reconnect" not in body["error"].lower()
     finally:
         await _cleanup(recommendation_id, conversation_id)
 
