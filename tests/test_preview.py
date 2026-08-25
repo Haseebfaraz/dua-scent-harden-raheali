@@ -63,15 +63,15 @@ def _shopify_secret(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
-def _fake_offline_token(monkeypatch):
+def _fake_admin_token(monkeypatch):
     # Default baseline for every test in this file: a token exists, so save_build/add_to_cart
     # tests reach their own mocked create_shopify_build_product/reprice_existing_build instead of
-    # short-circuiting on the new pre-flight session check. Tests that specifically exercise the
+    # short-circuiting on the new pre-flight auth check. Tests that specifically exercise the
     # missing-token/rejected-token paths override this within the test body.
     async def _fake(*_args, **_kwargs):
-        return "fake-offline-token-for-tests"
+        return "fake-admin-token-for-tests", "client_credentials"
 
-    monkeypatch.setattr(preview_module, "get_offline_access_token", _fake)
+    monkeypatch.setattr(preview_module, "get_admin_access_token", _fake)
 
 
 async def test_preview_rejects_missing_app_proxy_signature():
@@ -230,9 +230,9 @@ async def test_save_build_reports_missing_session_as_a_connection_problem_not_ge
     recommendation_id, conversation_id = await _make_recommendation()
     try:
         async def _no_token(*_a, **_kw):
-            return None
+            return None, "none"
 
-        monkeypatch.setattr(preview_module, "get_offline_access_token", _no_token)
+        monkeypatch.setattr(preview_module, "get_admin_access_token", _no_token)
 
         with TestClient(app) as client, caplog.at_level(logging.INFO, logger="app.api.preview"):
             response = client.post(
@@ -249,7 +249,7 @@ async def test_save_build_reports_missing_session_as_a_connection_problem_not_ge
 
         assert any("SHOPIFY_SESSION_MISSING" in r.message for r in caplog.records)
         lookup_records = [r for r in caplog.records if "SHOPIFY_SESSION_LOOKUP" in r.message]
-        assert lookup_records and "hasOfflineToken\": false" in lookup_records[0].message
+        assert lookup_records and '"hasToken": false' in lookup_records[0].message
     finally:
         await _cleanup(recommendation_id, conversation_id)
 

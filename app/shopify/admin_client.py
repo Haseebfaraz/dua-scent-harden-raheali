@@ -8,14 +8,14 @@ import httpx
 from sqlalchemy.ext.asyncio import AsyncSession as DbSession
 
 from app.config import settings
-from app.shopify.sessions import get_offline_access_token
+from app.shopify.admin_auth import get_admin_access_token
 
 _REQUEST_TIMEOUT_SECONDS = 15.0
 
 
 class ShopNotAuthenticated(Exception):
-    """No stored offline token for this shop -- the merchant hasn't installed, or Session was
-    cleared (e.g. by the APP_UNINSTALLED webhook handler)."""
+    """No usable Admin API credential for this shop -- client credentials aren't configured/
+    available and no stored offline Session token exists either."""
 
 
 async def _post(url: str, token: str, query: str, variables: dict[str, Any]) -> httpx.Response:
@@ -28,9 +28,12 @@ async def _post(url: str, token: str, query: str, variables: dict[str, Any]) -> 
 
 
 async def admin_graphql(session: DbSession, shop: str, query: str, variables: dict[str, Any] | None = None) -> dict:
-    token = await get_offline_access_token(session, shop)
+    # Client credentials grant first (cached, auto-refreshed) -- only falls back to a stored
+    # Session-table token when client credentials aren't configured/available. Never prefers a
+    # known-stale Session token over a fresh attempt.
+    token, _source = await get_admin_access_token(session, shop)
     if not token:
-        raise ShopNotAuthenticated(f'no stored offline access token for shop "{shop}"')
+        raise ShopNotAuthenticated(f'no usable Admin API credential for shop "{shop}"')
 
     url = f"https://{shop}/admin/api/{settings.shopify_api_version}/graphql.json"
     response = await _post(url, token, query, variables or {})

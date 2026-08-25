@@ -21,11 +21,11 @@ from app.db.session import get_session
 from app.services.customer_profile import get_customer_profile, save_customer_profile_field
 from app.services.fragrance_build import compute_default_ratios, compute_note_position_buckets, compute_price_per_5ml_by_position
 from app.services.recommendation_confirmation import get_recommendation, mark_recommendation_draft, mark_recommendation_saved
+from app.shopify.admin_auth import get_admin_access_token
 from app.shopify.admin_client import ShopNotAuthenticated
 from app.shopify.app_proxy import verified_shop
 from app.shopify.builds import InvalidComputedPrice, InvalidRatios, ProductPricingNotFound, create_shopify_build_product, reprice_existing_build
 from app.shopify.products import get_product_handle
-from app.shopify.sessions import get_offline_access_token
 
 logger = logging.getLogger(__name__)
 
@@ -121,9 +121,13 @@ async def preview_action(body: PreviewAction, shop: str = Depends(verified_shop)
         product_url = None
 
         # Fail fast with a clear, customer-safe reason instead of letting every downstream
-        # GraphQL call fail one by one -- never logs the token itself, only whether one exists.
-        token = await get_offline_access_token(session, shop)
-        logger.info("SHOPIFY_SESSION_LOOKUP %s", json.dumps({"shop": shop, "hasOfflineToken": bool(token)}))
+        # GraphQL call fail one by one. get_admin_access_token tries client credentials first
+        # (cached/auto-refreshed), only falling back to a stored Session-table token when client
+        # credentials aren't configured -- never logs the token itself, only whether one exists
+        # and which source it came from (it logs SHOPIFY_AUTH_SOURCE/SHOPIFY_ADMIN_AUTH_OK/
+        # SHOPIFY_ADMIN_AUTH_FAILED internally).
+        token, auth_source = await get_admin_access_token(session, shop)
+        logger.info("SHOPIFY_SESSION_LOOKUP %s", json.dumps({"shop": shop, "hasToken": bool(token), "source": auth_source}))
         if not token:
             logger.error("SHOPIFY_SESSION_MISSING %s", json.dumps({"shop": shop, "recommendationId": body.recommendationId}))
             return {"error": _NOT_CONNECTED_MESSAGE}
