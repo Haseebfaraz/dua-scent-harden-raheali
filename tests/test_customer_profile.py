@@ -18,58 +18,88 @@ def _new_conversation_id() -> str:
 
 
 def test_missing_required_fields_on_empty_profile():
-    # Phase 7: confidence-based readiness, not a fixed checklist -- with zero style direction at
-    # all, that's the one and only thing worth asking about; nothing else matters yet.
+    # Phase 8: discovery completeness -- with zero style direction at all, that's the one and only
+    # thing worth surfacing first; the other dimensions all report missing too but style leads.
     profile = empty_profile()
-    assert get_missing_required_fields(profile) == ["likes or preferredStyle"]
+    missing = get_missing_required_fields(profile)
+    assert missing[0] == "a fragrance direction, style, or vibe (likes, preferredStyle, or a mood word like seductive/clean/bold)"
     assert is_profile_ready_for_analysis(profile) is False
 
 
 def test_style_direction_alone_is_not_enough_without_any_other_signal():
     profile = {**empty_profile(), "likes": ["Fruity"]}
-    assert get_missing_required_fields(profile) == [
-        "at least one more high-value signal (occasion, dislikes, gift context, strength preference, or a verified location)"
-    ]
+    assert len(get_missing_required_fields(profile)) == 4  # dislikes, occasion, performance, location all still missing
     assert is_profile_ready_for_analysis(profile) is False
 
 
-def test_style_plus_occasion_is_enough_no_location_or_dislikes_needed():
-    # The wedding/work-party example: a style direction plus a real occasion is enough to
-    # generate -- city, country, and an explicit "did you ask about dislikes" flag are no longer
-    # hard requirements.
-    profile = {**empty_profile(), "preferredStyle": "fresh", "occasion": "wedding"}
-    assert get_missing_required_fields(profile) == []
-    assert is_profile_ready_for_analysis(profile) is True
-
-
-def test_accepts_preferred_style_in_place_of_likes():
-    profile = {**empty_profile(), "preferredStyle": "warm and woody", "dislikesAsked": True}
-    assert is_profile_ready_for_analysis(profile) is True
-
-
-def test_empty_dislikes_asked_still_counts_as_a_real_signal():
-    # A deliberately-confirmed "no dislikes" is still worth something, even with an empty list.
-    profile = {**empty_profile(), "likes": ["Fruity"], "dislikes": [], "dislikesAsked": True}
-    assert is_profile_ready_for_analysis(profile) is True
-
-
-def test_verified_location_alone_can_satisfy_readiness_without_dislikes_or_occasion():
+def test_strong_oud_plus_warm_weather_alone_is_not_ready():
+    # The exact regression this guards: a live conversation ("...i like strong (oud type)" / "for
+    # the warm days.") generated a recommendation off just style + a passing weather mention. That
+    # must NOT be enough on its own even with strengthPreference AND a verified, warm location --
+    # dislikes and occasion are both still ungathered.
     profile = {
-        **empty_profile(), "likes": ["Fruity"], "city": "Los Angeles", "country": "United States", "locationVerified": True,
+        **empty_profile(), "likes": ["Oud"], "strengthPreference": "strong",
+        "city": "Los Angeles", "country": "United States", "locationVerified": True, "weatherDirection": "warm",
+    }
+    missing = get_missing_required_fields(profile)
+    assert "dislikes or hard exclusions (or an explicit 'nothing I dislike')" in missing
+    assert "occasion or use context" in missing
+    assert is_profile_ready_for_analysis(profile) is False
+
+
+def test_all_discovery_dimensions_present_is_ready():
+    # style/vibe + occasion + dislike + performance + verified location/weather, matching the
+    # explicit "clearly enough" example: strong oud, date night, dislike vanilla, strong
+    # projection, Los Angeles, warm weather verified, dark/seductive vibe.
+    profile = {
+        **empty_profile(),
+        "likes": ["Oud", "Seductive"], "dislikes": ["Vanilla"], "occasion": "date night",
+        "strengthPreference": "strong",
+        "city": "Los Angeles", "country": "United States", "locationVerified": True, "weatherDirection": "warm",
     }
     assert get_missing_required_fields(profile) == []
     assert is_profile_ready_for_analysis(profile) is True
 
 
-def test_unverified_or_unknown_location_never_blocks_readiness_on_its_own():
-    # Phase 7: don't ask for location unless it will affect the recommendation -- an unverified
-    # city must never be treated as a blocker by itself once another real signal exists.
+def test_asked_flags_satisfy_their_dimension_without_a_real_answer():
+    # A genuinely-confirmed "none"/"couldn't give a city" must count as resolved -- these must
+    # never be re-asked, and must never block readiness forever chasing a fact that isn't coming.
     profile = {
-        **empty_profile(), "city": "Vice City", "country": "United States", "likes": ["Fruity"],
-        "locationVerified": False, "dislikesAsked": True,
+        **empty_profile(), "likes": ["Fruity"], "dislikesAsked": True, "occasionAsked": True,
+        "strengthPreference": "moderate", "locationAsked": True,
     }
     assert get_missing_required_fields(profile) == []
     assert is_profile_ready_for_analysis(profile) is True
+
+
+def test_gift_recipient_satisfies_occasion_without_a_separate_occasion_fact():
+    profile = {
+        **empty_profile(), "likes": ["Fruity"], "giftRecipient": "wife", "dislikesAsked": True,
+        "strengthPreference": "light", "locationAsked": True,
+    }
+    assert get_missing_required_fields(profile) == []
+    assert is_profile_ready_for_analysis(profile) is True
+
+
+def test_unverified_location_does_not_satisfy_the_location_dimension():
+    # An unverified/implausible city is not the same as a verified one, and is not the same as
+    # having genuinely asked and moved on -- it must still count as missing.
+    profile = {
+        **empty_profile(), "likes": ["Fruity"], "dislikesAsked": True, "occasionAsked": True,
+        "strengthPreference": "moderate", "city": "Vice City", "locationVerified": False,
+    }
+    assert "location, for verified weather/season context" in get_missing_required_fields(profile)
+    assert is_profile_ready_for_analysis(profile) is False
+
+
+def test_weather_direction_is_never_a_model_settable_field():
+    # Structural guarantee that the model can never fabricate weather: weatherDirection/
+    # currentWeather are not in the tool's settable field list at all -- they can only ever be
+    # written by verify_customer_location's own backend code path.
+    from app.ai.tools import PROFILE_FIELD_NAMES
+
+    assert "weatherDirection" not in PROFILE_FIELD_NAMES
+    assert "currentWeather" not in PROFILE_FIELD_NAMES
 
 
 @pytest.mark.asyncio

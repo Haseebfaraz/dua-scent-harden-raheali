@@ -556,6 +556,12 @@ async def _handle_analyze_candidates(session: AsyncSession, conversation_id: str
 
 async def _handle_generate_combinations(session: AsyncSession, conversation_id: str, args: dict, context: dict) -> dict:
     profile = await get_customer_profile(session, conversation_id)
+    # Deterministic in Python, not left to the model choosing to call analyze_customer_product_
+    # candidates first: that's only a prompt convention, and calling this tool directly would
+    # otherwise skip the discovery-completeness gate entirely (analyze's own gate never runs).
+    missing = get_missing_required_fields(profile)
+    if missing:
+        return _fail(f"not enough signal to generate yet -- still missing: {missing[0]}. Ask a natural follow-up to learn this before calling this tool again.")
     queried_profile = {**profile, "season": _effective_query_season(profile)}
     scratch = _get_scratch(conversation_id, profile)
     if not scratch["candidateProducts"]:

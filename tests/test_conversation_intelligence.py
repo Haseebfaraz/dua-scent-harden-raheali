@@ -136,12 +136,30 @@ async def test_known_profile_facts_are_always_injected_into_the_prompt(db_sessio
 # Section 10: confidence-based recommendation readiness (also see test_customer_profile.py)
 # ---------------------------------------------------------------------------
 
-async def test_analyze_candidates_succeeds_with_style_and_occasion_alone_no_location(db_session):
-    conversation_id = _conversation_id("readiness")
+async def test_analyze_candidates_rejects_style_and_occasion_alone(db_session):
+    # Phase 8: discovery completeness -- style + occasion alone (the old Phase 7 bar) is no longer
+    # enough; dislikes, performance, and location are still ungathered.
+    conversation_id = _conversation_id("readiness-incomplete")
     ctx = {"conversationId": conversation_id, "customerName": None, "customerEmail": None, "shopDomain": SHOP_DOMAIN}
     try:
         await execute_fragrance_tool(db_session, "save_customer_profile_field", '{"field": "preferredStyle", "value": "fresh"}', ctx)
         await execute_fragrance_tool(db_session, "save_customer_profile_field", '{"field": "occasion", "value": "wedding"}', ctx)
+        result = await execute_fragrance_tool(db_session, "analyze_customer_product_candidates", "{}", ctx)
+        assert result["modelContent"].startswith("Error")
+        assert "not enough signal" in result["modelContent"].lower()
+    finally:
+        await _cleanup(db_session, conversation_id)
+
+
+async def test_analyze_candidates_succeeds_once_every_discovery_dimension_is_covered(db_session):
+    conversation_id = _conversation_id("readiness-complete")
+    ctx = {"conversationId": conversation_id, "customerName": None, "customerEmail": None, "shopDomain": SHOP_DOMAIN}
+    try:
+        await execute_fragrance_tool(db_session, "save_customer_profile_field", '{"field": "preferredStyle", "value": "fresh"}', ctx)
+        await execute_fragrance_tool(db_session, "save_customer_profile_field", '{"field": "occasion", "value": "wedding"}', ctx)
+        await execute_fragrance_tool(db_session, "save_customer_profile_field", '{"field": "dislikesAsked", "value": true}', ctx)
+        await execute_fragrance_tool(db_session, "save_customer_profile_field", '{"field": "strengthPreference", "value": "moderate"}', ctx)
+        await execute_fragrance_tool(db_session, "save_customer_profile_field", '{"field": "locationAsked", "value": true}', ctx)
         result = await execute_fragrance_tool(db_session, "analyze_customer_product_candidates", "{}", ctx)
         assert not result["modelContent"].startswith("Error")
         assert "not enough signal" not in result["modelContent"].lower()

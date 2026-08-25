@@ -42,6 +42,7 @@ def empty_profile() -> dict[str, Any]:
         "giftRecipient": None,
         "dislikesAsked": False,
         "occasionAsked": False,
+        "locationAsked": False,
         "strengthPreference": None,
         "additionalPreferences": [],
         "locationVerified": False,
@@ -112,33 +113,43 @@ async def save_customer_profile_fields(
 
 
 def get_missing_required_fields(profile: dict[str, Any]) -> list[str]:
-    """Confidence-based readiness, not a fixed checklist (Phase 7): generate as soon as a real
-    style direction plus at least one other high-value signal exists, rather than requiring every
-    specific field to be individually filled in. The recommendation engine itself already
-    produces real results from likes/style alone with zero region/season signal -- city/country
-    were never a technical requirement, only a policy one, and that policy was blocking a
-    confident recommendation on customers who'd already given plenty to go on.
+    """Discovery-completeness policy (Phase 8) -- replaces the old "style direction + any ONE
+    other signal" binary, which let a recommendation build after just two weak facts (e.g. "strong
+    oud" + a passing "warm days" mention was already enough). Verified live that this was firing a
+    recommendation several turns before the customer had actually given enough to go on.
 
-    dislikesAsked/occasionAsked stay as real signals (a deliberately-confirmed "no dislikes" is
-    still worth something) but are no longer individually mandatory -- any one high-value signal
-    is enough once a style direction is known.
+    Every dimension below must be independently covered, though a single customer message can
+    supply several of them at once -- this is not a fixed question order or a rigid checklist read
+    back to the customer. The *Asked flags exist so a genuinely-answered "none"/"no preference" or
+    a customer who can't/won't give a city still counts as resolved -- this never re-asks and never
+    loops forever chasing a fact the customer isn't going to give.
+
+    Conceptually this is a 3-state model (DISCOVERY_INCOMPLETE / DISCOVERY_SUFFICIENT /
+    READY_TO_BUILD) collapsed into a single "what's still missing" list, since there is exactly one
+    consumer decision it drives: can analyze_customer_product_candidates run yet. An empty list is
+    READY_TO_BUILD; anything else is DISCOVERY_INCOMPLETE.
     """
-    has_style_direction = bool(profile.get("likes")) or bool(profile.get("preferredStyle")) or bool(profile.get("inferredStyle"))
-    if not has_style_direction:
-        return ["likes or preferredStyle"]
+    missing: list[str] = []
 
-    high_value_signal_present = any([
-        bool(profile.get("occasion")),
-        bool(profile.get("dislikes")) or bool(profile.get("dislikesAsked")),
-        bool(profile.get("occasionAsked")),
-        bool(profile.get("giftRecipient")),
-        bool(profile.get("strengthPreference")),
-        bool(profile.get("requestedSeasonStyle")),
-        bool(profile.get("city")) and bool(profile.get("locationVerified")),
-    ])
-    if not high_value_signal_present:
-        return ["at least one more high-value signal (occasion, dislikes, gift context, strength preference, or a verified location)"]
-    return []
+    has_style_direction = bool(profile.get("likes")) or bool(profile.get("preferredStyle")) or bool(profile.get("inferredStyle")) or bool(profile.get("additionalPreferences"))
+    if not has_style_direction:
+        missing.append("a fragrance direction, style, or vibe (likes, preferredStyle, or a mood word like seductive/clean/bold)")
+
+    if not (bool(profile.get("dislikes")) or bool(profile.get("dislikesAsked"))):
+        missing.append("dislikes or hard exclusions (or an explicit 'nothing I dislike')")
+
+    # A known gift recipient already establishes real use-context (who it's for) -- requiring a
+    # separate, distinct "occasion" fact on top of that would just be a second, redundant question.
+    if not (bool(profile.get("occasion")) or bool(profile.get("occasionAsked")) or bool(profile.get("giftRecipient"))):
+        missing.append("occasion or use context")
+
+    if not bool(profile.get("strengthPreference")):
+        missing.append("performance preference (longevity, projection, or strength)")
+
+    if not ((bool(profile.get("city")) and bool(profile.get("locationVerified"))) or bool(profile.get("locationAsked"))):
+        missing.append("location, for verified weather/season context")
+
+    return missing
 
 
 def is_profile_ready_for_analysis(profile: dict[str, Any]) -> bool:

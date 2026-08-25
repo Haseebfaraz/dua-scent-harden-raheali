@@ -32,8 +32,13 @@ def _ctx(conversation_id: str) -> dict:
 
 
 async def _verify_los_angeles_without_network(session, conversation_id: str) -> None:
+    # Also resolves the other Phase 8 discovery dimensions (occasion/dislikes/performance) this
+    # file's tests don't care about, via their *Asked-equivalent -- these tests are about
+    # generate/refine behavior itself, not discovery-completeness, which has its own dedicated
+    # tests in test_customer_profile.py and test_conversation_intelligence.py.
     await save_customer_profile_fields(session, conversation_id, {
         "city": "Los Angeles", "country": "United States", "locationVerified": True, "locationSource": "order_history",
+        "occasionAsked": True, "dislikesAsked": True, "strengthPreference": "moderate",
     })
 
 

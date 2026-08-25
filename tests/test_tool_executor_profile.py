@@ -235,6 +235,7 @@ async def test_analyze_candidates_never_requires_season(db_session, monkeypatch)
         await execute_fragrance_tool(db_session, "save_customer_profile_field", '{"field": "likes", "value": ["Fruity"]}', _ctx(conversation_id))
         await execute_fragrance_tool(db_session, "save_customer_profile_field", '{"field": "dislikesAsked", "value": true}', _ctx(conversation_id))
         await execute_fragrance_tool(db_session, "save_customer_profile_field", '{"field": "occasionAsked", "value": true}', _ctx(conversation_id))
+        await execute_fragrance_tool(db_session, "save_customer_profile_field", '{"field": "strengthPreference", "value": "moderate"}', _ctx(conversation_id))
         result = await execute_fragrance_tool(db_session, "analyze_customer_product_candidates", "{}", _ctx(conversation_id))
         assert "missing required fields" not in result["modelContent"].lower()
     finally:

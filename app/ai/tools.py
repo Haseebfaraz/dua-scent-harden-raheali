@@ -8,7 +8,7 @@ from app.services.customer_profile import VALID_SEASONS, VALID_STRENGTH_PREFEREN
 PROFILE_FIELD_NAMES = [
     "name", "email", "city", "stateRegion", "country", "requestedSeasonStyle",
     "likes", "dislikes", "preferredStyle", "occasion", "giftRecipient",
-    "dislikesAsked", "occasionAsked", "strengthPreference", "additionalPreferences",
+    "dislikesAsked", "occasionAsked", "locationAsked", "strengthPreference", "additionalPreferences",
 ]
 
 # Field name -> ("string" | "string_array" | "boolean" | "enum", extra) -- mirrors
@@ -27,6 +27,7 @@ PROFILE_FIELD_KINDS: dict[str, tuple[str, object]] = {
     "giftRecipient": ("string", None),
     "dislikesAsked": ("boolean", None),
     "occasionAsked": ("boolean", None),
+    "locationAsked": ("boolean", None),
     "strengthPreference": ("enum", VALID_STRENGTH_PREFERENCES),
     "additionalPreferences": ("string_array", None),
 }
@@ -63,12 +64,12 @@ FRAGRANCE_AGENT_TOOLS = [
         "type": "function",
         "function": {
             "name": "save_customer_profile_field",
-            "description": "Save one field of the customer's structured fragrance profile (name, email, city, stateRegion, country, requestedSeasonStyle, likes, dislikes, preferredStyle, occasion, giftRecipient, dislikesAsked, occasionAsked, strengthPreference, additionalPreferences). Call this every time the customer gives you a real answer for one of these — never track profile progress in your own memory. requestedSeasonStyle is ONLY for when the customer volunteers a specific seasonal style unprompted (e.g. 'I want something wintery') — never ask them what season it is or what season they associate with an occasion; live weather is handled automatically once their city is verified. giftRecipient is ONLY set when the customer indicates this is a gift for someone else (e.g. 'husband', 'wife', 'friend') — once set, likes/dislikes/preferredStyle/occasion describe that recipient, not necessarily the person chatting. dislikesAsked/occasionAsked are booleans (true/false) — set to true the moment you've asked about dislikes/occasion (or already knew the answer from earlier context), regardless of whether the real answer was 'none'/'nothing specific' — an empty dislikes list or a null occasion is ambiguous between 'never asked' and 'asked, real answer was none', these flags disambiguate it.",
+            "description": "Save one field of the customer's structured fragrance profile (name, email, city, stateRegion, country, requestedSeasonStyle, likes, dislikes, preferredStyle, occasion, giftRecipient, dislikesAsked, occasionAsked, locationAsked, strengthPreference, additionalPreferences). Call this every time the customer gives you a real answer for one of these — never track profile progress in your own memory. A single message often supplies several of these at once (e.g. 'strong and woody for date night, I'm in LA, love oud and hate vanilla' touches strengthPreference, preferredStyle/likes, occasion, city, and dislikes) — save every field it actually contains, not just one. strengthPreference captures longevity/projection/strength -- save it whenever the customer describes how strong or long-lasting they want it, even said casually as part of a like ('I like it strong', 'nothing too loud', 'needs to last all day'), not only when asked directly as its own question. requestedSeasonStyle is ONLY for when the customer volunteers a specific seasonal style unprompted (e.g. 'I want something wintery') — never ask them what season it is or what season they associate with an occasion; live weather is handled automatically once their city is verified. giftRecipient is ONLY set when the customer indicates this is a gift for someone else (e.g. 'husband', 'wife', 'friend') — once set, likes/dislikes/preferredStyle/occasion describe that recipient, not necessarily the person chatting. dislikesAsked/occasionAsked/locationAsked are booleans (true/false) — set to true the moment you've asked about dislikes/occasion/location (or already knew the answer from earlier context), regardless of whether the real answer was 'none'/'nothing specific'/'prefer not to say' — an empty dislikes list, a null occasion, or no city is ambiguous between 'never asked' and 'asked, real answer was none', these flags disambiguate it so you never ask the same thing twice.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "field": {"type": "string", "enum": PROFILE_FIELD_NAMES, "description": "Which profile field to set."},
-                    "value": {"description": "The value for this field. A plain string for most fields; an array of strings for likes/dislikes/additionalPreferences; a boolean (true/false) for dislikesAsked/occasionAsked."},
+                    "value": {"description": "The value for this field. A plain string for most fields; an array of strings for likes/dislikes/additionalPreferences; a boolean (true/false) for dislikesAsked/occasionAsked/locationAsked."},
                 },
                 "required": ["field", "value"],
             },
@@ -78,7 +79,7 @@ FRAGRANCE_AGENT_TOOLS = [
         "type": "function",
         "function": {
             "name": "get_customer_profile",
-            "description": "Get the customer's current structured fragrance profile and, if not yet ready, the single highest-value thing still missing before analysis can run (confidence-based, not a fixed checklist -- a real style direction plus one other high-value signal is enough; city/country are never individually required).",
+            "description": "Get the customer's current structured fragrance profile and, if not yet ready, the single highest-value thing still missing before analysis can run. Discovery completeness requires ALL of: a style/vibe direction (likes, preferredStyle, inferredStyle, or additionalPreferences), dislikes or hard exclusions resolved (a real list, or dislikesAsked=true meaning the customer was asked and effectively said none), an occasion or use context resolved (occasion, or occasionAsked=true), a performance preference (strengthPreference), and location resolved (a verified city, or locationAsked=true meaning the customer was asked and couldn't/wouldn't give one). This is not a fixed question order and not a multiple-choice questionnaire -- one customer message can satisfy several of these at once -- but every one of them must be genuinely covered before analysis, not just one or two.",
             "parameters": {"type": "object", "properties": {}},
         },
     },
@@ -86,7 +87,7 @@ FRAGRANCE_AGENT_TOOLS = [
         "type": "function",
         "function": {
             "name": "analyze_customer_product_candidates",
-            "description": "Deterministically score real DUA products against the customer's current profile using real order-history evidence (region, season/weather direction, likes/dislikes, repeat-purchase and popularity signals). Returns up to 10 real ProductCandidate results. Requires a real style direction (likes or preferredStyle) plus at least one other high-value signal (occasion, dislikes, gift context, strength preference, or a verified location) -- city/country alone are never required, and a verified location only helps when one is already known.",
+            "description": "Deterministically score real DUA products against the customer's current profile using real order-history evidence (region, season/weather direction, likes/dislikes, repeat-purchase and popularity signals). Returns up to 10 real ProductCandidate results. Requires genuine discovery completeness first -- see get_customer_profile's description for the exact dimensions (style/vibe, dislikes-resolved, occasion-resolved, performance preference, location-resolved). A style direction plus only one other weak signal (e.g. 'strong oud' plus a passing mention of warm weather) is NOT enough on its own anymore -- calling this before every dimension is covered will fail with the specific thing still missing.",
             "parameters": {"type": "object", "properties": {}},
         },
     },
