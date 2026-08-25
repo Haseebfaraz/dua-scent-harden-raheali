@@ -12,7 +12,7 @@ from app.config import settings
 logger = logging.getLogger(__name__)
 
 
-async def call_openai_once(messages: list[dict], tools: list[dict] | None) -> dict | None:
+async def call_openai_once(messages: list[dict], tools: list[dict] | None, tool_choice: dict | str | None = None) -> dict | None:
     payload = {
         "model": settings.openai_model,
         "messages": messages,
@@ -20,6 +20,8 @@ async def call_openai_once(messages: list[dict], tools: list[dict] | None) -> di
     }
     if tools:
         payload["tools"] = tools
+    if tool_choice:
+        payload["tool_choice"] = tool_choice
 
     try:
         async with httpx.AsyncClient(timeout=settings.openai_timeout_seconds) as client:

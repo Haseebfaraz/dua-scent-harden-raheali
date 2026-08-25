@@ -20,7 +20,7 @@ from app.ai.prompt import (
     get_known_profile_field_names,
 )
 from app.ai.tool_executor import execute_fragrance_tool
-from app.ai.tools import FRAGRANCE_AGENT_TOOLS, GENERAL_CONVERSATION_TOOLS
+from app.ai.tools import EXTRACTABLE_PROFILE_FIELD_NAMES, FRAGRANCE_AGENT_TOOLS, GENERAL_CONVERSATION_TOOLS, PROFILE_EXTRACTION_TOOL
 from app.services.customer_profile import get_customer_profile, get_missing_required_fields
 from app.services.conversation import get_conversation_history
 
@@ -55,6 +55,92 @@ def set_conversation_cache(conversation_id: str, history: list[dict]) -> None:
 _LEAKED_ID_PATTERN = re.compile(r"\bc[a-z0-9]{20,}\b", re.IGNORECASE)
 
 
+async def _extract_and_persist_profile_facts(
+    session: AsyncSession, history: list[dict], conversation_id: str, tool_context: dict,
+) -> tuple[list[dict], list[dict]]:
+    """One forced, structured extraction call up front instead of the model spending one full
+    round trip per fact via repeated save_customer_profile_field calls -- verified live that a
+    single fact-dense message ("strong and woody for date night, I'm in LA, love oud and hate
+    vanilla") was producing 5+ sequential save_customer_profile_field round trips, one per field.
+
+    Persists through the exact same execute_fragrance_tool dispatch the model itself would
+    otherwise use, so validation, vocabulary correction, dislike filtering, and location/weather
+    verification behave identically either way -- this only changes how many round trips it takes
+    to get there, never what gets saved or how.
+
+    Returns (sse_events, synthetic_messages). The synthetic messages matter: a static "profile
+    already saved: {...}" line in the system prompt was NOT enough on its own -- verified live
+    that the main loop's model still re-derived and re-saved (and even re-verified location)
+    everything from the raw customer text anyway, since it had no actual memory of having just
+    "done" anything (a prose claim doesn't carry the weight of the model's own tool-call history).
+    Synthesizing the exact assistant/tool_calls + tool-result messages this extraction performed,
+    appended after the customer's message, gives the main loop real conversational memory that it
+    already acted on this message -- the same mechanism it already trusts for its own prior turns.
+
+    Purely additive: on any failure (network, parse, empty result) this just no-ops and the normal
+    tool loop below still catches anything missed, exactly as it did before this existed.
+    """
+    latest_user_message = next((m for m in reversed(history) if m.get("role") == "user"), None)
+    if not latest_user_message:
+        return [], []
+
+    profile = await get_customer_profile(session, conversation_id)
+    extraction_system_prompt = (
+        "You are extracting structured fragrance-profile facts from this conversation's most "
+        "recent customer message. This is not a reply to the customer -- you never write "
+        "conversational text here, only call record_profile_updates with what you found.\n\n"
+        f"Profile already saved (do not re-extract anything already set here): {json.dumps(profile)}\n\n"
+        "Extract only from the customer's most recent message below; earlier turns are context "
+        "for disambiguation only (e.g. a bare \"no\" answering \"any dislikes?\" means "
+        "dislikesAsked=true, not a literal dislike named \"no\")."
+    )
+    extraction_messages = [{"role": "system", "content": extraction_system_prompt}, *history[-6:]]
+
+    data = await call_openai_once(
+        extraction_messages, [PROFILE_EXTRACTION_TOOL],
+        tool_choice={"type": "function", "function": {"name": "record_profile_updates"}},
+    )
+    if not data:
+        return [], []
+
+    try:
+        tool_calls = data["choices"][0]["message"].get("tool_calls") or []
+        if not tool_calls:
+            return [], []
+        args = json.loads(tool_calls[0]["function"]["arguments"])
+    except (KeyError, IndexError, json.JSONDecodeError, TypeError) as err:
+        logger.warning("PROFILE_EXTRACTION_PARSE_FAILED conversationId=%s error=%s", conversation_id, err)
+        return [], []
+
+    sse_events: list[dict] = []
+    synthetic_calls: list[dict] = []
+    synthetic_results: list[dict] = []
+
+    async def _run(tool_name: str, tool_args: dict) -> None:
+        call_id = f"extract_{uuid.uuid4().hex[:12]}"
+        synthetic_calls.append({"id": call_id, "type": "function", "function": {"name": tool_name, "arguments": json.dumps(tool_args)}})
+        result = await execute_fragrance_tool(session, tool_name, json.dumps(tool_args), tool_context)
+        synthetic_results.append({"role": "tool", "tool_call_id": call_id, "content": result["modelContent"]})
+        if result.get("sseEvent"):
+            sse_events.append(result["sseEvent"])
+
+    for update in (args.get("fieldsToUpdate") or []):
+        field = update.get("field")
+        if field not in EXTRACTABLE_PROFILE_FIELD_NAMES:
+            continue
+        await _run("save_customer_profile_field", {"field": field, "value": update.get("value")})
+
+    city_text = args.get("cityText")
+    if city_text:
+        await _run("verify_customer_location", {"cityText": city_text})
+
+    if not synthetic_calls:
+        return sse_events, []
+
+    synthetic_messages = [{"role": "assistant", "content": None, "tool_calls": synthetic_calls}, *synthetic_results]
+    return sse_events, synthetic_messages
+
+
 async def call_ai(
     session: AsyncSession, history: list[dict], conversation_id: str,
     known_customer_email: str | None, known_customer_name: str | None, shop_domain: str,
@@ -79,11 +165,6 @@ async def call_ai(
         "highSignalFlags": high_signal_flags,
     }))
 
-    system_prompt = await build_system_prompt(session, history, conversation_id, known_customer_email, known_customer_name)
-    messages: list[dict] = [{"role": "system", "content": system_prompt}, *history]
-    final_text = ""
-    sse_events: list[dict] = []
-    called_tool_names: list[str] = []
     tool_context = {
         "conversationId": conversation_id, "customerName": confirmed_customer_name,
         "customerEmail": confirmed_customer_email, "shopDomain": shop_domain,
@@ -97,6 +178,23 @@ async def call_ai(
     # still be saved.
     conversation_mode = determine_conversation_mode(history, profile_for_identity)
     tools_for_turn = GENERAL_CONVERSATION_TOOLS if conversation_mode == "GENERAL_CONVERSATION" else FRAGRANCE_AGENT_TOOLS
+
+    # Batch-extract before building the system prompt, so profile_status_line/missing_fields below
+    # already reflect whatever this message just supplied -- collapses what used to be several
+    # sequential save_customer_profile_field round trips into one.
+    sse_events: list[dict] = []
+    extraction_synthetic_messages: list[dict] = []
+    if conversation_mode == "FRAGRANCE_DISCOVERY":
+        extracted_sse_events, extraction_synthetic_messages = await _extract_and_persist_profile_facts(session, history, conversation_id, tool_context)
+        sse_events.extend(extracted_sse_events)
+
+    system_prompt = await build_system_prompt(session, history, conversation_id, known_customer_email, known_customer_name)
+    # The synthetic tool-call/result pair goes AFTER the customer's message so the model sees it as
+    # its own completed reaction to that message -- a static "already saved" line in the prompt was
+    # not enough on its own to stop the model re-deriving and re-saving everything itself.
+    messages: list[dict] = [{"role": "system", "content": system_prompt}, *history, *extraction_synthetic_messages]
+    final_text = ""
+    called_tool_names: list[str] = []
 
     # Up to 10 tool-resolution turns -- 6 wasn't enough headroom for the model to save several
     # profile fields one at a time (it doesn't batch parallel tool calls) and still reach

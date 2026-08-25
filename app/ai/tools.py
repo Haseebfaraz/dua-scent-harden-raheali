@@ -235,3 +235,59 @@ FRAGRANCE_AGENT_TOOLS = [
 GENERAL_CONVERSATION_TOOLS = [
     tool for tool in FRAGRANCE_AGENT_TOOLS if tool["function"]["name"] == "save_customer_profile_field"
 ]
+
+# name/email/city/stateRegion/country are excluded: identity fields resolve elsewhere, and city
+# must go through verify_customer_location (real geocoding), never a direct save -- callers of
+# PROFILE_EXTRACTION_TOOL route a mentioned city through its separate cityText slot instead.
+EXTRACTABLE_PROFILE_FIELD_NAMES = [
+    "likes", "dislikes", "preferredStyle", "occasion", "giftRecipient",
+    "requestedSeasonStyle", "strengthPreference", "additionalPreferences",
+    "dislikesAsked", "occasionAsked", "locationAsked",
+]
+
+# A single dedicated, forced tool call that extracts every explicit high-confidence fact from one
+# customer message at once, instead of the model spending one full round trip per field via
+# repeated save_customer_profile_field calls (verified live: a single fact-dense message was
+# producing 5+ sequential save_customer_profile_field round trips). conversation_flow.py calls the
+# model with only this tool and tool_choice forced to it, persists everything deterministically in
+# Python, then lets the normal tool loop continue from the now-updated profile -- so a customer
+# revealing several facts at once no longer costs several sequential model round trips.
+PROFILE_EXTRACTION_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "record_profile_updates",
+        "description": (
+            "Record every explicit, high-confidence fragrance-profile fact in the customer's latest "
+            "message, all at once -- one message can supply several. Do NOT record anything ambiguous "
+            "or uncertain (a bare color with no stated fragrance connection, vague small talk, a "
+            "reading you're not confident in) -- leave it out entirely rather than guessing; the "
+            "conversation will still ask about it naturally afterward. A genuine vibe/mood word "
+            "(seductive, clean, bold, professional, comforting, mysterious, energetic, etc.) said "
+            "about the fragrance itself IS explicit -- record it as a like/style value. "
+            "strengthPreference covers longevity/projection/strength, including said casually "
+            "('I like it strong'). If the customer states they have no dislikes, no particular "
+            "occasion, or won't give a location, that is itself a fact -- set the matching *Asked "
+            "flag to true rather than leaving it out. Never put a city here -- use cityText. If "
+            "genuinely nothing new and explicit is in this message, call this with an empty "
+            "fieldsToUpdate array and no cityText."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "fieldsToUpdate": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "field": {"type": "string", "enum": EXTRACTABLE_PROFILE_FIELD_NAMES},
+                            "value": {"description": "A plain string for most fields; an array of strings for likes/dislikes/additionalPreferences; a boolean for the *Asked flags."},
+                        },
+                        "required": ["field", "value"],
+                    },
+                },
+                "cityText": {"type": "string", "description": "The raw city the customer mentioned this message, verbatim, if any. Omit entirely if none."},
+            },
+            "required": ["fieldsToUpdate"],
+        },
+    },
+}

@@ -99,7 +99,9 @@ async def test_fragrance_discovery_mode_gets_the_full_tool_set(db_session, monke
 
     captured_tools = []
 
-    async def _fake_call_openai_once(messages, tools):
+    async def _fake_call_openai_once(messages, tools, tool_choice=None):
+        if tool_choice:
+            return {"choices": [{"finish_reason": "stop", "message": {"content": None}}]}  # batch-extraction pre-pass: nothing to extract
         captured_tools.append(tools)
         return {"choices": [{"finish_reason": "stop", "message": {"content": "Let's find you something fresh for the wedding."}}]}
 
@@ -193,7 +195,9 @@ async def test_refinement_never_drops_a_previously_saved_dislike(db_session):
 async def test_call_ai_gives_the_model_a_second_turn_to_write_the_reasoning_bridge(db_session, monkeypatch):
     calls = []
 
-    async def _fake_call_openai_once(messages, use_tools):
+    async def _fake_call_openai_once(messages, use_tools, tool_choice=None):
+        if tool_choice:
+            return {"choices": [{"finish_reason": "stop", "message": {"content": None}}]}  # batch-extraction pre-pass: nothing to extract
         calls.append(use_tools)
         if len(calls) == 1:
             return {"choices": [{"finish_reason": "tool_calls", "message": {
