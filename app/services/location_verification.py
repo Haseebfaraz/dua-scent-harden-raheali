@@ -33,7 +33,37 @@ async def _geocode_place(place_name: str) -> dict[str, Any]:
     return {"results": results if isinstance(results, list) else []}
 
 
-_NO_MATCH = {"verified": False, "city": None, "country": None, "source": None, "needsClarification": False, "candidates": []}
+_NO_MATCH = {
+    "verified": False, "city": None, "stateRegion": None, "country": None,
+    "latitude": None, "longitude": None, "source": None, "needsClarification": False, "candidates": [],
+}
+
+
+def _select_confident_match(candidates: list[dict]) -> dict | None:
+    """Picks the one candidate location should be treated as resolved, or None when the
+    ambiguity is real enough to be worth asking about.
+
+    Open-Meteo's geocoding API already returns results in its own relevance order -- for a
+    well-known city (Liverpool, Paris, New York, Dubai, Karachi...) the first result is
+    essentially always the intended place, with any same-named duplicates being minor towns far
+    behind it. `population`, when the API supplies it, is a concrete way to confirm that: the top
+    result is confident either because no other candidate has comparable population data to
+    rival it, or because it clearly outweighs whatever rival exists. Only genuinely close
+    population figures (a real contender, not a namesake village) fall through to asking the
+    customer.
+    """
+    if len(candidates) == 1:
+        return candidates[0]
+
+    top = candidates[0]
+    top_population = top.get("population") or 0
+    if top_population <= 0:
+        # No population data to compare with -- trust the geocoder's own top-ranked relevance
+        # match rather than treating every same-named place as an even toss-up.
+        return top
+
+    rivals = [c for c in candidates[1:] if (c.get("population") or 0) >= top_population * 0.5]
+    return top if not rivals else None
 
 
 async def verify_city(session: AsyncSession, city_text: str | None) -> dict[str, Any]:
@@ -53,7 +83,10 @@ async def verify_city(session: AsyncSession, city_text: str | None) -> dict[str,
         return {
             "verified": True,
             "city": history_match.city,
+            "stateRegion": history_match.stateName or None,
             "country": history_match.countryName or None,
+            "latitude": None,
+            "longitude": None,
             "source": "order_history",
             "needsClarification": False,
             "candidates": [],
@@ -71,11 +104,15 @@ async def verify_city(session: AsyncSession, city_text: str | None) -> dict[str,
         seen.setdefault(key, r)
     distinct_candidates = list(seen.values())
 
-    if len(distinct_candidates) > 1:
+    match = _select_confident_match(distinct_candidates)
+    if match is None:
         return {
             "verified": False,
             "city": None,
+            "stateRegion": None,
             "country": None,
+            "latitude": None,
+            "longitude": None,
             "source": None,
             "needsClarification": True,
             "candidates": [
@@ -83,26 +120,36 @@ async def verify_city(session: AsyncSession, city_text: str | None) -> dict[str,
             ],
         }
 
-    match = distinct_candidates[0]
     return {
         "verified": True,
         "city": match.get("name"),
+        "stateRegion": match.get("admin1") or None,
         "country": match.get("country") or None,
+        "latitude": match.get("latitude"),
+        "longitude": match.get("longitude"),
         "source": "geocoding",
         "needsClarification": False,
         "candidates": [],
     }
 
 
-async def fetch_current_weather(verified_city_name: str) -> dict[str, Any] | None:
-    geocode = await _geocode_place(verified_city_name)
-    results = geocode["results"]
-    if not results:
-        return None
-    place = results[0]
+async def fetch_current_weather(
+    verified_city_name: str, latitude: float | None = None, longitude: float | None = None
+) -> dict[str, Any] | None:
+    # verify_city's geocoding tier already resolves real latitude/longitude for the exact place it
+    # just confirmed -- reuse that instead of re-geocoding by name a second time (and risking a
+    # different top match than the one actually verified). Only re-geocodes when the caller
+    # genuinely doesn't have coordinates yet (e.g. an order-history-only match).
+    if latitude is None or longitude is None:
+        geocode = await _geocode_place(verified_city_name)
+        results = geocode["results"]
+        if not results:
+            return None
+        place = results[0]
+        latitude, longitude = place["latitude"], place["longitude"]
 
     url = (
-        f"https://api.open-meteo.com/v1/forecast?latitude={place['latitude']}&longitude={place['longitude']}"
+        f"https://api.open-meteo.com/v1/forecast?latitude={latitude}&longitude={longitude}"
         "&current=temperature_2m,weather_code,relative_humidity_2m&temperature_unit=fahrenheit"
     )
     try:

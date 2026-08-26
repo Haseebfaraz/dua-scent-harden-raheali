@@ -32,7 +32,8 @@ async def test_rejects_empty_string_without_network_call(db_session, monkeypatch
     monkeypatch.setattr(lv, "_http_get", _tracked)
     result = await lv.verify_city(db_session, "")
     assert result == {
-        "verified": False, "city": None, "country": None, "source": None,
+        "verified": False, "city": None, "stateRegion": None, "country": None,
+        "latitude": None, "longitude": None, "source": None,
         "needsClarification": False, "candidates": [],
     }
     assert called is False
@@ -58,7 +59,10 @@ async def test_accepts_real_city_with_zero_order_history(db_session, monkeypatch
 
 
 @pytest.mark.asyncio
-async def test_flags_multiple_distinct_places_as_needing_clarification(db_session, monkeypatch):
+async def test_prefers_top_geocoding_result_when_no_population_data(db_session, monkeypatch):
+    # Real place names can collide (a namesake town), but Open-Meteo already ranks its own top
+    # result as the intended place -- without population data to weigh a rival, auto-resolve to
+    # it rather than asking the customer to disambiguate every shared city name.
     async def _get(url):
         return _mock_geocode_response([
             {"name": "Paris", "country": "France", "latitude": 48.85, "longitude": 2.35},
@@ -67,6 +71,22 @@ async def test_flags_multiple_distinct_places_as_needing_clarification(db_sessio
 
     monkeypatch.setattr(lv, "_http_get", _get)
     result = await lv.verify_city(db_session, "Paris-Not-In-Order-History-Test")
+    assert result["verified"] is True
+    assert result["needsClarification"] is False
+    assert result["city"] == "Paris"
+    assert result["country"] == "France"
+
+
+@pytest.mark.asyncio
+async def test_flags_genuinely_comparable_population_candidates_as_needing_clarification(db_session, monkeypatch):
+    async def _get(url):
+        return _mock_geocode_response([
+            {"name": "Springfield", "country": "United States", "latitude": 39.78, "longitude": -89.65, "population": 114000},
+            {"name": "Springfield", "country": "Canada", "latitude": 45.19, "longitude": -66.98, "population": 92000},
+        ])
+
+    monkeypatch.setattr(lv, "_http_get", _get)
+    result = await lv.verify_city(db_session, "Springfield-Not-In-Order-History-Test")
     assert result["needsClarification"] is True
     assert result["verified"] is False
     assert len(result["candidates"]) == 2
@@ -165,3 +185,88 @@ async def test_fetch_current_weather_null_on_malformed_forecast(monkeypatch):
     monkeypatch.setattr(lv, "_http_get", _get)
     result = await lv.fetch_current_weather("Miami")
     assert result is None
+
+
+def _mock_geocode(monkeypatch, name, country, admin1, latitude, longitude, population=None):
+    candidate = {"name": name, "country": country, "admin1": admin1, "latitude": latitude, "longitude": longitude}
+    if population is not None:
+        candidate["population"] = population
+
+    async def _get(url):
+        return _mock_geocode_response([candidate])
+
+    monkeypatch.setattr(lv, "_http_get", _get)
+
+
+@pytest.mark.asyncio
+async def test_liverpool_auto_resolves_city_region_and_country(db_session, monkeypatch):
+    _mock_geocode(monkeypatch, "Liverpool", "United Kingdom", "England", 53.41, -2.98)
+    result = await lv.verify_city(db_session, "Liverpool-Not-In-Order-History-Test")
+    assert result["verified"] is True
+    assert result["needsClarification"] is False
+    assert result["city"] == "Liverpool"
+    assert result["stateRegion"] == "England"
+    assert result["country"] == "United Kingdom"
+
+
+@pytest.mark.asyncio
+async def test_liverpool_uk_normalizes_and_verifies_directly(db_session, monkeypatch):
+    _mock_geocode(monkeypatch, "Liverpool", "United Kingdom", "England", 53.41, -2.98)
+    result = await lv.verify_city(db_session, "Liverpool, UK")
+    assert result["verified"] is True
+    assert result["needsClarification"] is False
+    assert result["city"] == "Liverpool"
+    assert result["stateRegion"] == "England"
+    assert result["country"] == "United Kingdom"
+
+
+@pytest.mark.asyncio
+async def test_new_york_auto_resolves_state_and_country(db_session, monkeypatch):
+    _mock_geocode(monkeypatch, "New York", "United States", "New York", 40.71, -74.01)
+    result = await lv.verify_city(db_session, "New-York-Not-In-Order-History-Test")
+    assert result["verified"] is True
+    assert result["needsClarification"] is False
+    assert result["city"] == "New York"
+    assert result["stateRegion"] == "New York"
+    assert result["country"] == "United States"
+
+
+@pytest.mark.asyncio
+async def test_paris_auto_resolves_to_france(db_session, monkeypatch):
+    _mock_geocode(monkeypatch, "Paris", "France", "Île-de-France", 48.85, 2.35)
+    result = await lv.verify_city(db_session, "Paris-Auto-Resolve-Test")
+    assert result["verified"] is True
+    assert result["needsClarification"] is False
+    assert result["city"] == "Paris"
+    assert result["country"] == "France"
+
+
+@pytest.mark.asyncio
+async def test_dubai_auto_resolves_to_united_arab_emirates(db_session, monkeypatch):
+    _mock_geocode(monkeypatch, "Dubai", "United Arab Emirates", "Dubai", 25.2, 55.27)
+    result = await lv.verify_city(db_session, "Dubai-Not-In-Order-History-Test")
+    assert result["verified"] is True
+    assert result["needsClarification"] is False
+    assert result["city"] == "Dubai"
+    assert result["country"] == "United Arab Emirates"
+
+
+@pytest.mark.asyncio
+async def test_karachi_auto_resolves_to_pakistan(db_session, monkeypatch):
+    _mock_geocode(monkeypatch, "Karachi", "Pakistan", "Sindh", 24.86, 67.0)
+    result = await lv.verify_city(db_session, "Karachi-Not-In-Order-History-Test")
+    assert result["verified"] is True
+    assert result["needsClarification"] is False
+    assert result["city"] == "Karachi"
+    assert result["country"] == "Pakistan"
+
+
+@pytest.mark.asyncio
+async def test_invalid_location_only_then_allows_one_clarification(db_session, monkeypatch):
+    async def _get(url):
+        return _mock_geocode_response([])
+
+    monkeypatch.setattr(lv, "_http_get", _get)
+    result = await lv.verify_city(db_session, "Xyzzyplorp-Not-A-Real-Place")
+    assert result["verified"] is False
+    assert result["needsClarification"] is False

@@ -511,11 +511,12 @@ async def _handle_verify_customer_location(session: AsyncSession, conversation_i
     prior_profile = await get_customer_profile(session, conversation_id)
     fields: dict[str, Any] = {
         "city": result["city"], "country": result["country"] or prior_profile.get("country"),
+        "stateRegion": result.get("stateRegion") or prior_profile.get("stateRegion"),
         "locationVerified": True, "locationSource": result["source"],
     }
 
     conflict_message = ""
-    weather = await fetch_current_weather(result["city"])
+    weather = await fetch_current_weather(result["city"], result.get("latitude"), result.get("longitude"))
     if weather:
         summary = describe_weather_simple(weather["tempF"], weather["weatherCode"])["summary"]
         direction = derive_weather_direction(weather["tempF"], weather["weatherCode"], weather["relativeHumidityPercent"])

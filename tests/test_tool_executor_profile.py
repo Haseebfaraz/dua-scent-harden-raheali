@@ -178,6 +178,73 @@ async def test_verify_location_rejects_fictional_city(db_session, monkeypatch):
         await _cleanup(db_session, conversation_id)
 
 
+def _mock_single_geocode(monkeypatch, name, country, admin1, latitude, longitude):
+    calls = []
+
+    async def _get(url):
+        calls.append(url)
+        if len(calls) == 1:
+            return _mock_geocode_response([{"name": name, "country": country, "admin1": admin1, "latitude": latitude, "longitude": longitude}])
+        return httpx.Response(200, json={"current": {"temperature_2m": 60, "weather_code": 1, "relative_humidity_2m": 50}})
+
+    monkeypatch.setattr(lv, "_http_get", _get)
+
+
+@pytest.mark.asyncio
+async def test_liverpool_auto_resolves_city_region_country_without_second_question(db_session, monkeypatch):
+    conversation_id = _new_conversation_id("liverpool1")
+    try:
+        _mock_single_geocode(monkeypatch, "Liverpool", "United Kingdom", "England", 53.41, -2.98)
+        result = await execute_fragrance_tool(db_session, "verify_customer_location", '{"cityText": "Liverpool"}', _ctx(conversation_id))
+
+        assert "which liverpool" not in result["modelContent"].lower()
+        assert "which country" not in result["modelContent"].lower()
+        assert "what country" not in result["modelContent"].lower()
+
+        profile = await get_customer_profile(db_session, conversation_id)
+        assert profile["locationVerified"] is True
+        assert profile["city"] == "Liverpool"
+        assert profile["stateRegion"] == "England"
+        assert profile["country"] == "United Kingdom"
+    finally:
+        await _cleanup(db_session, conversation_id)
+
+
+@pytest.mark.asyncio
+async def test_valid_verified_city_never_triggers_clarification_content(db_session, monkeypatch):
+    conversation_id = _new_conversation_id("liverpool2")
+    try:
+        _mock_single_geocode(monkeypatch, "New York", "United States", "New York", 40.71, -74.01)
+        result = await execute_fragrance_tool(db_session, "verify_customer_location", '{"cityText": "New York"}', _ctx(conversation_id))
+
+        assert "ask the customer which one they mean" not in result["modelContent"].lower()
+        assert "couldn't confidently match" not in result["modelContent"].lower()
+
+        profile = await get_customer_profile(db_session, conversation_id)
+        assert profile["city"] == "New York"
+        assert profile["country"] == "United States"
+    finally:
+        await _cleanup(db_session, conversation_id)
+
+
+@pytest.mark.asyncio
+async def test_invalid_location_allows_exactly_one_clarification(db_session, monkeypatch):
+    conversation_id = _new_conversation_id("invalidloc1")
+    try:
+        async def _get(url):
+            return _mock_geocode_response([])
+
+        monkeypatch.setattr(lv, "_http_get", _get)
+        result = await execute_fragrance_tool(db_session, "verify_customer_location", '{"cityText": "Xyzzyplorp-Not-A-Real-Place"}', _ctx(conversation_id))
+        assert "which real city are you currently in" in result["modelContent"].lower()
+
+        profile = await get_customer_profile(db_session, conversation_id)
+        assert profile["locationVerified"] is False
+        assert profile["city"] is None
+    finally:
+        await _cleanup(db_session, conversation_id)
+
+
 @pytest.mark.asyncio
 async def test_season_style_no_conflict_with_no_weather_yet(db_session):
     conversation_id = _new_conversation_id("season3")
