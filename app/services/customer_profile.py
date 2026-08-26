@@ -49,6 +49,8 @@ def empty_profile() -> dict[str, Any]:
         "locationSource": None,
         "selectedRecommendationId": None,
         "pendingRecreateRecommendationId": None,
+        "fragrancePivotOffered": False,
+        "fragrancePivotDeclined": False,
     }
 
 

@@ -114,6 +114,47 @@ def detect_high_signal_flags(text: str | None) -> list[str]:
     return [flag for pattern, flag in _HIGH_SIGNAL_PATTERNS if pattern.search(value)]
 
 
+_MEANINGFUL_TURN_MIN = 2
+
+# Deterministic contextual-acceptance/decline detection for the soft fragrance pivot -- matched
+# against the message with punctuation stripped so "Yeah, go for it." and "yeah go for it" are the
+# same check. Deliberately a closed set of short, unambiguous replies rather than a loose regex:
+# a bare "yes"/"sure" is only fragrance intent when it's answering an invitation the assistant
+# just made (gated on fragrancePivotOffered below), never in an unrelated context.
+_FRAGRANCE_ACCEPTANCE_PHRASES = {
+    "yes", "yes please", "yeah", "yeah sure", "yeah lets do it", "yeah go for it",
+    "yep", "yup", "sure", "sure why not", "ok", "okay", "alright",
+    "why not", "go ahead", "go for it", "lets do it", "do it", "sounds good",
+    "definitely", "absolutely",
+}
+_FRAGRANCE_DECLINE_PHRASES = {
+    "no", "nah", "no thanks", "no thank you", "not now", "not right now",
+    "not today", "maybe later", "not interested", "im good", "im good for now",
+}
+
+
+def _clean_short_reply(text: str | None) -> str:
+    if not isinstance(text, str):
+        return ""
+    cleaned = re.sub(r"[^a-z\s']", " ", text.lower())
+    return re.sub(r"\s+", " ", cleaned).strip()
+
+
+def is_fragrance_pivot_acceptance(text: str | None) -> bool:
+    return _clean_short_reply(text) in _FRAGRANCE_ACCEPTANCE_PHRASES
+
+
+def is_fragrance_pivot_decline(text: str | None) -> bool:
+    return _clean_short_reply(text) in _FRAGRANCE_DECLINE_PHRASES
+
+
+def _last_user_message_content(history: list[dict]) -> str | None:
+    for message in reversed(history):
+        if message.get("role") == "user":
+            return message.get("content")
+    return None
+
+
 def determine_conversation_mode(history: list[dict], profile: dict) -> str:
     """Return the deterministic conversation mode.
 
@@ -135,9 +176,32 @@ def determine_conversation_mode(history: list[dict], profile: dict) -> str:
         or profile.get("likes")
         or profile.get("dislikes")
     )
-    if has_conversation_context or has_high_signal_message or has_saved_fragrance_signal:
+    # Contextual acceptance: a bare "yeah"/"sure" only counts as fragrance intent when it's
+    # answering a soft pivot invitation the assistant just made (see should_offer_fragrance_pivot),
+    # never as a standalone signal.
+    has_contextual_acceptance = bool(profile.get("fragrancePivotOffered")) and is_fragrance_pivot_acceptance(
+        _last_user_message_content(history)
+    )
+    if has_conversation_context or has_high_signal_message or has_saved_fragrance_signal or has_contextual_acceptance:
         return "FRAGRANCE_DISCOVERY"
     return "GENERAL_CONVERSATION"
+
+
+def should_offer_fragrance_pivot(history: list[dict], profile: dict) -> bool:
+    """Deterministic eligibility gate for the soft fragrance pivot -- Python decides WHEN the
+    assistant is allowed to make one, the model still decides (via the prompt) whether this
+    specific turn is actually a natural moment to take it (e.g. skipping an urgent question or an
+    upset customer). Not left for the model to remember on its own.
+    """
+    if determine_conversation_mode(history, profile) != "GENERAL_CONVERSATION":
+        return False
+    if profile.get("fragrancePivotDeclined") or profile.get("fragrancePivotOffered"):
+        return False
+    meaningful_user_turns = [
+        message for message in history
+        if message.get("role") == "user" and isinstance(message.get("content"), str) and message["content"].strip()
+    ]
+    return len(meaningful_user_turns) >= _MEANINGFUL_TURN_MIN
 
 
 _EMAIL_PATTERN = re.compile(r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}")
@@ -232,6 +296,25 @@ Reply to rewrite:
 """
 
 
+_HUMAN_SALES_CONVERSATION_SECTION = """HUMAN SALES CONVERSATION
+
+Talk like an experienced salesperson chatting with someone in the store, not a scripted concierge working through a checklist.
+
+React before you ask. A short reaction or observation usually lands better than jumping straight to a question.
+
+Vary your sentence length and structure. Do not repeat the same acknowledgment, summary, question pattern every turn.
+
+Sometimes reply with just a reaction, sometimes a short observation plus a question, sometimes only a question, sometimes a short answer with no question at all, sometimes a light, professional, playful comment.
+
+Use contractions naturally. Match the customer's tone and energy.
+
+Ask one question at a time. Let transitions feel spontaneous, not procedural.
+
+Never repeatedly say got it, understood, noted, that helps narrow it down, that makes sense, or thanks for sharing.
+
+Never expose an internal checklist. Do not say things like I still need one more detail, I need your city, I need one more preference, or I can build it properly once I have that. Ask for the same thing the way a person would instead: swap "I need your city" for "Where are you wearing this from?", and swap "I still need one performance detail before I can build it" for "How do you want it to wear around people, more noticeable or a little closer to you?"."""
+
+
 _EARLY_PHASE_TEMPLATE = """
 You are DUA Scent Concierge, the conversational fragrance expert for The DUA Brand.
 
@@ -239,11 +322,19 @@ conversationMode = GENERAL_CONVERSATION
 
 This mode is enforced by Python. You do not decide whether to switch modes.
 
-While conversationMode is GENERAL_CONVERSATION, asking about perfume, fragrance, scent preferences, notes, fragrance occasion, longevity, projection, performance, or fragrance style is invalid unless the customer introduces fragrance intent first.
+While conversationMode is GENERAL_CONVERSATION, asking a specific fragrance preference question (what scent, what notes, what fragrance style, what perfume, occasion, longevity, projection, or performance) is invalid unless the customer introduces fragrance intent first.
+
+A single soft, natural fragrance invitation is different from a preference question. It does not ask what the customer wants yet -- it only offers to help, connected to what the customer was just talking about.
+
+Do not force fragrance immediately. Start naturally. Build a little rapport first.
+
+{pivot_instruction}
 
 Follow the customer's latest topic naturally.
 
 A greeting, a name, ordinary small talk, a job, a hobby, a robot project, or a general question is not fragrance intent by itself.
+
+{human_sales_section}
 
 CUSTOMER FACING STYLE CONTRACT
 
@@ -275,15 +366,17 @@ CONVERSATION BEHAVIOR
 
 For a bare greeting or casual opener with no fragrance intent, respond warmly and naturally. You may ask one casual general question about their day or what they are doing.
 
-Do not mention fragrance unless the customer brings it up.
-
-Do not manufacture several rounds of small talk before helping.
+Do not manufacture several rounds of small talk before helping. After a little rapport, if the customer has not introduced fragrance themselves, look for a genuine conversational opening and make one soft fragrance invitation. The invitation should connect to what the customer has been talking about. Do not sound promotional or scripted.
 
 If the customer asks a normal general question, answer it naturally.
 
 If the customer later introduces a fragrance need, preference, dislike, gift, occasion, or asks you to create a fragrance, engage with that immediately. Python will switch the mode on the next turn.
 
 If something the customer says is genuinely ambiguous, do not invent a fragrance meaning. Ask one short clarification only when needed.
+
+Skip the fragrance invitation this turn if the customer is asking an urgent unrelated question, seems upset, has already said they do not want fragrance help, or is discussing something that deserves a direct answer first -- answer that first and look for a later opening instead.
+
+If the customer explicitly declines fragrance help (no, not now, maybe later, I don't want that, or similar), call save_customer_profile_field for fragrancePivotDeclined with true, respect it, and do not offer again this conversation unless they bring fragrance up themselves.
 
 {name_line}
 
@@ -339,6 +432,8 @@ Use the customer's name sparingly and only when it genuinely improves a meaningf
 Never expose internal IDs, recommendation IDs, database handles, scores, ranking values, inventory quantities, tool names, or system statuses.
 
 Do not volunteer technical implementation details. If the customer directly asks what you are, answer briefly and truthfully, then return to helping naturally.
+
+{human_sales_section}
 
 CORE CONVERSATION RULE
 
@@ -614,6 +709,17 @@ async def build_system_prompt(
     known_customer_name: str | None,
 ) -> str:
     profile = await get_customer_profile(session, conversation_id)
+
+    # Deterministic decline detection: once a pivot has been offered, a clear short decline from
+    # the customer is unambiguous evidence -- persisted here rather than left to the model
+    # remembering to call save_customer_profile_field itself.
+    if (
+        profile.get("fragrancePivotOffered")
+        and not profile.get("fragrancePivotDeclined")
+        and is_fragrance_pivot_decline(_last_user_message_content(history))
+    ):
+        profile = await save_customer_profile_field(session, conversation_id, "fragrancePivotDeclined", True)
+
     missing_fields = get_missing_required_fields(profile)
 
     confirmed_customer_name = known_customer_name or profile.get("name")
@@ -686,11 +792,31 @@ async def build_system_prompt(
                 "The customer's email is not available yet. Do not ask for it and do not block the conversation on it."
             )
 
+        if profile.get("fragrancePivotDeclined"):
+            pivot_instruction = (
+                "The customer already declined a fragrance invitation earlier in this conversation. "
+                "Do not offer again. Continue normal conversation, and only engage with fragrance if the customer brings it up themselves."
+            )
+        elif profile.get("fragrancePivotOffered"):
+            pivot_instruction = (
+                "A soft fragrance invitation was already made earlier in this conversation. "
+                "Do not repeat it. If the customer's latest message accepts it, Python has already switched modes -- otherwise continue naturally."
+            )
+        elif should_offer_fragrance_pivot(history, profile):
+            pivot_instruction = (
+                "You may make ONE soft, natural fragrance invitation now if this genuinely feels like a natural moment, connected to what the customer just said. "
+                "If you do, call save_customer_profile_field for fragrancePivotOffered with true in this same reply."
+            )
+        else:
+            pivot_instruction = "Do not introduce fragrance yet. Keep the conversation natural for now."
+
         return _EARLY_PHASE_TEMPLATE.format(
             profile_status_line=profile_status_line,
             name_line=name_line,
             email_line=email_line,
             name_usage_instruction=customer_name_usage_instruction,
+            pivot_instruction=pivot_instruction,
+            human_sales_section=_HUMAN_SALES_CONVERSATION_SECTION,
         )
 
     if confirmed_customer_email:
@@ -717,4 +843,5 @@ async def build_system_prompt(
         name_critical_line=name_critical_line,
         email_critical_line=email_critical_line,
         name_usage_instruction=customer_name_usage_instruction,
+        human_sales_section=_HUMAN_SALES_CONVERSATION_SECTION,
     )

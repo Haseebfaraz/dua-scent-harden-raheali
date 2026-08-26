@@ -10,10 +10,10 @@ from sqlalchemy import delete
 
 from app.ai import conversation_flow
 from app.ai.conversation_flow import call_ai
-from app.ai.prompt import build_system_prompt, detect_high_signal_flags
+from app.ai.prompt import build_system_prompt, detect_high_signal_flags, determine_conversation_mode, should_offer_fragrance_pivot
 from app.ai.tool_executor import execute_fragrance_tool
 from app.db.models import CustomerProfileState
-from app.services.customer_profile import get_customer_profile, save_customer_profile_fields
+from app.services.customer_profile import empty_profile, get_customer_profile, save_customer_profile_fields
 
 SHOP_DOMAIN = "test-shop.myshopify.com"
 
@@ -51,10 +51,12 @@ async def test_bare_greeting_gets_the_short_early_phase_prompt(db_session):
     conversation_id = _conversation_id("greeting")
     history = [{"role": "user", "content": "hey"}]
     prompt = await build_system_prompt(db_session, history, conversation_id, None, "Alex")
-    # The early-phase template is a distinctly short, single-question prompt -- not the full
-    # fragrance-expert system prompt with all its vocabulary/tool guidance.
-    assert "Keep this reply short and natural" in prompt
-    assert "Do NOT manufacture several rounds of small talk" in prompt
+    # The early-phase template is a distinctly short GENERAL_CONVERSATION prompt -- not the full
+    # fragrance-expert system prompt with all its vocabulary/tool guidance. A single bare greeting
+    # is also below the 2-meaningful-turn bar, so no fragrance pivot is offered yet either.
+    assert "conversationMode = GENERAL_CONVERSATION" in prompt
+    assert "Do not manufacture several rounds of small talk" in prompt
+    assert "Do not introduce fragrance yet" in prompt
 
 
 async def test_bare_name_reply_after_greeting_still_gets_the_early_phase_prompt(db_session):
@@ -67,7 +69,7 @@ async def test_bare_name_reply_after_greeting_still_gets_the_early_phase_prompt(
         {"role": "user", "content": "Haseeb"},
     ]
     prompt = await build_system_prompt(db_session, history, conversation_id, None, None)
-    assert "Keep this reply short and natural" in prompt
+    assert "conversationMode = GENERAL_CONVERSATION" in prompt
 
 
 async def test_general_conversation_mode_deterministically_withholds_fragrance_tools(db_session, monkeypatch):
@@ -249,3 +251,104 @@ async def test_call_ai_falls_back_to_a_generic_line_if_the_bridge_completion_fai
     result = await call_ai(db_session, history, conversation_id, None, None, SHOP_DOMAIN)
 
     assert result["replyText"] == "I've got the blend ready — take a look."
+
+
+# ---------------------------------------------------------------------------
+# Humanized soft fragrance pivot -- Python decides WHEN a pivot is eligible, the model still
+# decides whether this turn is actually the right moment to take it.
+# ---------------------------------------------------------------------------
+
+def test_bare_hello_is_not_yet_pivot_eligible():
+    profile = empty_profile()
+    history = [{"role": "user", "content": "hello"}]
+    assert should_offer_fragrance_pivot(history, profile) is False
+
+
+def test_second_meaningful_turn_makes_the_pivot_eligible():
+    profile = empty_profile()
+    history = [
+        {"role": "user", "content": "hey"},
+        {"role": "assistant", "content": "Hey! How's it going?"},
+        {"role": "user", "content": "pretty good, just relaxing"},
+    ]
+    assert should_offer_fragrance_pivot(history, profile) is True
+
+
+def test_robot_hobby_conversation_becomes_pivot_eligible_after_two_turns():
+    profile = empty_profile()
+    # Deliberately avoids the word "project" -- detect_high_signal_flags' strength_or_longevity
+    # group matches bare "project" (meant for fragrance projection), which would otherwise collide
+    # with "robot project" and switch modes for an unrelated reason before the pivot check runs.
+    history = [
+        {"role": "user", "content": "hey"},
+        {"role": "assistant", "content": "Hey! What are you up to?"},
+        {"role": "user", "content": "building a little robot from scratch"},
+    ]
+    assert should_offer_fragrance_pivot(history, profile) is True
+    # A robot hobby mention alone is not fragrance intent -- mode stays GENERAL_CONVERSATION,
+    # it's the pivot that becomes eligible, not a forced switch to FRAGRANCE_DISCOVERY.
+    assert determine_conversation_mode(history, profile) == "GENERAL_CONVERSATION"
+
+
+def test_long_day_mood_conversation_becomes_pivot_eligible():
+    profile = empty_profile()
+    history = [
+        {"role": "user", "content": "hey"},
+        {"role": "assistant", "content": "Hey! How's your day going?"},
+        {"role": "user", "content": "long day at work"},
+    ]
+    assert should_offer_fragrance_pivot(history, profile) is True
+    assert determine_conversation_mode(history, profile) == "GENERAL_CONVERSATION"
+
+
+async def test_decline_is_persisted_and_blocks_further_pivot_eligibility(db_session):
+    conversation_id = _conversation_id("pivot-decline")
+    try:
+        await save_customer_profile_fields(db_session, conversation_id, {"fragrancePivotOffered": True})
+        history = [
+            {"role": "user", "content": "hey"},
+            {"role": "assistant", "content": "Hey! How's it going?"},
+            {"role": "user", "content": "pretty good"},
+            {"role": "assistant", "content": "Nice. I could also put a fragrance together for you if you're up for it -- want me to try?"},
+            {"role": "user", "content": "no thanks"},
+        ]
+        # build_system_prompt deterministically detects the decline and persists it -- not left
+        # for the model to remember to call save_customer_profile_field itself.
+        await build_system_prompt(db_session, history, conversation_id, None, None)
+        profile = await get_customer_profile(db_session, conversation_id)
+        assert profile["fragrancePivotDeclined"] is True
+        assert should_offer_fragrance_pivot(history, profile) is False
+    finally:
+        await _cleanup(db_session, conversation_id)
+
+
+def test_contextual_yeah_after_pivot_offer_switches_to_fragrance_discovery():
+    profile = {**empty_profile(), "fragrancePivotOffered": True}
+    history = [
+        {"role": "user", "content": "hey"},
+        {"role": "assistant", "content": "Hey! How's it going?"},
+        {"role": "user", "content": "pretty good"},
+        {"role": "assistant", "content": "I could turn that vibe into a fragrance direction too. Want me to try?"},
+        {"role": "user", "content": "yeah go for it"},
+    ]
+    assert determine_conversation_mode(history, profile) == "FRAGRANCE_DISCOVERY"
+
+
+def test_bare_yeah_without_a_prior_pivot_offer_is_not_fragrance_intent():
+    # The same short reply must NOT count as fragrance intent in an unrelated context -- only when
+    # it's actually answering a pivot invitation the assistant just made.
+    profile = empty_profile()
+    history = [
+        {"role": "user", "content": "hey"},
+        {"role": "assistant", "content": "Hey! Want to hear a fun fact?"},
+        {"role": "user", "content": "yeah go for it"},
+    ]
+    assert determine_conversation_mode(history, profile) == "GENERAL_CONVERSATION"
+
+
+async def test_direct_fragrance_request_skips_general_conversation_entirely(db_session):
+    conversation_id = _conversation_id("direct-request")
+    history = [{"role": "user", "content": "I need a fresh scent for my wedding"}]
+    profile = await get_customer_profile(db_session, conversation_id)
+    assert determine_conversation_mode(history, profile) == "FRAGRANCE_DISCOVERY"
+    assert should_offer_fragrance_pivot(history, profile) is False  # no pivot needed, already there
