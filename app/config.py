@@ -14,11 +14,10 @@ class Settings(BaseSettings):
     openai_model: str
     openai_temperature: float = 0.3
     openai_timeout_seconds: int = 30
-    # The JS original hardcodes a SEPARATE, smaller model for note-aware copy generation
-    # (fragranceCopyGeneration.server.js) than the main conversation loop -- kept as its own
-    # env-overridable setting (defaulting to the JS's real current value) rather than collapsed
-    # into openai_model, to preserve that behavioral split.
-    openai_copy_model: str = "gpt-4.1-mini"
+    # Note-aware copy generation's own model -- kept as its own env-overridable setting rather
+    # than collapsed into openai_model, so the two can diverge again later if needed. This default
+    # only applies when OPENAI_COPY_MODEL is unset; always prefer setting it explicitly.
+    openai_copy_model: str = "gpt-5.6-terra"
     openai_copy_temperature: float = 0.5
 
     # These fallbacks are only ever used if the env var itself is unset -- matches the JS

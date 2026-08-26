@@ -24,7 +24,7 @@ services:
       - key: OPENAI_TIMEOUT_SECONDS
         value: "30"
       - key: OPENAI_COPY_MODEL
-        value: gpt-4.1-mini
+        value: gpt-5.6-terra
       - key: OPENAI_COPY_TEMPERATURE
         value: "0.5"
       - key: ODOO_PING_URL

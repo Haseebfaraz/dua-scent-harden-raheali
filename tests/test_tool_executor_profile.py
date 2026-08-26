@@ -214,8 +214,11 @@ async def test_liverpool_auto_resolves_city_region_country_without_second_questi
 async def test_valid_verified_city_never_triggers_clarification_content(db_session, monkeypatch):
     conversation_id = _new_conversation_id("liverpool2")
     try:
+        # A suffixed, non-real name -- a plain "New York" can collide with a real historical
+        # OrderHistory row in the shared test DB and resolve via that fast path (with whatever
+        # casing is actually stored there) instead of exercising the mocked geocoding tier below.
         _mock_single_geocode(monkeypatch, "New York", "United States", "New York", 40.71, -74.01)
-        result = await execute_fragrance_tool(db_session, "verify_customer_location", '{"cityText": "New York"}', _ctx(conversation_id))
+        result = await execute_fragrance_tool(db_session, "verify_customer_location", '{"cityText": "New-York-Not-In-Order-History-Test"}', _ctx(conversation_id))
 
         assert "ask the customer which one they mean" not in result["modelContent"].lower()
         assert "couldn't confidently match" not in result["modelContent"].lower()
