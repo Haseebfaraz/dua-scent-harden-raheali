@@ -12,12 +12,14 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.ai.openai_client import call_openai_once
 from app.ai.prompt import (
+    build_response_repair_prompt,
     build_system_prompt,
     count_assistant_question_turns,
     detect_high_signal_flags,
     determine_conversation_mode,
     extract_email_from_history,
     get_known_profile_field_names,
+    validate_customer_response,
 )
 from app.ai.tool_executor import execute_fragrance_tool
 from app.ai.tools import EXTRACTABLE_PROFILE_FIELD_NAMES, FRAGRANCE_AGENT_TOOLS, GENERAL_CONVERSATION_TOOLS, PROFILE_EXTRACTION_TOOL
@@ -141,6 +143,41 @@ async def _extract_and_persist_profile_facts(
     return sse_events, synthetic_messages
 
 
+def _is_privacy_violation(violation: str) -> bool:
+    return violation in ("brand_name_mention", "sku_like_value") or violation.startswith("blocked_product_title:")
+
+
+async def _component_titles_for_recommendation(session: AsyncSession, recommendation_id: str | None) -> list[str]:
+    if not recommendation_id:
+        return []
+    from app.services.recommendation_confirmation import get_recommendation
+
+    recommendation = await get_recommendation(session, recommendation_id)
+    products = recommendation.productsJson if recommendation and isinstance(recommendation.productsJson, list) else []
+    return [p.get("title") for p in products if p.get("title")]
+
+
+async def _validate_and_repair_customer_text(text: str, conversation_id: str, blocked_product_titles: list[str]) -> str:
+    """One deterministic repair pass, tools disabled, for a brand-name/product-title/SKU leak --
+    the model is instructed never to say these, but instruction-following alone has proven
+    unreliable elsewhere in this codebase at temperature > 0, so this is the actual backstop.
+
+    Only acts on privacy-specific violations. validate_customer_response's older formatting
+    checks (dashes, lists, headings, etc.) were never wired into a repair loop before this change
+    and stay that way here -- resurrecting them for every reply would be a separate, much larger
+    behavior change this task never asked for.
+    """
+    if not text:
+        return text
+    violations = [v for v in validate_customer_response(text, blocked_product_titles) if _is_privacy_violation(v)]
+    if not violations:
+        return text
+    logger.warning("CUSTOMER_RESPONSE_PRIVACY_VIOLATION %s", json.dumps({"conversationId": conversation_id, "violations": violations}))
+    repair_data = await call_openai_once([{"role": "system", "content": build_response_repair_prompt(text)}], None)
+    repaired = (repair_data["choices"][0]["message"].get("content") if repair_data else None)
+    return repaired.strip() if isinstance(repaired, str) and repaired.strip() else text
+
+
 async def call_ai(
     session: AsyncSession, history: list[dict], conversation_id: str,
     known_customer_email: str | None, known_customer_name: str | None, shop_domain: str,
@@ -231,6 +268,8 @@ async def call_ai(
                 bridge_data = await call_openai_once(messages, None)
                 bridge_message = (bridge_data["choices"][0]["message"] if bridge_data else {})
                 final_text = bridge_message.get("content") or "I've got the blend ready — take a look."
+                blocked_titles = await _component_titles_for_recommendation(session, (result.get("sseEvent") or {}).get("recommendationId"))
+                final_text = await _validate_and_repair_customer_text(final_text, conversation_id, blocked_titles)
                 messages.append({"role": "assistant", "content": final_text})
                 logger.info("CHAT_NEXT_ACTION %s", json.dumps({
                     "conversationId": conversation_id, "action": "GENERATE", "reason": "preview_ready",
@@ -255,6 +294,7 @@ async def call_ai(
             })
             continue
 
+        final_text = await _validate_and_repair_customer_text(final_text, conversation_id, [])
         messages.append({"role": "assistant", "content": final_text})
         break
 

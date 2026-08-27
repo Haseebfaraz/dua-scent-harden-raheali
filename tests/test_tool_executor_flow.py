@@ -7,7 +7,7 @@ from sqlalchemy import delete, select
 
 from app.ai.refinement import derive_refinement_adjustments
 from app.ai.preview_url import build_preview_url
-from app.ai.tool_executor import execute_fragrance_tool
+from app.ai.tool_executor import _redact_titles_for_sse, execute_fragrance_tool
 from app.db.models import CustomerProfileState, FragranceRecommendation
 from app.services import copy_generation
 from app.services.customer_profile import get_customer_profile, save_customer_profile_fields
@@ -319,3 +319,19 @@ async def test_select_recommendation_rehydrates_from_db_when_scratch_empty(db_se
         assert result["sseEvent"]["recommendationId"] == second_id
     finally:
         await _cleanup(db_session, conversation_id)
+
+
+def test_redact_titles_for_sse_strips_product_titles_but_keeps_other_fields():
+    # sse_events reach the customer's browser network payload unfiltered -- product titles are
+    # internal evidence and must never leave the backend that way, even though the same data (with
+    # titles) is still what modelContent gives the LLM for its own internal reasoning.
+    candidates = [{
+        "productName": "Midnight Saffron Reserve", "normalizedProductName": "midnight saffron reserve",
+        "relevanceScore": 12.5, "sameCityOrders": 3,
+    }]
+    redacted = _redact_titles_for_sse(candidates)
+    assert redacted == [{"relevanceScore": 12.5, "sameCityOrders": 3}]
+    assert "productName" not in redacted[0]
+    assert "normalizedProductName" not in redacted[0]
+    # Original list is untouched -- callers still pass the full candidates to modelContent.
+    assert candidates[0]["productName"] == "Midnight Saffron Reserve"

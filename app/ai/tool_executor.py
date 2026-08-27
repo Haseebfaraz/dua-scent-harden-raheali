@@ -583,6 +583,13 @@ async def _handle_select_recommendation(session: AsyncSession, conversation_id: 
     )
 
 
+def _redact_titles_for_sse(candidates: list[dict]) -> list[dict]:
+    # sse_events reach the browser's network payload unfiltered (app/api/chat.py) even though the
+    # widget never reads this event type -- real product/catalog titles are internal evidence for
+    # the model only (modelContent keeps them in full) and must never leave the backend otherwise.
+    return [{k: v for k, v in c.items() if k not in ("productName", "normalizedProductName")} for c in candidates]
+
+
 async def _handle_analyze_candidates(session: AsyncSession, conversation_id: str) -> dict:
     profile = await get_customer_profile(session, conversation_id)
     missing = get_missing_required_fields(profile)
@@ -598,7 +605,7 @@ async def _handle_analyze_candidates(session: AsyncSession, conversation_id: str
     return _ok(
         f"Real product candidates (highest relevance first): {json.dumps(candidate_products)}\n\n"
         "Call generate_new_product_combinations now to build real Hybrid/Tribrid/Quadbrid combinations from these candidates -- do not stop here.",
-        {"type": "candidate_products", "candidateProducts": candidate_products},
+        {"type": "candidate_products", "candidateProducts": _redact_titles_for_sse(candidate_products)},
     )
 
 

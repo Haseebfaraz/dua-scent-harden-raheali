@@ -59,7 +59,7 @@ _BASE_RULES = f"""Rules:
 - "description": one short phrase (roughly 4-10 words) describing the blend's actual character, grounded in the real notes given. Never a generic mood phrase disconnected from the actual notes.
 - "whySuits": one short sentence on why this suits THIS customer, referencing their actual stated likes/preferred style/occasion where given. Never a generic catch-all sentence.
 - Vary your sentence opening and structure every time. NEVER start "description" or "whySuits" with the word "This" as the literal first word.
-- NEVER name a real product, SKU, product ID, internal handle, or any brand other than DUA. Describe only the blend's own character and notes.
+- NEVER name a real product, SKU, product ID, internal handle, or any brand name (including this brand's own name). Describe only the blend's own character and notes.
 - NEVER make any claim about regional, seasonal, or historical popularity (e.g. "popular in your area," "trending this season") — that is handled by a separate field elsewhere and phrased under its own strict rules. If you reference evidence at all, follow this exact constraint: {_EVIDENCE_SCOPE_RULE}
 - Never contradict a stated dislike. Never invent a note, preference, or occasion beyond what's given below.
 - The customer's stated "likes" may name a preference family (e.g. "Floral") that THIS SPECIFIC blend doesn't actually contain — "matchedFamilies" below is the subset that's actually real for this blend; "missingFamilies" is the subset that isn't. NEVER claim, imply, or reference a family listed in "missingFamilies" (e.g. never say "designed around your preference for floral scents" if "floral" is in missingFamilies) — describe what the blend actually is instead.
@@ -76,12 +76,17 @@ def _opening_of(text: str, n: int = 4) -> str:
     return " ".join(text.strip().split()[:n]).lower()
 
 
+_BRAND_NAME_PATTERN = re.compile(r"\bdua\b", re.IGNORECASE)
+
+
 def _text_leaks(text: str | None, catalog_titles_lowercase: list[str]) -> bool:
     if not text:
         return True
     if _LEAKED_ID_PATTERN.search(text):
         return True
     lower = text.lower()
+    if _BRAND_NAME_PATTERN.search(lower):
+        return True
     return any(title in lower for title in catalog_titles_lowercase)
 
 
@@ -105,7 +110,7 @@ def _build_prompt_initial(
 ) -> list[dict]:
     angle_hint = OPENING_ANGLES[position % len(OPENING_ANGLES)]
     system = (
-        "You write short, appealing customer-facing copy for a single custom DUA fragrance blend. "
+        "You write short, appealing customer-facing copy for a single custom fragrance blend. "
         "You are given only the blend's real notes (grouped by the role each plays in the blend) "
         "and the customer's own stated preferences — nothing else about how the blend was built. "
         f"This is recommendation {position + 1} of {total} being shown to the same customer in one "
@@ -126,7 +131,7 @@ def _build_prompt_retry(
     avoid_openings_text = ", ".join(f'"{o}"' for o in avoid_openings) if avoid_openings else "(none yet)"
     avoid_first_words_text = ", ".join(f'"{w}"' for w in avoid_first_words)
     system = (
-        "You write short, appealing customer-facing copy for a single custom DUA fragrance blend. "
+        "You write short, appealing customer-facing copy for a single custom fragrance blend. "
         "You are given only the blend's real notes (grouped by the role each plays in the blend) "
         "and the customer's own stated preferences — nothing else about how the blend was built. "
         f"This is recommendation {position + 1} of {total} being shown to the same customer in one "

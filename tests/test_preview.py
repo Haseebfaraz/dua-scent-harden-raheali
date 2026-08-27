@@ -92,6 +92,26 @@ async def test_preview_renders_recommendation_data():
         await _cleanup(recommendation_id, conversation_id)
 
 
+async def test_preview_never_exposes_component_product_titles():
+    # An unusual, recognizable component title -- must never appear anywhere in the rendered page
+    # (visible text or the embedded window.__PREVIEW_DATA__ JSON), even though it's real internal
+    # data used for buckets/ratios/pricing on this same page.
+    unusual_title = "Midnight Saffron Reserve"
+    recommendation_id, conversation_id = await _make_recommendation(
+        productsJson=[{"title": unusual_title, "notes": ["Saffron"], "contribution": "anchor"}],
+        ratiosJson=[{"productTitle": unusual_title, "ratioPercent": 100}],
+    )
+    try:
+        with TestClient(app) as client:
+            response = client.get("/apps/scent-library/fragrance-preview", params=_proxy_params(recommendationId=recommendation_id))
+        assert response.status_code == 200
+        assert unusual_title not in response.text
+        assert "dua" not in response.text.lower()
+        assert "Rose Dream" in response.text  # the customer-facing name still renders normally
+    finally:
+        await _cleanup(recommendation_id, conversation_id)
+
+
 async def test_preview_asset_urls_stay_under_the_app_proxy_path():
     # The page is only ever loaded through Shopify's App Proxy (test-shop.myshopify.com/apps/
     # scent-library/...) -- an asset URL starting with a bare /static/... resolves, in the

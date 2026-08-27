@@ -12,7 +12,8 @@ from app.ai import conversation_flow
 from app.ai.conversation_flow import call_ai
 from app.ai.prompt import build_system_prompt, detect_high_signal_flags, determine_conversation_mode, should_offer_fragrance_pivot
 from app.ai.tool_executor import execute_fragrance_tool
-from app.db.models import CustomerProfileState
+from app.db.models import CustomerProfileState, FragranceRecommendation
+from app.db.time import utcnow
 from app.services.customer_profile import empty_profile, get_customer_profile, save_customer_profile_fields
 
 SHOP_DOMAIN = "test-shop.myshopify.com"
@@ -352,3 +353,80 @@ async def test_direct_fragrance_request_skips_general_conversation_entirely(db_s
     profile = await get_customer_profile(db_session, conversation_id)
     assert determine_conversation_mode(history, profile) == "FRAGRANCE_DISCOVERY"
     assert should_offer_fragrance_pivot(history, profile) is False  # no pivot needed, already there
+
+
+# ---------------------------------------------------------------------------
+# Strict customer-facing brand + product-title privacy
+# ---------------------------------------------------------------------------
+
+async def test_reasoning_bridge_never_leaks_the_brand_name_or_component_title(db_session, monkeypatch):
+    # An unusual, recognizable component title -- if it (or the brand name) leaks into the bridge
+    # text, the deterministic repair pass must catch and rewrite it before the customer sees it.
+    unusual_title = "Midnight Saffron Reserve"
+    recommendation_id = f"pytest-rec-leak-{uuid.uuid4().hex[:8]}"
+    conversation_id = _conversation_id("leak")
+    db_session.add(FragranceRecommendation(
+        id=recommendation_id, conversationId=conversation_id, createdAt=utcnow(),
+        customerProfileJson={}, productsJson=[{"title": unusual_title, "notes": [], "contribution": "anchor"}],
+        combinationType="HYBRID", scoreJson={}, evidenceJson={}, ratiosJson=[{"productTitle": unusual_title, "ratioPercent": 100}],
+        customerFacingJson={"customerFacingName": "Custom Blend"}, status="pending", buildStatus="draft",
+    ))
+    await db_session.commit()
+    calls = []
+
+    async def _fake_call_openai_once(messages, use_tools, tool_choice=None):
+        if tool_choice:
+            return {"choices": [{"finish_reason": "stop", "message": {"content": None}}]}  # extraction pre-pass
+        calls.append(use_tools)
+        if len(calls) == 1:
+            return {"choices": [{"finish_reason": "tool_calls", "message": {
+                "content": None,
+                "tool_calls": [{"id": "call_1", "function": {"name": "generate_new_product_combinations", "arguments": "{}"}}],
+            }}]}
+        if len(calls) == 2:
+            # Simulated leak: the bridge names the brand and the real component title.
+            return {"choices": [{"finish_reason": "stop", "message": {
+                "content": f"I combined {unusual_title} with a DUA classic for a bold, warm direction.",
+            }}]}
+        return {"choices": [{"finish_reason": "stop", "message": {
+            "content": "I kept it bold and warm, with real depth that lingers through the day.",
+        }}]}
+
+    async def _fake_execute_fragrance_tool(session, tool_name, args, context):
+        return {
+            "modelContent": "grounded facts",
+            "sseEvent": {"type": "preview_ready", "recommendationId": recommendation_id, "previewId": recommendation_id, "previewUrl": "https://example.test/preview"},
+        }
+
+    monkeypatch.setattr(conversation_flow, "call_openai_once", _fake_call_openai_once)
+    monkeypatch.setattr(conversation_flow, "execute_fragrance_tool", _fake_execute_fragrance_tool)
+
+    try:
+        history = [{"role": "user", "content": "I need something bold for my wedding"}]
+        result = await call_ai(db_session, history, conversation_id, None, None, SHOP_DOMAIN)
+
+        assert unusual_title.lower() not in result["replyText"].lower()
+        assert "dua" not in result["replyText"].lower()
+        assert result["replyText"] == "I kept it bold and warm, with real depth that lingers through the day."
+    finally:
+        await db_session.execute(delete(FragranceRecommendation).where(FragranceRecommendation.id == recommendation_id))
+        await db_session.execute(delete(CustomerProfileState).where(CustomerProfileState.conversationId == conversation_id))
+        await db_session.commit()
+
+
+async def test_general_reply_mentioning_brand_name_gets_repaired(db_session, monkeypatch):
+    calls = []
+
+    async def _fake_call_openai_once(messages, use_tools, tool_choice=None):
+        if tool_choice:
+            return {"choices": [{"finish_reason": "stop", "message": {"content": None}}]}
+        calls.append(use_tools)
+        if len(calls) == 1:
+            return {"choices": [{"finish_reason": "stop", "message": {"content": "Welcome! I'm happy to help you find a DUA fragrance today."}}]}
+        return {"choices": [{"finish_reason": "stop", "message": {"content": "Welcome! I'm happy to help you find a fragrance today."}}]}
+
+    monkeypatch.setattr(conversation_flow, "call_openai_once", _fake_call_openai_once)
+    conversation_id = _conversation_id("brand-leak-general")
+    history = [{"role": "user", "content": "hi"}]
+    result = await call_ai(db_session, history, conversation_id, None, None, SHOP_DOMAIN)
+    assert "dua" not in result["replyText"].lower()

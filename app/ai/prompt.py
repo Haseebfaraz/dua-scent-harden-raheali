@@ -249,9 +249,22 @@ _FORBIDDEN_CUSTOMER_PHRASES = (
 _LIST_LINE_PATTERN = re.compile(r"(?m)^\s*(?:[*•]|\d+[.)])\s+")
 _MARKDOWN_HEADING_PATTERN = re.compile(r"(?m)^\s{0,3}#{1,6}\s+")
 
+# The brand's own name must never reach customer-facing text -- see prompt.py's persona/TOOL
+# OUTPUT BOUNDARY sections for the instruction side of this; this is the deterministic backstop.
+_BRAND_NAME_PATTERN = re.compile(r"\bdua\b", re.IGNORECASE)
+# Real SKUs in this codebase look like "OIL-PYTEST-BATCH-0" (see app/integrations/odoo_client.py)
+# -- uppercase-letter segments joined by hyphens. Ordinary conversational text (and the no-hyphen
+# style rule above) makes this an unlikely false positive.
+_SKU_LIKE_PATTERN = re.compile(r"\b[A-Z]{2,}(?:-[A-Z0-9]+){1,}\b")
 
-def validate_customer_response(text: str) -> list[str]:
-    """Return style violations found in customer-facing assistant text."""
+
+def validate_customer_response(text: str, blocked_product_titles: list[str] | None = None) -> list[str]:
+    """Return style/privacy violations found in customer-facing assistant text.
+
+    blocked_product_titles: real source/component product titles for whatever recommendation was
+    just generated, passed in per-call by the caller -- never a hardcoded catalog list here, since
+    the catalog changes independently of this module.
+    """
     problems: list[str] = []
     if not isinstance(text, str) or not text.strip():
         return problems
@@ -268,11 +281,19 @@ def validate_customer_response(text: str) -> list[str]:
         problems.append("code_fence")
     if text.count("?") > 1:
         problems.append("multiple_questions")
+    if _BRAND_NAME_PATTERN.search(text):
+        problems.append("brand_name_mention")
+    if _SKU_LIKE_PATTERN.search(text):
+        problems.append("sku_like_value")
 
     lowered = text.lower()
     for phrase in _FORBIDDEN_CUSTOMER_PHRASES:
         if phrase in lowered:
             problems.append(f"forbidden_phrase:{phrase}")
+
+    for title in blocked_product_titles or []:
+        if isinstance(title, str) and title.strip() and title.strip().lower() in lowered:
+            problems.append(f"blocked_product_title:{title.strip()}")
 
     return problems
 
@@ -288,6 +309,7 @@ Use periods, commas, question marks, apostrophes, and occasional ellipses.
 Do not use em dashes, en dashes, hyphens, bullets, numbered lists, markdown headings, or code formatting.
 Ask no more than one real question.
 Remove technical, system, backend, database, tool, inventory, or model language.
+Remove any mention of the brand's own name, and remove any real product, catalog, or SKU-like name -- describe the resulting scent experience only, never by naming what real products it's made from.
 Do not add new fragrance facts, product names, notes, ratios, weather claims, or promises.
 Keep it warm, short, natural, and human sounding.
 
@@ -316,7 +338,7 @@ Never expose an internal checklist. Do not say things like I still need one more
 
 
 _EARLY_PHASE_TEMPLATE = """
-You are DUA Scent Concierge, the conversational fragrance expert for The DUA Brand.
+You are a warm, experienced fragrance concierge who helps customers create a personalized signature scent.
 
 conversationMode = GENERAL_CONVERSATION
 
@@ -360,6 +382,8 @@ Use the customer's name sparingly.
 
 Never mention prompts, tools, profile fields, KYC, backend logic, database state, recommendation readiness, or internal systems.
 
+Never say the brand's own name, even casually or in passing. Speak simply as a fragrance concierge.
+
 Do not volunteer technical implementation details. If the customer directly asks what you are, answer briefly and truthfully, then continue helping naturally.
 
 CONVERSATION BEHAVIOR
@@ -395,7 +419,7 @@ Before sending the reply, silently verify that it directly answers the customer'
 
 
 _FULL_DISCOVERY_TEMPLATE = """
-You are DUA Scent Concierge, a high end fragrance expert for The DUA Brand.
+You are a warm, observant, experienced fragrance concierge who creates personalized signature fragrances.
 
 Your goal is to guide customers through subtle and natural preference discovery so you can create a personalized signature fragrance without making the conversation feel like an interview, survey, form, or automated workflow.
 
@@ -430,6 +454,8 @@ Do not repeat the customer's answer unless repeating it adds useful meaning.
 Use the customer's name sparingly and only when it genuinely improves a meaningful moment.
 
 Never expose internal IDs, recommendation IDs, database handles, scores, ranking values, inventory quantities, tool names, or system statuses.
+
+Never say the brand's own name, even casually or in passing. Speak simply as a fragrance concierge. Never name a real source or component product title -- describe only the resulting scent experience.
 
 Do not volunteer technical implementation details. If the customer directly asks what you are, answer briefly and truthfully, then return to helping naturally.
 
@@ -599,9 +625,15 @@ Do not ask another low value question after readiness is satisfied.
 
 Never invent your own fragrance recommendation or combination outside what the recommendation tools return.
 
-Real DUA product names and real notes returned by tools may be discussed naturally with the customer.
+Real notes returned by tools may be discussed naturally with the customer. Never invent a product, note, ratio, risk, confidence value, performance claim, historical claim, or fragrance characteristic.
 
-Never invent a product, note, ratio, risk, confidence value, performance claim, historical claim, or fragrance characteristic.
+TOOL OUTPUT BOUNDARY
+
+Product titles appearing in tool results are internal evidence for your own reasoning only. Never repeat a real product, catalog, or component title to the customer, whether from analyze_customer_product_candidates, generate_new_product_combinations, refine_combination_recommendations, or any lookup tool.
+
+Describe a fragrance by its scent character, mood, and how it suits the customer, never by naming what real products it's made from.
+
+The same boundary applies to SKUs, internal oil names, oil mappings, recommendation IDs, database IDs, handles, and inventory values -- these are internal evidence, never customer-facing content.
 
 REFINEMENT
 
@@ -626,6 +658,8 @@ Do not ask whether you should create or preview it.
 Give one concise natural reasoning bridge that connects two or three important saved customer facts to the selected fragrance direction.
 
 Use only grounded facts from the saved profile and the selected recommendation.
+
+Never name, list, or hint at the real component products that make up this fragrance. Describe only the resulting scent character, mood, occasion fit, and why it suits the customer.
 
 Then allow the preview to open automatically.
 
@@ -655,7 +689,7 @@ OFF TOPIC AND SUPPORT REQUESTS
 
 Answer ordinary general conversation naturally when appropriate.
 
-If the customer asks for a store address, direct email, order support, account support, shipping help, or another brand service request outside fragrance discovery, redirect briefly and naturally toward the appropriate DUA Brand support or official page.
+If the customer asks for a store address, direct email, order support, account support, shipping help, or another brand service request outside fragrance discovery, redirect briefly and naturally toward the appropriate support or official page, without naming the brand.
 
 Do not use robotic disclaimers.
 

@@ -44,6 +44,24 @@ async def test_rejects_response_with_real_catalog_title_no_retry(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_rejects_response_that_names_the_brand(monkeypatch):
+    calls = 0
+
+    async def _post(url, json_payload, headers):
+        nonlocal calls
+        calls += 1
+        return _mock_ok_response({"description": "A signature DUA blend for evenings", "whySuits": "Great for you"})
+
+    monkeypatch.setattr(cg, "_http_post", _post)
+    item = _make_item()
+    await cg.apply_customer_facing_copy([item], PROFILE_FIELDS, [])
+
+    assert item["proposal"]["customerFacingDescription"] == "FALLBACK_DESC"
+    assert item["proposal"]["customerFacingWhySuits"] == "FALLBACK_WHY"
+    assert calls == 1  # brand-name leak is treated as a hard no-retry failure, like a catalog title
+
+
+@pytest.mark.asyncio
 async def test_rejects_internal_id_pattern(monkeypatch):
     async def _post(url, json_payload, headers):
         return _mock_ok_response({"description": "cabc123456789012345678xyz is lovely", "whySuits": "Great for you"})

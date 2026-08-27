@@ -32,7 +32,7 @@ logger = logging.getLogger(__name__)
 # Customer-safe -- never mentions tokens, sessions, or internal auth mechanics. Used whenever this
 # shop has no usable Shopify Admin credentials, whether that's a missing Session row or a token
 # Shopify itself rejected (401/403) on the actual request.
-_NOT_CONNECTED_MESSAGE = "This store isn't connected to Shopify for building products right now — an admin needs to reconnect the DUA Scent AI app before builds can be saved."
+_NOT_CONNECTED_MESSAGE = "This store isn't connected to Shopify for building products right now — an admin needs to reconnect the app before builds can be saved."
 
 router = APIRouter()
 templates = Jinja2Templates(directory=str(Path(__file__).resolve().parent.parent / "templates"))
@@ -83,7 +83,10 @@ async def preview_page(request: Request, shop: str = Depends(verified_shop), ses
         "shopifyProductId": recommendation.shopifyProductId,
         "pricePer5mlByPosition": price_per_5ml_by_position,
         "profilePills": profile_pills,
-        "productsUsed": [{"title": p.get("title"), "contribution": p.get("contribution")} for p in internal_products],
+        # Deliberately no product title here -- source/component products are internal evidence
+        # only. "contribution" is a neutral scent-structure ratio, never associated with a real
+        # catalog title in anything customer-facing (this data is embedded in the page's HTML).
+        "productsUsed": [{"contribution": p.get("contribution")} for p in internal_products],
     }
 
     return templates.TemplateResponse(
