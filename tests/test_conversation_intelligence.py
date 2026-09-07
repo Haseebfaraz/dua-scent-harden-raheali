@@ -6,11 +6,12 @@ to vary, per the explicit instruction not to templatize it to satisfy tests.
 
 import uuid
 
+import pytest
 from sqlalchemy import delete
 
 from app.ai import conversation_flow
 from app.ai.conversation_flow import call_ai
-from app.ai.prompt import build_system_prompt, detect_high_signal_flags, determine_conversation_mode, should_offer_fragrance_pivot
+from app.ai.prompt import build_system_prompt, detect_high_signal_flags, determine_conversation_mode, is_fragrance_pivot_due, is_role_question
 from app.ai.tool_executor import execute_fragrance_tool
 from app.db.models import CustomerProfileState, FragranceRecommendation
 from app.db.time import utcnow
@@ -54,10 +55,10 @@ async def test_bare_greeting_gets_the_short_early_phase_prompt(db_session):
     prompt = await build_system_prompt(db_session, history, conversation_id, None, "Alex")
     # The early-phase template is a distinctly short GENERAL_CONVERSATION prompt -- not the full
     # fragrance-expert system prompt with all its vocabulary/tool guidance. A single bare greeting
-    # is also below the 2-meaningful-turn bar, so no fragrance pivot is offered yet either.
+    # is also well below the meaningful-turn bar, so the pivot is not due yet either.
     assert "conversationMode = GENERAL_CONVERSATION" in prompt
     assert "Do not manufacture several rounds of small talk" in prompt
-    assert "Do not introduce fragrance yet" in prompt
+    assert "FRAGRANCE PIVOT STATUS: NOT_DUE" in prompt
 
 
 async def test_bare_name_reply_after_greeting_still_gets_the_early_phase_prompt(db_session):
@@ -256,27 +257,54 @@ async def test_call_ai_falls_back_to_a_generic_line_if_the_bridge_completion_fai
 
 
 # ---------------------------------------------------------------------------
-# Humanized soft fragrance pivot -- Python decides WHEN a pivot is eligible, the model still
-# decides whether this turn is actually the right moment to take it.
+# Fragrance pivot DUE -- Python decides WHETHER and WHEN a pivot is mandatory (not merely
+# eligible: a merely-eligible pivot let the model keep declining the opportunity forever, verified
+# live over an 8-turn small-talk conversation that never once mentioned fragrance). The model still
+# decides exact wording and whether THIS reply is a genuine emergency to handle first.
 # ---------------------------------------------------------------------------
 
-def test_bare_hello_is_not_yet_pivot_eligible():
+def test_bare_hello_is_not_yet_pivot_due():
     profile = empty_profile()
     history = [{"role": "user", "content": "hello"}]
-    assert should_offer_fragrance_pivot(history, profile) is False
+    assert is_fragrance_pivot_due(history, profile) is False
 
 
-def test_second_meaningful_turn_makes_the_pivot_eligible():
+def test_filler_only_turns_never_accumulate_toward_pivot_due():
+    # hello / yes / hmm / okay-style replies carry no real context and must not count, even many
+    # of them in a row.
     profile = empty_profile()
     history = [
-        {"role": "user", "content": "hey"},
+        {"role": "user", "content": "hello"},
         {"role": "assistant", "content": "Hey! How's it going?"},
-        {"role": "user", "content": "pretty good, just relaxing"},
+        {"role": "user", "content": "great yours?"},
+        {"role": "assistant", "content": "Doing well, thanks!"},
+        {"role": "user", "content": "yes it is"},
+        {"role": "assistant", "content": "Glad to hear it."},
+        {"role": "user", "content": "hmm"},
     ]
-    assert should_offer_fragrance_pivot(history, profile) is True
+    assert is_fragrance_pivot_due(history, profile) is False
 
 
-def test_robot_hobby_conversation_becomes_pivot_eligible_after_two_turns():
+def test_four_meaningful_work_related_turns_makes_the_pivot_due():
+    profile = empty_profile()
+    history = [
+        {"role": "user", "content": "hello"},
+        {"role": "assistant", "content": "Hey! How's it going?"},
+        {"role": "user", "content": "just back from vacations"},
+        {"role": "assistant", "content": "Nice, hope it was a good reset."},
+        {"role": "user", "content": "settling back"},
+        {"role": "assistant", "content": "That shift can be a little rough."},
+        {"role": "user", "content": "aligning by work"},
+        {"role": "assistant", "content": "Work mode, then."},
+        {"role": "user", "content": "trying to catch up on emails today"},
+    ]
+    assert is_fragrance_pivot_due(history, profile) is True
+    # Four real, meaningful turns is not itself fragrance intent -- mode stays GENERAL_CONVERSATION,
+    # it's the pivot that becomes due, not a forced switch to FRAGRANCE_DISCOVERY.
+    assert determine_conversation_mode(history, profile) == "GENERAL_CONVERSATION"
+
+
+def test_robot_hobby_conversation_becomes_pivot_due_after_rapport():
     profile = empty_profile()
     # Deliberately avoids the word "project" -- detect_high_signal_flags' strength_or_longevity
     # group matches bare "project" (meant for fragrance projection), which would otherwise collide
@@ -285,25 +313,37 @@ def test_robot_hobby_conversation_becomes_pivot_eligible_after_two_turns():
         {"role": "user", "content": "hey"},
         {"role": "assistant", "content": "Hey! What are you up to?"},
         {"role": "user", "content": "building a little robot from scratch"},
+        {"role": "assistant", "content": "That's a fun hobby."},
+        {"role": "user", "content": "yeah it's been keeping me busy on weekends"},
+        {"role": "assistant", "content": "Sounds rewarding."},
+        {"role": "user", "content": "definitely, learning a lot about motors and sensors"},
+        {"role": "assistant", "content": "That's a real skill to build."},
+        {"role": "user", "content": "trying to get the wiring right this week"},
     ]
-    assert should_offer_fragrance_pivot(history, profile) is True
-    # A robot hobby mention alone is not fragrance intent -- mode stays GENERAL_CONVERSATION,
-    # it's the pivot that becomes eligible, not a forced switch to FRAGRANCE_DISCOVERY.
+    assert is_fragrance_pivot_due(history, profile) is True
     assert determine_conversation_mode(history, profile) == "GENERAL_CONVERSATION"
 
 
-def test_long_day_mood_conversation_becomes_pivot_eligible():
+def test_role_question_forces_pivot_due_regardless_of_turn_count():
     profile = empty_profile()
     history = [
-        {"role": "user", "content": "hey"},
-        {"role": "assistant", "content": "Hey! How's your day going?"},
-        {"role": "user", "content": "long day at work"},
+        {"role": "user", "content": "hello"},
+        {"role": "assistant", "content": "Hey! How's it going?"},
+        {"role": "user", "content": "what is your task?"},
     ]
-    assert should_offer_fragrance_pivot(history, profile) is True
-    assert determine_conversation_mode(history, profile) == "GENERAL_CONVERSATION"
+    assert is_role_question("what is your task?") is True
+    assert is_fragrance_pivot_due(history, profile) is True
 
 
-async def test_decline_is_persisted_and_blocks_further_pivot_eligibility(db_session):
+def test_role_question_does_not_force_pivot_after_decline():
+    # A direct role question is a strong opening, but an explicit decline is still respected --
+    # the assistant can explain what it does without re-pushing a declined fragrance offer.
+    profile = {**empty_profile(), "fragrancePivotDeclined": True}
+    history = [{"role": "user", "content": "what is your task?"}]
+    assert is_fragrance_pivot_due(history, profile) is False
+
+
+async def test_decline_is_persisted_and_blocks_further_pivot_due(db_session):
     conversation_id = _conversation_id("pivot-decline")
     try:
         await save_customer_profile_fields(db_session, conversation_id, {"fragrancePivotOffered": True})
@@ -319,7 +359,7 @@ async def test_decline_is_persisted_and_blocks_further_pivot_eligibility(db_sess
         await build_system_prompt(db_session, history, conversation_id, None, None)
         profile = await get_customer_profile(db_session, conversation_id)
         assert profile["fragrancePivotDeclined"] is True
-        assert should_offer_fragrance_pivot(history, profile) is False
+        assert is_fragrance_pivot_due(history, profile) is False
     finally:
         await _cleanup(db_session, conversation_id)
 
@@ -353,7 +393,96 @@ async def test_direct_fragrance_request_skips_general_conversation_entirely(db_s
     history = [{"role": "user", "content": "I need a fresh scent for my wedding"}]
     profile = await get_customer_profile(db_session, conversation_id)
     assert determine_conversation_mode(history, profile) == "FRAGRANCE_DISCOVERY"
-    assert should_offer_fragrance_pivot(history, profile) is False  # no pivot needed, already there
+    assert is_fragrance_pivot_due(history, profile) is False  # no pivot needed, already there
+
+
+async def test_due_pivot_prompt_hands_the_urgent_customer_judgment_to_the_model(db_session):
+    # Python has no reliable "customer is upset"/"urgent unrelated issue" detector -- when due, the
+    # injected prompt must still explicitly hand that judgment call to the model rather than
+    # silently assuming every due turn is a safe moment to pivot.
+    conversation_id = _conversation_id("due-escape-valve")
+    history = [
+        {"role": "user", "content": "hello"},
+        {"role": "assistant", "content": "..."},
+        {"role": "user", "content": "just back from vacations"},
+        {"role": "assistant", "content": "..."},
+        {"role": "user", "content": "settling back"},
+        {"role": "assistant", "content": "..."},
+        {"role": "user", "content": "aligning by work"},
+    ]
+    profile = await get_customer_profile(db_session, conversation_id)
+    assert is_fragrance_pivot_due(history, profile) is True
+    prompt = await build_system_prompt(db_session, history, conversation_id, None, None)
+    assert "FRAGRANCE PIVOT STATUS: DUE" in prompt
+    assert "you must introduce fragrance" in prompt.lower()
+    assert "urgent" in prompt.lower() and "distressed" in prompt.lower()
+
+
+# ---------------------------------------------------------------------------
+# LIVE regression: the exact transcript that exposed the bug -- an 8-turn small-talk conversation
+# that used to finish with the assistant still behaving like a generic chatbot. Real, paid calls
+# through the actual call_ai orchestration -- run explicitly with `pytest -m live_ai`.
+# ---------------------------------------------------------------------------
+
+_LIVE_PIVOT_TRANSCRIPT = [
+    "hello",
+    "great yours?",
+    "just back from vacations",
+    "settling back",
+    "aligning by work",
+    "yes it is",
+    "hmm",
+    "what is your task?",
+]
+
+
+@pytest.mark.live_ai
+async def test_live_transcript_introduces_fragrance_pivot_by_role_question(db_session):
+    conversation_id = _conversation_id("live-pivot-transcript")
+    history: list[dict] = []
+    pivot_due_at_turn = None
+    pivot_used_at_turn = None
+    mode_before_pivot = None
+    assistant_replies = []
+    try:
+        for turn_index, customer_message in enumerate(_LIVE_PIVOT_TRANSCRIPT, start=1):
+            profile_before = await get_customer_profile(db_session, conversation_id)
+            history.append({"role": "user", "content": customer_message})
+
+            if pivot_due_at_turn is None and is_fragrance_pivot_due(history, profile_before):
+                pivot_due_at_turn = turn_index
+                mode_before_pivot = determine_conversation_mode(history, profile_before)
+
+            result = await call_ai(db_session, history, conversation_id, None, None, SHOP_DOMAIN)
+            reply_text = result["replyText"]
+            assistant_replies.append(reply_text)
+            history = result.get("updatedMessages") or (history + [{"role": "assistant", "content": reply_text}])
+
+            profile_after = await get_customer_profile(db_session, conversation_id)
+            if pivot_used_at_turn is None and profile_after.get("fragrancePivotOffered"):
+                pivot_used_at_turn = turn_index
+
+        mode_after_transcript = determine_conversation_mode(history, await get_customer_profile(db_session, conversation_id))
+
+        print(f"\nPIVOT_DUE_AT_TURN={pivot_due_at_turn}")
+        print(f"PIVOT_USED_AT_TURN={pivot_used_at_turn}")
+        print(f"MODE_BEFORE_PIVOT={mode_before_pivot}")
+        print(f"MODE_AFTER_TRANSCRIPT={mode_after_transcript}")
+        for i, (msg, reply) in enumerate(zip(_LIVE_PIVOT_TRANSCRIPT, assistant_replies), start=1):
+            print(f"  [{i}] Customer: {msg}")
+            print(f"      Assistant: {reply}")
+
+        assert pivot_used_at_turn is not None, "the pivot was never delivered across the whole transcript"
+        assert pivot_used_at_turn <= 8, "the pivot must be introduced by turn 8 (the role question)"
+
+        pivot_reply = assistant_replies[pivot_used_at_turn - 1].lower()
+        assert "help with that later" not in pivot_reply
+        assert "if you want fragrance help later" not in pivot_reply
+        assert "fragrance help later" not in pivot_reply
+        assert "dua" not in pivot_reply
+    finally:
+        await db_session.execute(delete(CustomerProfileState).where(CustomerProfileState.conversationId == conversation_id))
+        await db_session.commit()
 
 
 # ---------------------------------------------------------------------------

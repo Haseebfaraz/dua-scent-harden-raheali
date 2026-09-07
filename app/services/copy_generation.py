@@ -158,17 +158,20 @@ async def _http_post(url: str, json_payload: dict, headers: dict) -> httpx.Respo
 async def call_copy_model(messages: list[dict]) -> dict[str, str] | None:
     if not settings.openai_api_key:
         return None
+    payload = {
+        "model": settings.openai_copy_model,
+        "messages": messages,
+        "temperature": settings.openai_copy_temperature,
+        "response_format": {"type": "json_object"},
+    }
+    headers = {"Content-Type": "application/json", "Authorization": f"Bearer {settings.openai_api_key}"}
     try:
-        response = await _http_post(
-            "https://api.openai.com/v1/chat/completions",
-            {
-                "model": settings.openai_copy_model,
-                "messages": messages,
-                "temperature": settings.openai_copy_temperature,
-                "response_format": {"type": "json_object"},
-            },
-            {"Content-Type": "application/json", "Authorization": f"Bearer {settings.openai_api_key}"},
-        )
+        response = await _http_post("https://api.openai.com/v1/chat/completions", payload, headers)
+        # Some models (reasoning-tier ones in particular) only support the default temperature and
+        # reject any explicit value with a 400 -- retry once without it, same as openai_client.py.
+        if response.status_code == 400 and "temperature" in response.text and "does not support" in response.text:
+            payload.pop("temperature", None)
+            response = await _http_post("https://api.openai.com/v1/chat/completions", payload, headers)
     except Exception:
         return None
     if response.status_code != 200:
