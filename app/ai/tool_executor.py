@@ -212,7 +212,7 @@ async def _auto_select_and_confirm_best(session: AsyncSession, with_ids: list[di
     for candidate_index, candidate in enumerate(with_ids):
         if not candidate.get("autoConfirmEligible"):
             any_confidence_gated = True
-            _reject(candidate_index, candidate, "confidence_gate", "not autoConfirmEligible")
+            _reject(candidate_index, candidate, "confidence_gate", ",".join(candidate.get("autoConfirmReasons") or ["not autoConfirmEligible"]))
             continue
         eligible_candidate_count += 1
 
