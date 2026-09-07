@@ -448,7 +448,19 @@ def _find_analogous_combinations(combo_products: list[dict], all_combinations: l
 
 
 MAX_HISTORY_SCORE = 6
-CUSTOMER_FIT_LOW_THRESHOLD = 3
+# Verified live (a real conversation, and reproduced locally): a customer who states exactly one
+# real preference family and nothing else -- "fruity", matching real, correctly-detected product
+# notes -- structurally cannot reach 3. matchesLike only floors at 5*0.2=1.0 per matching
+# component (real DUA notes lists run 10-20 notes deep, so match strength for one family is
+# almost always near that floor), family_breadth_coverage_score contributes nothing below two
+# distinct families, and exact_note_coverage_score contributes nothing without a literal note
+# name. Measured customerFitScore across 8 real candidates for this exact profile: 1.0-2.67 --
+# every one landed "low" and got hard-blocked, even though the family match itself was completely
+# correct. 2 is the lowest threshold that still filters out the genuinely weak case (a single
+# component barely matching) while accepting the normal case (both components in a match,
+# scoring 2.0) -- customer_fit_low remains an absolute block in evaluate_auto_confirm_eligibility,
+# so this is the one number that actually controls whether a single stated preference is usable.
+CUSTOMER_FIT_LOW_THRESHOLD = 2
 
 
 def compute_history_score(anchor: dict) -> float:
