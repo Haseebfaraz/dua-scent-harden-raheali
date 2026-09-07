@@ -250,12 +250,31 @@ async def call_ai(
 
             preview_ready = False
             for tool_call in tool_calls:
-                called_tool_names.append(tool_call["function"]["name"])
-                result = await execute_fragrance_tool(session, tool_call["function"]["name"], tool_call["function"]["arguments"], tool_context)
+                tool_name = tool_call["function"]["name"]
+                called_tool_names.append(tool_name)
+                result = await execute_fragrance_tool(session, tool_name, tool_call["function"]["arguments"], tool_context)
                 if result.get("sseEvent"):
                     sse_events.append(result["sseEvent"])
 
                 messages.append({"role": "tool", "tool_call_id": tool_call["id"], "content": result["modelContent"]})
+
+                # tool_context's identity fields were snapshotted once before this loop started --
+                # but save_customer_profile_field can persist a newly-revealed name/email DURING
+                # this same turn, and a later tool call in this same loop (recommendation
+                # generation's identity preflight in particular) must see it immediately, not on
+                # the customer's next turn. Verified live: a customer whose name arrived on the
+                # exact turn generation was attempted got an incorrect "please sign in" message
+                # that only resolved itself once call_ai re-fetched the profile from scratch on
+                # their NEXT message. known_customer_name/known_customer_email (the trusted,
+                # Shopify/session-supplied identity) still take precedence either way -- this only
+                # catches the profile up when it just gained something the session context didn't
+                # already have, never overrides a genuinely known account identity with something
+                # weaker. Cheap (one indexed lookup) and only run for the one tool that can
+                # actually change these two fields, not after every tool call.
+                if tool_name == "save_customer_profile_field":
+                    refreshed_profile = await get_customer_profile(session, conversation_id)
+                    tool_context["customerName"] = known_customer_name or refreshed_profile.get("name")
+                    tool_context["customerEmail"] = known_customer_email or refreshed_profile.get("email")
 
                 if (result.get("sseEvent") or {}).get("type") == "preview_ready":
                     preview_ready = True

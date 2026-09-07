@@ -4,6 +4,7 @@ persistence, high-signal detection), not on exact bot prose -- the model's own w
 to vary, per the explicit instruction not to templatize it to satisfy tests.
 """
 
+import json
 import uuid
 
 import pytest
@@ -705,3 +706,162 @@ async def test_general_reply_mentioning_brand_name_gets_repaired(db_session, mon
     history = [{"role": "user", "content": "hi"}]
     result = await call_ai(db_session, history, conversation_id, None, None, SHOP_DOMAIN)
     assert "dua" not in result["replyText"].lower()
+
+
+# ---------------------------------------------------------------------------
+# Same-turn identity refresh -- tool_context's customerName/customerEmail were snapshotted once
+# before the tool-resolution loop started. A profile-mutating tool (save_customer_profile_field)
+# can persist a newly-revealed name DURING that same loop; a later tool call in the same turn
+# (recommendation generation's identity preflight in particular) must see it immediately, not on
+# the customer's next message. Verified live: a customer whose name arrived on the exact turn
+# generation was attempted got an incorrect "please sign in" message that only cleared up once
+# call_ai re-fetched the profile from scratch on their NEXT turn.
+# ---------------------------------------------------------------------------
+
+def _ready_profile_fields() -> dict:
+    # Every get_missing_required_fields dimension covered except name, which each test sets up
+    # deliberately -- matches the exact live scenario (fully ready to generate the moment identity
+    # resolves).
+    return {
+        "city": "Los Angeles", "country": "United States", "locationVerified": True, "locationSource": "order_history",
+        "occasionAsked": True, "dislikesAsked": True, "strengthPreference": "moderate", "likes": ["Fruity"],
+        "customBuildAccepted": True,
+    }
+
+
+async def test_name_revealed_and_generation_attempted_in_the_same_turn_succeeds(db_session, monkeypatch):
+    """Case 1: known email present, profile name initially missing, customer gives their name this
+    turn, and the model tries to generate in the very same reply (two tool_calls in one model
+    response -- the exact shape of the live regression)."""
+    conversation_id = _conversation_id("same-turn-identity-ok")
+    known_email = "haseeb@example.test"
+    try:
+        await save_customer_profile_fields(db_session, conversation_id, _ready_profile_fields())
+        calls = []
+
+        async def _fake_call_openai_once(messages, use_tools, tool_choice=None):
+            if tool_choice:
+                return {"choices": [{"finish_reason": "stop", "message": {"content": None}}]}
+            calls.append(use_tools)
+            if len(calls) == 1:
+                return {"choices": [{"finish_reason": "tool_calls", "message": {
+                    "content": None,
+                    "tool_calls": [
+                        {"id": "call_name", "function": {"name": "save_customer_profile_field", "arguments": json.dumps({"field": "name", "value": "Haseeb"})}},
+                        {"id": "call_generate", "function": {"name": "generate_new_product_combinations", "arguments": "{}"}},
+                    ],
+                }}]}
+            return {"choices": [{"finish_reason": "stop", "message": {"content": "Here's what I put together for you."}}]}
+
+        monkeypatch.setattr(conversation_flow, "call_openai_once", _fake_call_openai_once)
+        history = [{"role": "user", "content": "Haseeb"}]
+        result = await call_ai(db_session, history, conversation_id, known_email, None, SHOP_DOMAIN)
+
+        assert "sign" not in result["replyText"].lower()
+        profile = await get_customer_profile(db_session, conversation_id)
+        assert profile["name"] == "Haseeb"
+        assert profile["email"] == known_email
+    finally:
+        await db_session.execute(delete(FragranceRecommendation).where(FragranceRecommendation.conversationId == conversation_id))
+        await _cleanup(db_session, conversation_id)
+
+
+async def test_name_only_without_email_still_requires_identity(db_session, monkeypatch):
+    """Case 3: identity is still genuinely incomplete without an email -- the fix must never
+    weaken that requirement, only correct the stale-snapshot timing bug."""
+    conversation_id = _conversation_id("same-turn-identity-no-email")
+    try:
+        await save_customer_profile_fields(db_session, conversation_id, _ready_profile_fields())
+        calls = []
+
+        async def _fake_call_openai_once(messages, use_tools, tool_choice=None):
+            if tool_choice:
+                return {"choices": [{"finish_reason": "stop", "message": {"content": None}}]}
+            calls.append(use_tools)
+            if len(calls) == 1:
+                return {"choices": [{"finish_reason": "tool_calls", "message": {
+                    "content": None,
+                    "tool_calls": [
+                        {"id": "call_name", "function": {"name": "save_customer_profile_field", "arguments": json.dumps({"field": "name", "value": "Haseeb"})}},
+                        {"id": "call_generate", "function": {"name": "generate_new_product_combinations", "arguments": "{}"}},
+                    ],
+                }}]}
+            return {"choices": [{"finish_reason": "stop", "message": {"content": "Here's what I put together for you."}}]}
+
+        monkeypatch.setattr(conversation_flow, "call_openai_once", _fake_call_openai_once)
+        history = [{"role": "user", "content": "Haseeb"}]
+        result = await call_ai(db_session, history, conversation_id, None, None, SHOP_DOMAIN)
+
+        # The final replyText comes from a stubbed model that ignores tool content -- what
+        # matters is the tool's own result (the same layer test_tool_executor_flow.py's identity
+        # tests assert on), not the fake model's canned wording.
+        tool_messages = [m for m in result["updatedMessages"] if m.get("role") == "tool"]
+        generate_result = next(m["content"] for m in tool_messages if "sign" in m["content"].lower() or "account" in m["content"].lower())
+        assert generate_result.lower().startswith("error")
+        profile = await get_customer_profile(db_session, conversation_id)
+        assert profile["name"] == "Haseeb"
+        assert not profile.get("email")
+    finally:
+        await db_session.execute(delete(FragranceRecommendation).where(FragranceRecommendation.conversationId == conversation_id))
+        await _cleanup(db_session, conversation_id)
+
+
+async def test_known_name_and_known_email_generates_normally(db_session, monkeypatch):
+    """Case 2: both already known from the account -- ordinary, unaffected path."""
+    conversation_id = _conversation_id("same-turn-identity-both-known")
+    try:
+        await save_customer_profile_fields(db_session, conversation_id, _ready_profile_fields())
+
+        async def _fake_call_openai_once(messages, use_tools, tool_choice=None):
+            if tool_choice:
+                return {"choices": [{"finish_reason": "stop", "message": {"content": None}}]}
+            return {"choices": [{"finish_reason": "tool_calls", "message": {
+                "content": None,
+                "tool_calls": [{"id": "call_generate", "function": {"name": "generate_new_product_combinations", "arguments": "{}"}}],
+            }}]}
+
+        monkeypatch.setattr(conversation_flow, "call_openai_once", _fake_call_openai_once)
+        history = [{"role": "user", "content": "let's do it"}]
+        result = await call_ai(db_session, history, conversation_id, "haseeb@example.test", "Haseeb", SHOP_DOMAIN)
+
+        assert "sign" not in result["replyText"].lower()
+    finally:
+        await db_session.execute(delete(FragranceRecommendation).where(FragranceRecommendation.conversationId == conversation_id))
+        await _cleanup(db_session, conversation_id)
+
+
+async def test_location_verified_earlier_in_the_same_loop_is_used_by_generation(db_session, monkeypatch):
+    """Case 5: verify_customer_location earlier in the same tool loop, generation later in the
+    same loop -- confirms this was already correct (each recommendation handler re-fetches the
+    profile from the database itself rather than reading a stale in-memory snapshot) and stays
+    that way. Not a new fix -- a protective regression test for the mechanism this task's fix
+    generalizes from."""
+    conversation_id = _conversation_id("same-turn-location-fresh")
+    try:
+        await save_customer_profile_fields(db_session, conversation_id, {
+            "occasionAsked": True, "dislikesAsked": True, "strengthPreference": "moderate", "likes": ["Fruity"],
+            "customBuildAccepted": True, "nameAsked": True,
+        })
+
+        async def _fake_call_openai_once(messages, use_tools, tool_choice=None):
+            if tool_choice:
+                return {"choices": [{"finish_reason": "stop", "message": {"content": None}}]}
+            return {"choices": [{"finish_reason": "tool_calls", "message": {
+                "content": None,
+                "tool_calls": [
+                    {"id": "call_location", "function": {"name": "verify_customer_location", "arguments": json.dumps({"cityText": "Los Angeles"})}},
+                    {"id": "call_generate", "function": {"name": "generate_new_product_combinations", "arguments": "{}"}},
+                ],
+            }}]}
+
+        monkeypatch.setattr(conversation_flow, "call_openai_once", _fake_call_openai_once)
+        history = [{"role": "user", "content": "Los Angeles"}]
+        result = await call_ai(db_session, history, conversation_id, "haseeb@example.test", "Haseeb", SHOP_DOMAIN)
+
+        assert "not enough signal" not in result["replyText"].lower()
+        profile = await get_customer_profile(db_session, conversation_id)
+        assert profile["locationVerified"] is True
+        assert profile["city"].lower() == "los angeles"
+    finally:
+        await db_session.execute(delete(FragranceRecommendation).where(FragranceRecommendation.conversationId == conversation_id))
+        await _cleanup(db_session, conversation_id)
