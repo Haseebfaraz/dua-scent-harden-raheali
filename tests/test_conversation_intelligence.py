@@ -11,7 +11,15 @@ from sqlalchemy import delete
 
 from app.ai import conversation_flow
 from app.ai.conversation_flow import call_ai
-from app.ai.prompt import build_system_prompt, detect_high_signal_flags, determine_conversation_mode, is_fragrance_pivot_due, is_role_question
+from app.ai.prompt import (
+    build_system_prompt,
+    detect_high_signal_flags,
+    determine_conversation_mode,
+    is_custom_build_invitation_due,
+    is_direct_custom_build_request,
+    is_fragrance_pivot_due,
+    is_role_question,
+)
 from app.ai.tool_executor import execute_fragrance_tool
 from app.db.models import CustomerProfileState, FragranceRecommendation
 from app.db.time import utcnow
@@ -483,6 +491,143 @@ async def test_live_transcript_introduces_fragrance_pivot_by_role_question(db_se
     finally:
         await db_session.execute(delete(CustomerProfileState).where(CustomerProfileState.conversationId == conversation_id))
         await db_session.commit()
+
+
+# ---------------------------------------------------------------------------
+# Custom build invitation -- fragrance INTEREST (a bare style word like "fruity") is not the same
+# as build ACCEPTANCE. Interest routes through a second, explicit invitation instead of jumping
+# straight into a full discovery questionnaire.
+# ---------------------------------------------------------------------------
+
+def test_bare_style_word_alone_does_not_start_fragrance_discovery():
+    profile = empty_profile()
+    assert determine_conversation_mode([{"role": "user", "content": "fruity"}], profile) == "GENERAL_CONVERSATION"
+
+
+def test_bare_style_word_makes_the_custom_build_invitation_due():
+    profile = empty_profile()
+    history = [{"role": "user", "content": "fruity"}]
+    assert is_custom_build_invitation_due(history, profile) is True
+
+
+def test_custom_build_invitation_not_due_without_any_fragrance_interest():
+    profile = empty_profile()
+    history = [{"role": "user", "content": "hey"}, {"role": "assistant", "content": "..."}, {"role": "user", "content": "just relaxing"}]
+    assert is_custom_build_invitation_due(history, profile) is False
+
+
+def test_custom_build_invitation_not_due_twice():
+    profile = {**empty_profile(), "customBuildInvited": True}
+    history = [{"role": "user", "content": "fruity"}]
+    assert is_custom_build_invitation_due(history, profile) is False
+
+
+def test_custom_build_invitation_not_due_after_decline():
+    profile = {**empty_profile(), "customBuildDeclined": True}
+    history = [{"role": "user", "content": "fruity"}]
+    assert is_custom_build_invitation_due(history, profile) is False
+
+
+@pytest.mark.parametrize("message", [
+    "make me a fragrance",
+    "build me a custom scent",
+    "I want to create my own perfume",
+    "can you make something for me",
+    "create a fragrance for dinner",
+])
+def test_direct_custom_build_requests_are_detected(message):
+    assert is_direct_custom_build_request(message) is True
+
+
+@pytest.mark.parametrize("message", [
+    "fruity", "fresh", "I like sweet scents", "oud is nice", "I usually wear clean scents",
+    "vanilla", "something strong",
+])
+def test_fragrance_interest_without_build_intent_is_not_a_direct_request(message):
+    assert is_direct_custom_build_request(message) is False
+
+
+@pytest.mark.parametrize("message", [
+    "make me a fragrance",
+    "build me a custom scent",
+    "I want to create my own perfume",
+    "can you make something for me",
+    "create a fragrance for dinner",
+])
+def test_direct_custom_build_requests_skip_the_invitation_entirely(message):
+    profile = empty_profile()
+    history = [{"role": "user", "content": message}]
+    assert determine_conversation_mode(history, profile) == "FRAGRANCE_DISCOVERY"
+    assert is_custom_build_invitation_due(history, profile) is False
+
+
+def test_contextual_acceptance_of_the_custom_build_invitation_switches_mode():
+    profile = {**empty_profile(), "customBuildInvited": True}
+    history = [
+        {"role": "user", "content": "fruity"},
+        {"role": "assistant", "content": "I can build something around that. Want me to make one with you?"},
+        {"role": "user", "content": "yeah sure"},
+    ]
+    assert determine_conversation_mode(history, profile) == "FRAGRANCE_DISCOVERY"
+
+
+def test_bare_yes_without_a_pending_custom_build_invitation_is_not_acceptance():
+    profile = empty_profile()
+    history = [{"role": "user", "content": "yeah sure"}]
+    assert determine_conversation_mode(history, profile) == "GENERAL_CONVERSATION"
+
+
+async def test_custom_build_decline_is_persisted_and_blocks_further_invitation(db_session):
+    conversation_id = _conversation_id("custom-build-decline")
+    try:
+        await save_customer_profile_fields(db_session, conversation_id, {"customBuildInvited": True, "likes": ["Fruity"]})
+        history = [
+            {"role": "user", "content": "fruity"},
+            {"role": "assistant", "content": "I can build something around that. Want me to make one with you?"},
+            {"role": "user", "content": "not now"},
+        ]
+        # build_system_prompt deterministically detects the decline and persists it -- not left
+        # for the model to remember to call save_customer_profile_field itself.
+        await build_system_prompt(db_session, history, conversation_id, None, None)
+        profile = await get_customer_profile(db_session, conversation_id)
+        assert profile["customBuildDeclined"] is True
+        assert is_custom_build_invitation_due(history, profile) is False
+        assert determine_conversation_mode(history, profile) == "GENERAL_CONVERSATION"
+    finally:
+        await _cleanup(db_session, conversation_id)
+
+
+async def test_custom_build_acceptance_is_persisted_and_stays_sticky(db_session):
+    # Once accepted, mode must stay FRAGRANCE_DISCOVERY even on a later turn where the customer's
+    # latest message no longer looks like an acceptance itself (e.g. they've moved on to a normal
+    # follow-up answer) -- a transient "was the last message yes" check alone would lose this.
+    conversation_id = _conversation_id("custom-build-accept-sticky")
+    try:
+        await save_customer_profile_fields(db_session, conversation_id, {"customBuildInvited": True, "likes": ["Fruity"]})
+        history = [
+            {"role": "user", "content": "fruity"},
+            {"role": "assistant", "content": "I can build something around that. Want me to make one with you?"},
+            {"role": "user", "content": "yeah sure"},
+        ]
+        await build_system_prompt(db_session, history, conversation_id, None, None)
+        profile = await get_customer_profile(db_session, conversation_id)
+        assert profile["customBuildAccepted"] is True
+
+        later_history = [*history, {"role": "assistant", "content": "Great. Is this for everyday wear or somewhere specific?"}, {"role": "user", "content": "everyday"}]
+        assert determine_conversation_mode(later_history, profile) == "FRAGRANCE_DISCOVERY"
+    finally:
+        await _cleanup(db_session, conversation_id)
+
+
+async def test_custom_build_invitation_status_block_appears_when_due(db_session):
+    # Prompt-contract check (not just the deterministic gate): the model must actually be told
+    # about the invitation, in mandatory language, when it's due.
+    conversation_id = _conversation_id("custom-build-status-block")
+    history = [{"role": "user", "content": "fruity"}]
+    prompt = await build_system_prompt(db_session, history, conversation_id, None, None)
+    assert "CUSTOM BUILD INVITATION DUE" in prompt
+    assert "invite them" in prompt.lower()
+    assert "do not start a fragrance preference questionnaire yet" in prompt.lower()
 
 
 # ---------------------------------------------------------------------------

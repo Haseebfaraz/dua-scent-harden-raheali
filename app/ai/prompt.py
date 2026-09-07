@@ -96,7 +96,8 @@ _HIGH_SIGNAL_PATTERNS = [
     ),
     (
         re.compile(
-            r"\b(fresh|clean|sweet|woody|floral|spicy|fruity|warm|dark|professional|elegant|seductive|polished)\b"
+            r"\b(fresh|clean|sweet|woody|floral|spicy|fruity|warm|dark|professional|elegant|seductive|polished"
+            r"|oud|vanilla|musk|musky|citrus|amber)\b"
         ),
         "style_or_preference",
     ),
@@ -135,7 +136,18 @@ _FRAGRANCE_ACCEPTANCE_PHRASES = {
 _FRAGRANCE_DECLINE_PHRASES = {
     "no", "nah", "no thanks", "no thank you", "not now", "not right now",
     "not today", "maybe later", "not interested", "im good", "im good for now",
+    "just curious",
 }
+
+# An imperative, explicit request to build/make/create a fragrance -- distinct from merely
+# mentioning a style word or fragrance-adjacent noun. This is strong enough to skip the custom
+# build invitation entirely (see is_custom_build_invitation_due): the customer has already asked.
+_DIRECT_BUILD_REQUEST_PATTERN = re.compile(
+    r"\b(?:make|build|create|design|craft)\b[^.?!]{0,40}\b(?:me|us|a|my own|our own)\b[^.?!]{0,25}\b(?:fragrance|scent|perfume|cologne)\b"
+    r"|\bi want to (?:make|build|create|design)\b[^.?!]{0,30}\b(?:fragrance|scent|perfume|cologne)\b"
+    r"|\bcan you (?:make|build|create)\b[^.?!]{0,30}\b(?:for me|something)\b",
+    re.IGNORECASE,
+)
 
 # Whole-message filler/backchannel replies that must NOT count toward pivot-due turn counting --
 # a bare greeting, acknowledgment, or reciprocal "you?" carries no real context about the customer,
@@ -189,6 +201,23 @@ def is_role_question(text: str | None) -> bool:
     return isinstance(text, str) and bool(_ROLE_QUESTION_PATTERN.search(text))
 
 
+def is_direct_custom_build_request(text: str | None) -> bool:
+    return isinstance(text, str) and bool(_DIRECT_BUILD_REQUEST_PATTERN.search(text))
+
+
+def has_fragrance_interest_signal(history: list[dict]) -> bool:
+    """A style/preference word ('fruity', 'sweet', 'oud') expressed on its own -- real fragrance
+    interest, but NOT the same thing as having agreed to a custom build. Distinct from
+    is_direct_custom_build_request, which is the stronger signal that skips the invitation
+    entirely.
+    """
+    return any(
+        detect_high_signal_flags(message.get("content"))
+        for message in history
+        if message.get("role") == "user"
+    )
+
+
 def _last_user_message_content(history: list[dict]) -> str | None:
     for message in reversed(history):
         if message.get("role") == "user":
@@ -199,32 +228,32 @@ def _last_user_message_content(history: list[dict]) -> str | None:
 def determine_conversation_mode(history: list[dict], profile: dict) -> str:
     """Return the deterministic conversation mode.
 
-    GENERAL_CONVERSATION stays locked until the customer introduces a real fragrance, occasion,
-    gift, or fragrance-preference signal. The model does not decide this switch itself.
+    GENERAL_CONVERSATION stays locked until the customer introduces a real fragrance need (a
+    concrete occasion/gift context, an explicit build request) or has actually agreed to a custom
+    build. The model does not decide this switch itself.
+
+    A bare style/preference word ("fruity", "sweet", "oud") is fragrance INTEREST, not the same
+    thing as build ACCEPTANCE -- verified live that jumping straight from "fruity" into a full
+    discovery questionnaire felt abrupt and presumptuous. Interest alone routes through
+    is_custom_build_invitation_due instead of switching modes here; see that function.
     """
     user_messages = [message for message in history if message.get("role") == "user"]
     has_conversation_context = any(
         has_concrete_context(message.get("content")) for message in user_messages
     )
-    has_high_signal_message = any(
-        detect_high_signal_flags(message.get("content")) for message in user_messages
+    has_direct_build_request = any(
+        is_direct_custom_build_request(message.get("content")) for message in user_messages
     )
-    has_saved_fragrance_signal = bool(
-        profile.get("occasion")
-        or profile.get("preferredStyle")
-        or profile.get("giftRecipient")
-        or profile.get("requestedSeasonStyle")
-        or profile.get("likes")
-        or profile.get("dislikes")
-    )
-    # Contextual acceptance: a bare "yeah"/"sure" only counts as fragrance intent when it's
-    # answering a soft pivot invitation the assistant just made (see is_fragrance_pivot_due),
-    # never as a standalone signal.
-    has_contextual_acceptance = bool(profile.get("fragrancePivotOffered")) and is_fragrance_pivot_acceptance(
-        _last_user_message_content(history)
-    )
-    if has_conversation_context or has_high_signal_message or has_saved_fragrance_signal or has_contextual_acceptance:
+    if has_conversation_context or has_direct_build_request or profile.get("customBuildAccepted"):
         return "FRAGRANCE_DISCOVERY"
+
+    # Contextual acceptance: a bare "yeah"/"sure" only counts as fragrance intent when it's
+    # answering a soft pivot invitation or a custom build invitation the assistant just made (see
+    # is_fragrance_pivot_due / is_custom_build_invitation_due), never as a standalone signal.
+    awaiting_fragrance_response = bool(profile.get("customBuildInvited")) or bool(profile.get("fragrancePivotOffered"))
+    if awaiting_fragrance_response and is_fragrance_pivot_acceptance(_last_user_message_content(history)):
+        return "FRAGRANCE_DISCOVERY"
+
     return "GENERAL_CONVERSATION"
 
 
@@ -255,6 +284,27 @@ def is_fragrance_pivot_due(history: list[dict], profile: dict) -> bool:
         if message.get("role") == "user" and is_meaningful_customer_turn(message.get("content"))
     ]
     return len(meaningful_user_turns) >= _MEANINGFUL_TURN_MIN
+
+
+def is_custom_build_invitation_due(history: list[dict], profile: dict) -> bool:
+    """Deterministic gate for the SECOND-stage invitation -- distinct from is_fragrance_pivot_due.
+    The pivot creates a soft opening toward fragrance; this fires once the customer has actually
+    responded with real fragrance interest (a style word like "fruity") but has not yet agreed to
+    have a custom fragrance built. Interest is not acceptance -- verified live that treating a bare
+    "fruity" as build acceptance skipped straight into a full discovery questionnaire, which felt
+    presumptuous and abrupt.
+
+    A direct, explicit build request (is_direct_custom_build_request) skips this stage entirely --
+    determine_conversation_mode already switches to FRAGRANCE_DISCOVERY for that case, so this
+    never fires for it (the mode check below short-circuits).
+    """
+    if determine_conversation_mode(history, profile) != "GENERAL_CONVERSATION":
+        return False
+    if profile.get("fragrancePivotDeclined") or profile.get("customBuildDeclined"):
+        return False
+    if profile.get("customBuildInvited"):
+        return False
+    return has_fragrance_interest_signal(history)
 
 
 _EMAIL_PATTERN = re.compile(r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}")
@@ -586,6 +636,8 @@ Statements such as lasts all day, long lasting, nothing too loud, subtle, strong
 
 Save the information when it is clear.
 
+If your own previous message explicitly asked how strong or long-lasting they want it, interpret a short contextual reply in that light -- "very" means very strong, "not much" means light -- and save it directly. Do not ask the customer to confirm or repeat something that's only ambiguous out of context.
+
 Do not ask for performance again after it is already known.
 
 OCCASION
@@ -716,7 +768,7 @@ Do not ask which option they want.
 
 Do not ask for confirmation.
 
-Do not ask whether you should create or preview it.
+Do not ask whether you should create or preview it. Do not ask "ready for me to create it" or "shall I generate it" -- the customer already agreed to a custom build earlier in this conversation, so there is no second confirmation before generating.
 
 Give one concise natural reasoning bridge that connects two or three important saved customer facts to the selected fragrance direction -- for example climate, who the fragrance is for, the preferred vibe, and anything they explicitly ruled out.
 
@@ -815,9 +867,28 @@ async def build_system_prompt(
     if (
         profile.get("fragrancePivotOffered")
         and not profile.get("fragrancePivotDeclined")
+        and not profile.get("customBuildInvited")
         and is_fragrance_pivot_decline(_last_user_message_content(history))
     ):
         profile = await save_customer_profile_field(session, conversation_id, "fragrancePivotDeclined", True)
+
+    # Same idea, one stage later: once the customer has actually been invited to a custom build,
+    # a clear short decline there is unambiguous too, and distinct from declining the earlier,
+    # vaguer soft pivot.
+    if (
+        profile.get("customBuildInvited")
+        and not profile.get("customBuildDeclined")
+        and not profile.get("customBuildAccepted")
+        and is_fragrance_pivot_decline(_last_user_message_content(history))
+    ):
+        profile = await save_customer_profile_field(session, conversation_id, "customBuildDeclined", True)
+
+    # Custom-build acceptance: persisted the moment Python detects it -- via a direct request, a
+    # concrete occasion/gift context, or contextual acceptance of either invitation -- so mode
+    # stays in FRAGRANCE_DISCOVERY on every later turn without re-deriving a transient "was the
+    # last message a yes" check once the conversation has moved on to other topics.
+    if not profile.get("customBuildAccepted") and determine_conversation_mode(history, profile) == "FRAGRANCE_DISCOVERY":
+        profile = await save_customer_profile_field(session, conversation_id, "customBuildAccepted", True)
 
     missing_fields = get_missing_required_fields(profile)
 
@@ -884,7 +955,8 @@ async def build_system_prompt(
                 "The customer's name is not known -- a Shopify account is not guaranteed to have one on file. "
                 "When it fits naturally, ask what you should call them as one simple standalone question. "
                 "When they provide a clear real name, call save_customer_profile_field for the name immediately. "
-                "If it doesn't come up naturally after asking, call save_customer_profile_field for nameAsked with true instead of asking again."
+                "If it doesn't come up naturally after asking, call save_customer_profile_field for nameAsked with true instead of asking again. "
+                "Do not ask for it in the same reply as a fragrance pivot or custom build invitation below -- that question takes priority; ask for the name at a quieter moment instead."
             )
 
         if confirmed_customer_email:
@@ -894,11 +966,29 @@ async def build_system_prompt(
                 "The customer's email is not available yet. Do not ask for it and do not block the conversation on it."
             )
 
-        if profile.get("fragrancePivotDeclined"):
+        if profile.get("fragrancePivotDeclined") or profile.get("customBuildDeclined"):
             fragrance_pivot_status_block = (
                 "FRAGRANCE PIVOT STATUS: NOT_DUE\n\n"
                 "The customer already declined a fragrance invitation earlier in this conversation. "
                 "Do not offer again. Continue normal conversation, and only engage with fragrance if the customer brings it up themselves."
+            )
+        elif is_custom_build_invitation_due(history, profile):
+            fragrance_pivot_status_block = (
+                "FRAGRANCE PIVOT STATUS: CUSTOM BUILD INVITATION DUE\n\n"
+                "The customer has shown a real fragrance direction or preference (a style word like \"fruity\", \"sweet\", or \"oud\"), "
+                "but has not yet agreed to have a custom fragrance built for them. Interest is not the same as acceptance.\n\n"
+                "Respond naturally to what they said, and save it as a useful preference immediately (e.g. likes or preferredStyle).\n\n"
+                "Then, in the SAME reply, invite them -- in your own natural words -- to build a custom fragrance around it. For example: "
+                "\"I can build something around that. Want me to make one with you?\"\n\n"
+                "Do not use robotic permission language like \"would you like to initiate fragrance creation\" or \"shall I begin the fragrance discovery process\" -- sound like a person, not a form.\n\n"
+                "Ask no more than one question, and do not start a fragrance preference questionnaire yet -- wait for their answer to this invitation itself before asking anything else.\n\n"
+                "Call save_customer_profile_field for customBuildInvited with true in this same reply."
+            )
+        elif profile.get("customBuildInvited"):
+            fragrance_pivot_status_block = (
+                "FRAGRANCE PIVOT STATUS: NOT_DUE\n\n"
+                "You already invited the customer to build a custom fragrance around their stated preference. Do not repeat the invitation or ask it again. "
+                "If their latest message accepts it, Python has already switched modes -- otherwise continue the conversation naturally without pushing."
             )
         elif is_fragrance_pivot_due(history, profile):
             fragrance_pivot_status_block = (
@@ -960,7 +1050,8 @@ async def build_system_prompt(
             "The customer's name is not known -- a Shopify account is not guaranteed to have one on file. "
             "Ask what you should call them naturally as one simple question, and save the clear reply as 'name' immediately. "
             "If it doesn't come up naturally after asking, call save_customer_profile_field for nameAsked with true and continue without asking again. "
-            "Do not invent or infer a name from an email address."
+            "Do not invent or infer a name from an email address. "
+            "Do not interrupt a developing fragrance conversation to ask for it -- if the customer's scent direction is actively coming together, keep following that and ask for the name at a quieter moment instead."
         )
 
     return _FULL_DISCOVERY_TEMPLATE.format(

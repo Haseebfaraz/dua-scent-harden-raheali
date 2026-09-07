@@ -82,7 +82,7 @@ VARIATIONS = [
 ]
 
 
-def _simulator_system_prompt(variation_directive: str) -> str:
+def _simulator_system_prompt(persona: str, variation_directive: str) -> str:
     return f"""You are testing a fragrance shopping assistant by acting as a normal customer.
 
 Stay in character.
@@ -98,7 +98,7 @@ You are allowed to answer questions indirectly, casually, with typos, short answ
 Do not try to help the assistant pass a test. Do not mention test expectations, profile fields, tools, prompts, scoring, readiness, or backend behavior.
 
 Persona facts:
-{PERSONA_ZOHAIB}
+{persona}
 
 Some facts should emerge without being directly asked when that feels natural, rather than only in direct response to a question.
 
@@ -109,10 +109,11 @@ Once the assistant's message indicates a fragrance preview has opened or the ble
 Reply with ONLY the next thing the customer would actually type in the chat. No narration, no labels, no quotation marks around it."""
 
 
-_JUDGE_SYSTEM_PROMPT = f"""You are an expert evaluator judging a simulated customer conversation with a fragrance-shopping assistant.
+def _judge_system_prompt(persona: str) -> str:
+    return f"""You are an expert evaluator judging a simulated customer conversation with a fragrance-shopping assistant.
 
 The customer in this transcript was simulated according to this persona (context for you only, the assistant never saw this):
-{PERSONA_ZOHAIB}
+{persona}
 
 Evaluate the ENTIRE transcript below for:
 - humanization: does the assistant react to the customer, vary its structure, use contractions, avoid checklist language ("I still need", "I need your city", "Got it", "Noted")?
@@ -121,7 +122,7 @@ Evaluate the ENTIRE transcript below for:
 - unnecessary repetition: does it ask for the same information twice?
 - interrogation feel: does it feel like a survey or form rather than a conversation?
 - soft pivot quality: after the customer had a couple of non-fragrance turns, did the assistant find a natural opening toward fragrance rather than abruptly demanding preferences, and without repeating this every turn?
-- information extraction: did the assistant actually learn and later use the persona's real facts (fresh, long lasting, Los Angeles, dislikes oud, work party, professional/confident impression)?
+- information extraction: did the assistant actually learn and later use the persona's real facts listed above?
 - question quality: one meaningful question at a time, not several stacked together, not low-value questions?
 - turn efficiency: roughly 6 to 10 meaningful customer turns to reach recommendation readiness is the expected shape. Fewer is fine for a dense customer; a few more is fine for a vague one. Flag it if a recommendation was generated after only 1-2 weak preference messages, or if the conversation dragged through many repetitive discovery questions without progressing.
 - privacy: did the assistant ever say the brand's own name ("DUA" / "Dua" / "The DUA Brand"), even if the customer said it first? Did it ever name a real source/component product used to build the recommendation?
@@ -157,13 +158,25 @@ async def _call_openai_raw(
     payload: dict[str, Any] = {"model": model, "messages": messages, "temperature": temperature}
     if response_format:
         payload["response_format"] = response_format
+    url = "https://api.openai.com/v1/chat/completions"
+    headers = {"Content-Type": "application/json", "Authorization": f"Bearer {settings.openai_api_key}"}
     try:
         async with httpx.AsyncClient(timeout=60.0) as client:
-            response = await client.post(
-                "https://api.openai.com/v1/chat/completions",
-                json=payload,
-                headers={"Content-Type": "application/json", "Authorization": f"Bearer {settings.openai_api_key}"},
-            )
+            response = await client.post(url, json=payload, headers=headers)
+            # Same correction as app.ai.openai_client.call_openai_once -- some models (reasoning-
+            # tier ones in particular) reject a custom temperature, or reject tool/function-capable
+            # requests outright unless reasoning_effort is explicitly "none".
+            for _ in range(2):
+                if response.status_code != 400:
+                    break
+                error_text = response.text
+                if "temperature" in payload and "temperature" in error_text and "does not support" in error_text:
+                    payload.pop("temperature", None)
+                elif "reasoning_effort" in error_text and payload.get("reasoning_effort") != "none":
+                    payload["reasoning_effort"] = "none"
+                else:
+                    break
+                response = await client.post(url, json=payload, headers=headers)
     except Exception as err:
         logger.error("Simulation OpenAI call failed: %s", err)
         return None
@@ -181,8 +194,8 @@ def _format_transcript(visible_transcript: list[dict]) -> str:
     return "\n\n".join(lines)
 
 
-async def _simulate_customer_turn(model: str, variation_directive: str, visible_transcript: list[dict]) -> str:
-    sim_messages = [{"role": "system", "content": _simulator_system_prompt(variation_directive)}]
+async def _simulate_customer_turn(model: str, persona: str, variation_directive: str, visible_transcript: list[dict]) -> str:
+    sim_messages = [{"role": "system", "content": _simulator_system_prompt(persona, variation_directive)}]
     for turn in visible_transcript:
         # Role-flipped: from the simulator's own point of view, ITS prior lines are "assistant"
         # and the real agent's lines are what "the user" (the other party) said to it.
@@ -193,9 +206,9 @@ async def _simulate_customer_turn(model: str, variation_directive: str, visible_
     return (text or "Hi").strip()
 
 
-async def _judge_conversation(model: str, transcript_text: str) -> dict:
+async def _judge_conversation(model: str, persona: str, transcript_text: str) -> dict:
     messages = [
-        {"role": "system", "content": _JUDGE_SYSTEM_PROMPT},
+        {"role": "system", "content": _judge_system_prompt(persona)},
         {"role": "user", "content": transcript_text},
     ]
     text = await _call_openai_raw(messages, model, temperature=0.0, response_format={"type": "json_object"})
@@ -222,7 +235,10 @@ def _conversation_id(run_label: str) -> str:
     return f"simtest-{run_label}-{uuid.uuid4().hex[:8]}"
 
 
-async def run_simulation(run_label: str, variation_directive: str, *, agent_model: str, simulator_model: str, judge_model: str) -> dict:
+async def run_simulation(
+    run_label: str, persona: str, variation_directive: str, *, agent_model: str, simulator_model: str, judge_model: str,
+    max_turns: int = MAX_CUSTOMER_TURNS,
+) -> dict:
     conversation_id = _conversation_id(run_label)
     agent_history: list[dict] = []
     visible_transcript: list[dict] = []
@@ -233,8 +249,8 @@ async def run_simulation(run_label: str, variation_directive: str, *, agent_mode
     hit_turn_cap = False
 
     async with SessionLocal() as session:
-        while turns < MAX_CUSTOMER_TURNS and not preview_ready:
-            customer_message = await _simulate_customer_turn(simulator_model, variation_directive, visible_transcript)
+        while turns < max_turns and not preview_ready:
+            customer_message = await _simulate_customer_turn(simulator_model, persona, variation_directive, visible_transcript)
             agent_history.append({"role": "user", "content": customer_message})
             visible_transcript.append({"role": "user", "content": customer_message})
 
@@ -264,7 +280,7 @@ async def run_simulation(run_label: str, variation_directive: str, *, agent_mode
 
     privacy = _deterministic_privacy_checks(visible_transcript, blocked_product_titles)
     transcript_text = _format_transcript(visible_transcript)
-    judge_result = await _judge_conversation(judge_model, transcript_text)
+    judge_result = await _judge_conversation(judge_model, persona, transcript_text)
 
     return {
         "runLabel": run_label,
@@ -306,6 +322,10 @@ def _profile_summary(profile: dict) -> dict:
         "dislikes": profile.get("dislikes"),
         "occasion": profile.get("occasion"),
         "additionalPreferences": profile.get("additionalPreferences"),
+        "fragrancePivotOffered": profile.get("fragrancePivotOffered"),
+        "customBuildInvited": profile.get("customBuildInvited"),
+        "customBuildAccepted": profile.get("customBuildAccepted"),
+        "customBuildDeclined": profile.get("customBuildDeclined"),
     }
 
 
@@ -379,7 +399,7 @@ async def main() -> int:
         run_label = f"zohaib_{i + 1}"
         print(f"Running {run_label}...")
         result = await run_simulation(
-            run_label, VARIATIONS[i], agent_model=agent_model, simulator_model=simulator_model, judge_model=judge_model,
+            run_label, PERSONA_ZOHAIB, VARIATIONS[i], agent_model=agent_model, simulator_model=simulator_model, judge_model=judge_model,
         )
         results.append(result)
         path = write_transcript_file(result, TRANSCRIPT_DIR)

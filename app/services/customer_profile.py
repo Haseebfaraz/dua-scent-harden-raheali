@@ -52,6 +52,9 @@ def empty_profile() -> dict[str, Any]:
         "pendingRecreateRecommendationId": None,
         "fragrancePivotOffered": False,
         "fragrancePivotDeclined": False,
+        "customBuildInvited": False,
+        "customBuildAccepted": False,
+        "customBuildDeclined": False,
     }
 
 
