@@ -259,12 +259,6 @@ _SKU_LIKE_PATTERN = re.compile(r"\b[A-Z]{2,}(?:-[A-Z0-9]+){1,}\b")
 
 
 def validate_customer_response(text: str, blocked_product_titles: list[str] | None = None) -> list[str]:
-    """Return style/privacy violations found in customer-facing assistant text.
-
-    blocked_product_titles: real source/component product titles for whatever recommendation was
-    just generated, passed in per-call by the caller -- never a hardcoded catalog list here, since
-    the catalog changes independently of this module.
-    """
     problems: list[str] = []
     if not isinstance(text, str) or not text.strip():
         return problems
@@ -285,6 +279,10 @@ def validate_customer_response(text: str, blocked_product_titles: list[str] | No
         problems.append("brand_name_mention")
     if _SKU_LIKE_PATTERN.search(text):
         problems.append("sku_like_value")
+
+    # Catch premature authentication or shopify account demands
+    if _AUTH_BLOCK_PATTERN.search(text):
+        problems.append("premature_auth_demand")
 
     lowered = text.lower()
     for phrase in _FORBIDDEN_CUSTOMER_PHRASES:
