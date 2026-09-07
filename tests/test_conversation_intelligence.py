@@ -165,6 +165,7 @@ async def test_analyze_candidates_succeeds_once_every_discovery_dimension_is_cov
         await execute_fragrance_tool(db_session, "save_customer_profile_field", '{"field": "dislikesAsked", "value": true}', ctx)
         await execute_fragrance_tool(db_session, "save_customer_profile_field", '{"field": "strengthPreference", "value": "moderate"}', ctx)
         await execute_fragrance_tool(db_session, "save_customer_profile_field", '{"field": "locationAsked", "value": true}', ctx)
+        await execute_fragrance_tool(db_session, "save_customer_profile_field", '{"field": "nameAsked", "value": true}', ctx)
         result = await execute_fragrance_tool(db_session, "analyze_customer_product_candidates", "{}", ctx)
         assert not result["modelContent"].startswith("Error")
         assert "not enough signal" not in result["modelContent"].lower()

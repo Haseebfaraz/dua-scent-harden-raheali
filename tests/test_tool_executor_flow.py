@@ -39,7 +39,7 @@ async def _verify_los_angeles_without_network(session, conversation_id: str) -> 
     # tests in test_customer_profile.py and test_conversation_intelligence.py.
     await save_customer_profile_fields(session, conversation_id, {
         "city": "Los Angeles", "country": "United States", "locationVerified": True, "locationSource": "order_history",
-        "occasionAsked": True, "dislikesAsked": True, "strengthPreference": "moderate",
+        "occasionAsked": True, "dislikesAsked": True, "strengthPreference": "moderate", "nameAsked": True,
     })
 
 

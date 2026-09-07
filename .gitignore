@@ -12,3 +12,7 @@ __pycache__/
 
 dist/
 build/
+
+# Full transcripts from live-model conversation simulation runs -- for local manual review only,
+# never committed (may contain real live-model output shaped by whatever persona was tested).
+tests/e2e/transcripts/

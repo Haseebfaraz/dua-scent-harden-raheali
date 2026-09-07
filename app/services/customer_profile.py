@@ -43,6 +43,7 @@ def empty_profile() -> dict[str, Any]:
         "dislikesAsked": False,
         "occasionAsked": False,
         "locationAsked": False,
+        "nameAsked": False,
         "strengthPreference": None,
         "additionalPreferences": [],
         "locationVerified": False,
@@ -150,6 +151,13 @@ def get_missing_required_fields(profile: dict[str, Any]) -> list[str]:
 
     if not ((bool(profile.get("city")) and bool(profile.get("locationVerified"))) or bool(profile.get("locationAsked"))):
         missing.append("location, for verified weather/season context")
+
+    # A Shopify account is not guaranteed to have a name on file (email-only accounts are common),
+    # and nothing else in the conversation forces this to be asked -- without this dimension, a
+    # nameless account could sail through discovery and only discover it's blocked at the very
+    # final confirm_recommendation identity check, with no natural point earlier to have fixed it.
+    if not (bool(profile.get("name")) or bool(profile.get("nameAsked"))):
+        missing.append("the customer's name")
 
     return missing
 

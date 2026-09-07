@@ -28,7 +28,7 @@ def test_missing_required_fields_on_empty_profile():
 
 def test_style_direction_alone_is_not_enough_without_any_other_signal():
     profile = {**empty_profile(), "likes": ["Fruity"]}
-    assert len(get_missing_required_fields(profile)) == 4  # dislikes, occasion, performance, location all still missing
+    assert len(get_missing_required_fields(profile)) == 5  # dislikes, occasion, performance, location, name all still missing
     assert is_profile_ready_for_analysis(profile) is False
 
 
@@ -48,11 +48,11 @@ def test_strong_oud_plus_warm_weather_alone_is_not_ready():
 
 
 def test_all_discovery_dimensions_present_is_ready():
-    # style/vibe + occasion + dislike + performance + verified location/weather, matching the
-    # explicit "clearly enough" example: strong oud, date night, dislike vanilla, strong
+    # name + style/vibe + occasion + dislike + performance + verified location/weather, matching
+    # the explicit "clearly enough" example: strong oud, date night, dislike vanilla, strong
     # projection, Los Angeles, warm weather verified, dark/seductive vibe.
     profile = {
-        **empty_profile(),
+        **empty_profile(), "name": "Sam",
         "likes": ["Oud", "Seductive"], "dislikes": ["Vanilla"], "occasion": "date night",
         "strengthPreference": "strong",
         "city": "Los Angeles", "country": "United States", "locationVerified": True, "weatherDirection": "warm",
@@ -62,11 +62,12 @@ def test_all_discovery_dimensions_present_is_ready():
 
 
 def test_asked_flags_satisfy_their_dimension_without_a_real_answer():
-    # A genuinely-confirmed "none"/"couldn't give a city" must count as resolved -- these must
-    # never be re-asked, and must never block readiness forever chasing a fact that isn't coming.
+    # A genuinely-confirmed "none"/"couldn't give a city"/"didn't give a name" must count as
+    # resolved -- these must never be re-asked, and must never block readiness forever chasing a
+    # fact that isn't coming.
     profile = {
         **empty_profile(), "likes": ["Fruity"], "dislikesAsked": True, "occasionAsked": True,
-        "strengthPreference": "moderate", "locationAsked": True,
+        "strengthPreference": "moderate", "locationAsked": True, "nameAsked": True,
     }
     assert get_missing_required_fields(profile) == []
     assert is_profile_ready_for_analysis(profile) is True
@@ -75,7 +76,7 @@ def test_asked_flags_satisfy_their_dimension_without_a_real_answer():
 def test_gift_recipient_satisfies_occasion_without_a_separate_occasion_fact():
     profile = {
         **empty_profile(), "likes": ["Fruity"], "giftRecipient": "wife", "dislikesAsked": True,
-        "strengthPreference": "light", "locationAsked": True,
+        "strengthPreference": "light", "locationAsked": True, "nameAsked": True,
     }
     assert get_missing_required_fields(profile) == []
     assert is_profile_ready_for_analysis(profile) is True
@@ -86,10 +87,30 @@ def test_unverified_location_does_not_satisfy_the_location_dimension():
     # having genuinely asked and moved on -- it must still count as missing.
     profile = {
         **empty_profile(), "likes": ["Fruity"], "dislikesAsked": True, "occasionAsked": True,
-        "strengthPreference": "moderate", "city": "Vice City", "locationVerified": False,
+        "strengthPreference": "moderate", "city": "Vice City", "locationVerified": False, "nameAsked": True,
     }
     assert "location, for verified weather/season context" in get_missing_required_fields(profile)
     assert is_profile_ready_for_analysis(profile) is False
+
+
+def test_name_missing_blocks_readiness_even_with_every_other_dimension_covered():
+    # The exact real-world regression this guards: a signed-in Shopify account with no name on
+    # file (email-only accounts are common) must not sail through discovery and only discover the
+    # block at the final confirm_recommendation identity check.
+    profile = {
+        **empty_profile(), "likes": ["Fruity"], "dislikesAsked": True, "occasionAsked": True,
+        "strengthPreference": "moderate", "locationAsked": True,
+    }
+    assert "the customer's name" in get_missing_required_fields(profile)
+    assert is_profile_ready_for_analysis(profile) is False
+
+
+def test_name_asked_satisfies_the_name_dimension_without_a_real_name():
+    profile = {
+        **empty_profile(), "likes": ["Fruity"], "dislikesAsked": True, "occasionAsked": True,
+        "strengthPreference": "moderate", "locationAsked": True, "nameAsked": True,
+    }
+    assert "the customer's name" not in get_missing_required_fields(profile)
 
 
 def test_weather_direction_is_never_a_model_settable_field():

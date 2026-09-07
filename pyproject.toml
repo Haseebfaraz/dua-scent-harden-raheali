@@ -19,6 +19,13 @@ dev = ["pytest>=8.3", "pytest-asyncio>=0.24"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
+# live_ai tests make real, paid OpenAI calls (agent + simulator + judge models) and can take a
+# long time -- excluded by default so a bare `pytest` run never triggers them by accident. Run
+# them explicitly with `pytest -m live_ai` (overrides this default marker filter).
+addopts = "-m 'not live_ai'"
+markers = [
+    "live_ai: makes real, paid OpenAI API calls -- excluded from the default run, opt in with -m live_ai",
+]
 
 [build-system]
 requires = ["setuptools>=68"]

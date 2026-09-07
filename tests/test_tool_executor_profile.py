@@ -194,8 +194,11 @@ def _mock_single_geocode(monkeypatch, name, country, admin1, latitude, longitude
 async def test_liverpool_auto_resolves_city_region_country_without_second_question(db_session, monkeypatch):
     conversation_id = _new_conversation_id("liverpool1")
     try:
+        # A suffixed, non-real name -- a plain "Liverpool" can collide with a real historical
+        # OrderHistory row in the shared test DB and resolve via that fast path (with whatever
+        # casing is actually stored there) instead of exercising the mocked geocoding tier below.
         _mock_single_geocode(monkeypatch, "Liverpool", "United Kingdom", "England", 53.41, -2.98)
-        result = await execute_fragrance_tool(db_session, "verify_customer_location", '{"cityText": "Liverpool"}', _ctx(conversation_id))
+        result = await execute_fragrance_tool(db_session, "verify_customer_location", '{"cityText": "Liverpool-Not-In-Order-History-Test"}', _ctx(conversation_id))
 
         assert "which liverpool" not in result["modelContent"].lower()
         assert "which country" not in result["modelContent"].lower()
@@ -306,7 +309,9 @@ async def test_analyze_candidates_never_requires_season(db_session, monkeypatch)
         await execute_fragrance_tool(db_session, "save_customer_profile_field", '{"field": "dislikesAsked", "value": true}', _ctx(conversation_id))
         await execute_fragrance_tool(db_session, "save_customer_profile_field", '{"field": "occasionAsked", "value": true}', _ctx(conversation_id))
         await execute_fragrance_tool(db_session, "save_customer_profile_field", '{"field": "strengthPreference", "value": "moderate"}', _ctx(conversation_id))
+        await execute_fragrance_tool(db_session, "save_customer_profile_field", '{"field": "nameAsked", "value": true}', _ctx(conversation_id))
         result = await execute_fragrance_tool(db_session, "analyze_customer_product_candidates", "{}", _ctx(conversation_id))
         assert "missing required fields" not in result["modelContent"].lower()
+        assert not result["modelContent"].startswith("Error")
     finally:
         await _cleanup(db_session, conversation_id)
