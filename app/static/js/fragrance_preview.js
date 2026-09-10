@@ -121,7 +121,8 @@
       response = await fetch(window.location.pathname + window.location.search, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ intent, recommendationId: DATA.recommendationId, name: state.name, ratios: state.ratios }),
+        // buildToken: the server-minted capability for this one build (see docs/SHOPIFY_BUILD_SECURITY_CONTRACT.md).
+        body: JSON.stringify({ intent, recommendationId: DATA.recommendationId, buildToken: DATA.buildToken, name: state.name, ratios: state.ratios }),
       });
       json = await response.json();
     } catch (err) {
@@ -136,7 +137,9 @@
     if (json.status === "recreate" && json.redirectUrl) {
       window.location.href = json.redirectUrl;
     } else if (json.status === "saved" && json.productUrl) {
-      window.location.href = json.productUrl;
+      // The capability travels to the product page in the URL fragment (never sent to any
+      // server, never in referrers) so the theme's slider can call /api/save-build with it.
+      window.location.href = json.productUrl + "#scentBuild=" + encodeURIComponent(DATA.recommendationId) + "." + encodeURIComponent(DATA.buildToken);
     } else if (json.status === "added" && json.cartUrl) {
       window.location.href = json.cartUrl;
     } else {

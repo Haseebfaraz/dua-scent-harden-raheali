@@ -62,10 +62,23 @@ Postgres database the Node app already uses (no separate schema needed). `OPENAI
 `OPENAI_API_KEY` are required; everything else has a sensible default or is optional. Never commit
 a real `.env`.
 
+### Trusted shop (required)
+
+`SHOPIFY_SHOP_DOMAIN` must be set to the one installed store, e.g. `your-store.myshopify.com`.
+Every Shopify Admin call (client-credentials grant, GraphQL) is refused until it is set, and no
+request header, query parameter, or body can ever select a different shop. See
+`app/shopify/trusted_shop.py` and `docs/SECURITY_AUDIT.md` (finding F1).
+
 ### Database
 
-No migrations to run -- this service maps onto the existing schema with SQLAlchemy models that
-mirror it exactly (see `app/db/models/__init__.py`). If you're pointing at a fresh/staging
+One additive migration is required before running the Phase 1 code against any database:
+`migrations/0001_build_capability.sql` creates the `BuildCapability` table (server-minted
+capabilities that authorize preview reads and Shopify build mutations -- see
+`docs/SHOPIFY_BUILD_SECURITY_CONTRACT.md`). Apply it with `psql -f` against staging first. Without
+it, every preview / Save Build / Add to Cart flow fails closed.
+
+Everything else maps onto the existing schema with SQLAlchemy models that mirror it exactly (see
+`app/db/models/__init__.py`). If you're pointing at a fresh/staging
 database instead of the shared production one, its schema must already match production before
 running the test suite (most tests assert against real catalog data: real product titles, real
 `ExistingCombination` rows, etc.).

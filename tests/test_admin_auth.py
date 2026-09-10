@@ -7,7 +7,9 @@ import pytest
 from app.config import settings
 from app.shopify import admin_auth
 
-SHOP = "test-3d-products.myshopify.com"
+# Must equal the suite-wide trusted shop (tests/conftest.py) -- Phase 1 refuses any other value
+# before any HTTP request; see tests/security/test_trusted_shop.py.
+SHOP = "test-shop.myshopify.com"
 
 
 @pytest.fixture(autouse=True)

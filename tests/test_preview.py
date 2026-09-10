@@ -11,9 +11,17 @@ from app.config import settings
 from app.db.models import Conversation, CustomerProfileState, FragranceRecommendation
 from app.db.session import SessionLocal
 from app.main import app
+from app.services.build_capability import issue_build_token
 
 SECRET = "preview-test-secret"
+# The suite-wide trusted shop (tests/conftest.py); the App Proxy shop must match it (Phase 1).
 SHOP = "test-shop.myshopify.com"
+
+# Phase 1 (security, N3): a recommendation id is not authorization. Every GET carries the build
+# capability as `bt` and every POST carries it as `buildToken`; the token is minted per
+# recommendation by _make_recommendation below. Unauthorized cases live in
+# tests/security/test_preview_authorization.py.
+_TOKENS: dict[str, str] = {}
 
 
 def _sign(params: dict) -> str:
@@ -46,7 +54,16 @@ async def _make_recommendation(**overrides):
         session.add(record)
         session.add(Conversation(id=conversation_id, createdAt=utcnow(), updatedAt=utcnow()))
         await session.commit()
+        _TOKENS[defaults["id"]] = await issue_build_token(session, recommendation_id=defaults["id"], conversation_id=conversation_id, shop=SHOP)
     return defaults["id"], conversation_id
+
+
+def _get_params(recommendation_id: str) -> dict:
+    return _proxy_params(recommendationId=recommendation_id, bt=_TOKENS[recommendation_id])
+
+
+def _body(intent: str, recommendation_id: str, **extra) -> dict:
+    return {"intent": intent, "recommendationId": recommendation_id, "buildToken": _TOKENS[recommendation_id], **extra}
 
 
 async def _cleanup(recommendation_id, conversation_id):
@@ -60,6 +77,7 @@ async def _cleanup(recommendation_id, conversation_id):
 @pytest.fixture(autouse=True)
 def _shopify_secret(monkeypatch):
     monkeypatch.setattr(settings, "shopify_api_secret", SECRET)
+    monkeypatch.setattr(settings, "shopify_shop_domain", SHOP)
 
 
 @pytest.fixture(autouse=True)
@@ -84,7 +102,7 @@ async def test_preview_renders_recommendation_data():
     recommendation_id, conversation_id = await _make_recommendation()
     try:
         with TestClient(app) as client:
-            response = client.get("/apps/scent-library/fragrance-preview", params=_proxy_params(recommendationId=recommendation_id))
+            response = client.get("/apps/scent-library/fragrance-preview", params=_get_params(recommendation_id))
         assert response.status_code == 200
         assert "Rose Dream" in response.text
         assert recommendation_id in response.text
@@ -103,7 +121,7 @@ async def test_preview_never_exposes_component_product_titles():
     )
     try:
         with TestClient(app) as client:
-            response = client.get("/apps/scent-library/fragrance-preview", params=_proxy_params(recommendationId=recommendation_id))
+            response = client.get("/apps/scent-library/fragrance-preview", params=_get_params(recommendation_id))
         assert response.status_code == 200
         assert unusual_title not in response.text
         assert "dua" not in response.text.lower()
@@ -120,7 +138,7 @@ async def test_preview_asset_urls_stay_under_the_app_proxy_path():
     recommendation_id, conversation_id = await _make_recommendation()
     try:
         with TestClient(app) as client:
-            response = client.get("/apps/scent-library/fragrance-preview", params=_proxy_params(recommendationId=recommendation_id))
+            response = client.get("/apps/scent-library/fragrance-preview", params=_get_params(recommendation_id))
         assert response.status_code == 200
         assert '/apps/scent-library/static/css/fragrance_preview.css' in response.text
         assert '/apps/scent-library/static/js/fragrance_preview.js' in response.text
@@ -151,10 +169,11 @@ def test_original_static_mount_still_works_unchanged():
     assert "css" in response.headers["content-type"]
 
 
-async def test_preview_returns_404_for_unknown_recommendation():
+async def test_preview_refuses_an_unknown_recommendation_without_revealing_whether_it_exists():
+    # Phase 1: with no valid capability the answer is 403 either way -- existence is not leaked.
     with TestClient(app) as client:
         response = client.get("/apps/scent-library/fragrance-preview", params=_proxy_params(recommendationId="does-not-exist"))
-    assert response.status_code == 404
+    assert response.status_code == 403
 
 
 async def test_preview_recreate_marks_draft_and_flags_profile(monkeypatch):
@@ -163,7 +182,7 @@ async def test_preview_recreate_marks_draft_and_flags_profile(monkeypatch):
         with TestClient(app) as client:
             response = client.post(
                 "/apps/scent-library/fragrance-preview", params=_proxy_params(),
-                json={"intent": "recreate", "recommendationId": recommendation_id, "name": "New Name", "ratios": {"top": 40, "middle": 30, "base": 30}},
+                json=_body("recreate", recommendation_id, name="New Name", ratios={"top": 40, "middle": 30, "base": 30}),
             )
         assert response.status_code == 200
         body = response.json()
@@ -189,7 +208,7 @@ async def test_preview_save_build_first_time_creation(monkeypatch):
         with TestClient(app) as client:
             response = client.post(
                 "/apps/scent-library/fragrance-preview", params=_proxy_params(),
-                json={"intent": "save_build", "recommendationId": recommendation_id, "name": "Rose Dream", "ratios": {"top": 40, "middle": 30, "base": 30}},
+                json=_body("save_build", recommendation_id, name="Rose Dream", ratios={"top": 40, "middle": 30, "base": 30}),
             )
         assert response.status_code == 200
         body = response.json()
@@ -215,7 +234,7 @@ async def test_preview_add_to_cart_uses_existing_product(monkeypatch):
         with TestClient(app) as client:
             response = client.post(
                 "/apps/scent-library/fragrance-preview", params=_proxy_params(),
-                json={"intent": "add_to_cart", "recommendationId": recommendation_id, "ratios": {"top": 40, "middle": 30, "base": 30}},
+                json=_body("add_to_cart", recommendation_id, ratios={"top": 40, "middle": 30, "base": 30}),
             )
         assert response.status_code == 200
         body = response.json()
@@ -236,7 +255,7 @@ async def test_preview_save_build_reports_shopify_failure_as_json_error(monkeypa
         with TestClient(app) as client:
             response = client.post(
                 "/apps/scent-library/fragrance-preview", params=_proxy_params(),
-                json={"intent": "save_build", "recommendationId": recommendation_id, "ratios": {"top": 40, "middle": 30, "base": 30}},
+                json=_body("save_build", recommendation_id, ratios={"top": 40, "middle": 30, "base": 30}),
             )
         assert response.status_code == 200
         assert response.json() == {"error": "Failed to save the build."}
@@ -257,7 +276,7 @@ async def test_save_build_reports_missing_session_as_a_connection_problem_not_ge
         with TestClient(app) as client, caplog.at_level(logging.INFO, logger="app.api.preview"):
             response = client.post(
                 "/apps/scent-library/fragrance-preview", params=_proxy_params(),
-                json={"intent": "save_build", "recommendationId": recommendation_id, "ratios": {"top": 40, "middle": 30, "base": 30}},
+                json=_body("save_build", recommendation_id, ratios={"top": 40, "middle": 30, "base": 30}),
             )
         assert response.status_code == 200
         body = response.json()
@@ -291,7 +310,7 @@ async def test_save_build_reports_shopify_401_as_a_connection_problem(monkeypatc
         with TestClient(app) as client, caplog.at_level(logging.INFO, logger="app.api.preview"):
             response = client.post(
                 "/apps/scent-library/fragrance-preview", params=_proxy_params(),
-                json={"intent": "save_build", "recommendationId": recommendation_id, "ratios": {"top": 40, "middle": 30, "base": 30}},
+                json=_body("save_build", recommendation_id, ratios={"top": 40, "middle": 30, "base": 30}),
             )
         assert response.status_code == 200
         body = response.json()
@@ -320,7 +339,7 @@ async def test_save_build_non_auth_shopify_error_gets_a_distinct_message(monkeyp
         with TestClient(app) as client:
             response = client.post(
                 "/apps/scent-library/fragrance-preview", params=_proxy_params(),
-                json={"intent": "save_build", "recommendationId": recommendation_id, "ratios": {"top": 40, "middle": 30, "base": 30}},
+                json=_body("save_build", recommendation_id, ratios={"top": 40, "middle": 30, "base": 30}),
             )
         assert response.status_code == 200
         body = response.json()
@@ -339,7 +358,7 @@ async def test_preview_rejects_unknown_intent():
         with TestClient(app) as client:
             response = client.post(
                 "/apps/scent-library/fragrance-preview", params=_proxy_params(),
-                json={"intent": "bogus", "recommendationId": recommendation_id},
+                json=_body("bogus", recommendation_id),
             )
         assert response.status_code == 400
     finally:

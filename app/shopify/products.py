@@ -102,6 +102,10 @@ async def get_product_for_pricing(session: AsyncSession, shop: str, product_id: 
         """
         query getProductForPricing($id: ID!) {
           product(id: $id) {
+            id
+            title
+            vendor
+            templateSuffix
             metafield(namespace: "custom", key: "note_composition") { value }
             variants(first: 100) {
               edges { node { id price selectedOptions { name value } inventoryItem { id tracked } } }

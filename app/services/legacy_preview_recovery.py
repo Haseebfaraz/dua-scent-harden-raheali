@@ -15,6 +15,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.ai.preview_url import build_preview_url
 from app.db.models import FragranceRecommendation
+from app.services.build_capability import issue_build_token
 from app.services.customer_profile import get_customer_profile, save_customer_profile_fields
 from app.services.recommendation_confirmation import confirm_recommendation
 
@@ -82,4 +83,5 @@ async def resolve_legacy_preview_short_circuit(
         return None
 
     await save_customer_profile_fields(session, conversation_id, {"selectedRecommendationId": recommendation_id})
-    return {"recommendationId": recommendation_id, "previewUrl": build_preview_url(shop_domain, recommendation_id)}
+    build_token = await issue_build_token(session, recommendation_id=recommendation_id, conversation_id=conversation_id, shop=shop_domain)
+    return {"recommendationId": recommendation_id, "previewUrl": build_preview_url(shop_domain, recommendation_id, build_token)}

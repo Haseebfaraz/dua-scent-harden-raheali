@@ -23,6 +23,7 @@ import time
 import httpx
 
 from app.config import settings
+from app.shopify.trusted_shop import require_trusted_shop
 
 logger = logging.getLogger(__name__)
 
@@ -39,6 +40,11 @@ _token_cache: dict[str, tuple[str, float]] = {}
 
 
 async def _request_client_credentials_token(shop: str) -> dict | None:
+    # Phase 1 (F1): the client secret is about to be placed in a request body -- the destination
+    # MUST be the configured trusted shop. This raises (no HTTP request is ever built) for any
+    # other value, regardless of what the caller already checked.
+    shop = require_trusted_shop(shop)
+
     if not settings.shopify_api_key or not settings.shopify_api_secret:
         return None
 
@@ -49,7 +55,9 @@ async def _request_client_credentials_token(shop: str) -> dict | None:
         "grant_type": "client_credentials",
     }
     try:
-        async with httpx.AsyncClient(timeout=_REQUEST_TIMEOUT_SECONDS) as client:
+        # follow_redirects=False is httpx's default; stated explicitly because this request
+        # carries credentials and must never be replayed to a redirect target.
+        async with httpx.AsyncClient(timeout=_REQUEST_TIMEOUT_SECONDS, follow_redirects=False) as client:
             response = await client.post(url, json=payload)
     except httpx.HTTPError as err:
         logger.error("SHOPIFY_ADMIN_AUTH_FAILED %s", json.dumps({"shop": shop, "method": "client_credentials", "reason": "network_error", "errorType": type(err).__name__}))
@@ -72,7 +80,11 @@ async def get_admin_access_token(session, shop: str) -> tuple[str | None, str]:
     """Returns (token, source). source is one of:
     "client_credentials_cached", "client_credentials", "session_table", or "none".
     Callers should treat "none" as ShopNotAuthenticated -- there is no usable credential.
+
+    Raises UntrustedShopError before touching the cache, the network, or the database when
+    `shop` is not the configured trusted shop (Phase 1, F1).
     """
+    shop = require_trusted_shop(shop)
     now = time.monotonic()
     cached = _token_cache.get(shop)
     if cached and cached[1] > now:

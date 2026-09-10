@@ -9,6 +9,7 @@ from sqlalchemy.ext.asyncio import AsyncSession as DbSession
 
 from app.config import settings
 from app.shopify.admin_auth import get_admin_access_token
+from app.shopify.trusted_shop import require_trusted_shop
 
 _REQUEST_TIMEOUT_SECONDS = 15.0
 
@@ -19,7 +20,9 @@ class ShopNotAuthenticated(Exception):
 
 
 async def _post(url: str, token: str, query: str, variables: dict[str, Any]) -> httpx.Response:
-    async with httpx.AsyncClient(timeout=_REQUEST_TIMEOUT_SECONDS) as client:
+    # follow_redirects=False (httpx default) stated explicitly: this request carries the Admin
+    # access token and must never be replayed to a redirect target.
+    async with httpx.AsyncClient(timeout=_REQUEST_TIMEOUT_SECONDS, follow_redirects=False) as client:
         return await client.post(
             url,
             json={"query": query, "variables": variables},
@@ -28,6 +31,10 @@ async def _post(url: str, token: str, query: str, variables: dict[str, Any]) -> 
 
 
 async def admin_graphql(session: DbSession, shop: str, query: str, variables: dict[str, Any] | None = None) -> dict:
+    # Phase 1 (F1): an access token is about to be sent to https://{shop}/... -- the destination
+    # MUST be the configured trusted shop. Raises before any credential lookup or HTTP request.
+    shop = require_trusted_shop(shop)
+
     # Client credentials grant first (cached, auto-refreshed) -- only falls back to a stored
     # Session-table token when client credentials aren't configured/available. Never prefers a
     # known-stale Session token over a fresh attempt.

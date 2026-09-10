@@ -2,6 +2,17 @@
 Proxy path, same recommendation lookup, same recreate/save_build/add_to_cart behavior -- only the
 rendering technology changed (Jinja2 + vanilla JS instead of React), per the explicit decision to
 migrate, not redesign, this page.
+
+Phase 1 (security, F1 / F2 / N1 / N3):
+  * the App Proxy signature proves Shopify proxied the request; `verified_shop` additionally
+    proves the shop is OUR configured store;
+  * a recommendation id is not authorization. Both GET and POST require the build capability
+    token (`bt` query parameter on GET, `buildToken` in the POST body) minted for that exact
+    recommendation when the backend emitted preview_ready. GET is gated too, deliberately: the
+    page embeds the customer's draft name, pricing, the Shopify product id, and the token itself;
+  * ratios and name go through the shared validator before anything is persisted or sent to
+    Shopify; the Shopify product id always comes from the recommendation row;
+  * nothing is written (not even the draft) until the caller is authorized.
 """
 
 import json
@@ -18,14 +29,17 @@ from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.session import get_session
+from app.services.build_capability import BUILD_TOKEN_QUERY_PARAM, BuildNotAuthorized, authorize_build_token
 from app.services.customer_profile import get_customer_profile, save_customer_profile_field
 from app.services.fragrance_build import compute_default_ratios, compute_note_position_buckets, compute_price_per_5ml_by_position
 from app.services.recommendation_confirmation import get_recommendation, mark_recommendation_draft, mark_recommendation_saved
 from app.shopify.admin_auth import get_admin_access_token
 from app.shopify.admin_client import ShopNotAuthenticated
 from app.shopify.app_proxy import verified_shop
-from app.shopify.builds import InvalidComputedPrice, InvalidRatios, ProductPricingNotFound, create_shopify_build_product, reprice_existing_build
+from app.shopify.build_input import InvalidCustomName, InvalidRatios, validate_custom_name, validate_ratios
+from app.shopify.builds import BuildProductNotSaved, InvalidComputedPrice, ProductPricingNotFound, create_shopify_build_product, reprice_existing_build
 from app.shopify.products import get_product_handle
+from app.shopify.trusted_shop import UntrustedShopError
 
 logger = logging.getLogger(__name__)
 
@@ -33,6 +47,7 @@ logger = logging.getLogger(__name__)
 # shop has no usable Shopify Admin credentials, whether that's a missing Session row or a token
 # Shopify itself rejected (401/403) on the actual request.
 _NOT_CONNECTED_MESSAGE = "This store isn't connected to Shopify for building products right now — an admin needs to reconnect the app before builds can be saved."
+_NOT_AUTHORIZED_MESSAGE = "This fragrance preview link is not valid or has expired. Please reopen it from the chat."
 
 router = APIRouter()
 templates = Jinja2Templates(directory=str(Path(__file__).resolve().parent.parent / "templates"))
@@ -59,6 +74,13 @@ async def preview_page(request: Request, shop: str = Depends(verified_shop), ses
     if not recommendation_id:
         raise HTTPException(status_code=400, detail="recommendationId is required")
 
+    # AUTHORIZE before revealing anything about the recommendation (including whether it exists).
+    build_token = request.query_params.get(BUILD_TOKEN_QUERY_PARAM)
+    try:
+        await authorize_build_token(session, token=build_token, recommendation_id=recommendation_id)
+    except BuildNotAuthorized:
+        raise HTTPException(status_code=403, detail=_NOT_AUTHORIZED_MESSAGE) from None
+
     recommendation = await get_recommendation(session, recommendation_id)
     if not recommendation:
         raise HTTPException(status_code=404, detail="Recommendation not found")
@@ -76,6 +98,8 @@ async def preview_page(request: Request, shop: str = Depends(verified_shop), ses
 
     data = {
         "recommendationId": recommendation_id,
+        # The capability the page must present on every POST. Same-origin page data, never logged.
+        "buildToken": build_token,
         "name": recommendation.draftName or customer_facing_name,
         "buckets": buckets,
         "ratios": ratios,
@@ -98,91 +122,112 @@ async def preview_page(request: Request, shop: str = Depends(verified_shop), ses
 class PreviewAction(BaseModel):
     intent: str
     recommendationId: str
-    name: str | None = None
-    ratios: dict[str, float] | None = None
+    buildToken: str | None = None
+    name: Any = None
+    # Validated by app/shopify/build_input.py, not by pydantic's lenient float coercion.
+    ratios: Any = None
 
 
 @router.post("/apps/scent-library/fragrance-preview")
 async def preview_action(body: PreviewAction, shop: str = Depends(verified_shop), session: AsyncSession = Depends(get_session)) -> dict:
+    if body.intent not in ("recreate", "save_build", "add_to_cart"):
+        raise HTTPException(status_code=400, detail=f'Unknown intent "{body.intent}".')
+
+    # ---- AUTHORIZE first: no draft write, no lookup result, no Shopify call before this ----
+    try:
+        await authorize_build_token(session, token=body.buildToken, recommendation_id=body.recommendationId)
+    except BuildNotAuthorized:
+        logger.info("PREVIEW_ACTION_REJECTED %s", json.dumps({"shop": shop, "recommendationId": body.recommendationId, "intent": body.intent, "reason": "build_not_authorized"}))
+        return {"error": _NOT_AUTHORIZED_MESSAGE, "code": "build_not_authorized"}
+
     recommendation = await get_recommendation(session, body.recommendationId)
     if not recommendation:
         return {"error": "Recommendation not found."}
 
+    # ---- VALIDATE INPUT (shared rules for every intent) ----
+    try:
+        name = validate_custom_name(body.name)
+        ratios = validate_ratios(body.ratios) if (body.ratios is not None or body.intent != "recreate") else None
+    except (InvalidRatios, InvalidCustomName) as err:
+        return {"error": str(err), "code": "invalid_input"}
+
     if body.intent == "recreate":
-        await mark_recommendation_draft(session, body.recommendationId, name=body.name, ratios=body.ratios)
+        await mark_recommendation_draft(session, body.recommendationId, name=name, ratios=ratios)
         await save_customer_profile_field(session, recommendation.conversationId, "pendingRecreateRecommendationId", body.recommendationId)
         return {"status": "recreate", "redirectUrl": f"https://{shop}/"}
 
-    if body.intent in ("save_build", "add_to_cart"):
-        log_prefix = "SAVE_BUILD" if body.intent == "save_build" else "ADD_TO_CART"
-        logger.info("%s_STARTED %s", log_prefix, json.dumps({"shop": shop, "recommendationId": body.recommendationId}))
+    log_prefix = "SAVE_BUILD" if body.intent == "save_build" else "ADD_TO_CART"
+    logger.info("%s_STARTED %s", log_prefix, json.dumps({"shop": shop, "recommendationId": body.recommendationId}))
 
-        await mark_recommendation_draft(session, body.recommendationId, name=body.name, ratios=body.ratios)
+    await mark_recommendation_draft(session, body.recommendationId, name=name, ratios=ratios)
 
-        shopify_product_id = recommendation.shopifyProductId
-        shopify_variant_id = recommendation.shopifyVariantId
-        product_url = None
+    shopify_product_id = recommendation.shopifyProductId
+    shopify_variant_id = recommendation.shopifyVariantId
+    product_url = None
 
-        # Fail fast with a clear, customer-safe reason instead of letting every downstream
-        # GraphQL call fail one by one. get_admin_access_token tries client credentials first
-        # (cached/auto-refreshed), only falling back to a stored Session-table token when client
-        # credentials aren't configured -- never logs the token itself, only whether one exists
-        # and which source it came from (it logs SHOPIFY_AUTH_SOURCE/SHOPIFY_ADMIN_AUTH_OK/
-        # SHOPIFY_ADMIN_AUTH_FAILED internally).
+    # Fail fast with a clear, customer-safe reason instead of letting every downstream GraphQL
+    # call fail one by one. get_admin_access_token only ever operates on the trusted shop and
+    # never logs the token itself.
+    try:
         token, auth_source = await get_admin_access_token(session, shop)
-        logger.info("SHOPIFY_SESSION_LOOKUP %s", json.dumps({"shop": shop, "hasToken": bool(token), "source": auth_source}))
-        if not token:
-            logger.error("SHOPIFY_SESSION_MISSING %s", json.dumps({"shop": shop, "recommendationId": body.recommendationId}))
+    except UntrustedShopError:
+        logger.error("SHOPIFY_SESSION_MISSING %s", json.dumps({"shop": shop, "recommendationId": body.recommendationId, "reason": "untrusted_shop"}))
+        return {"error": _NOT_CONNECTED_MESSAGE}
+    logger.info("SHOPIFY_SESSION_LOOKUP %s", json.dumps({"shop": shop, "hasToken": bool(token), "source": auth_source}))
+    if not token:
+        logger.error("SHOPIFY_SESSION_MISSING %s", json.dumps({"shop": shop, "recommendationId": body.recommendationId}))
+        return {"error": _NOT_CONNECTED_MESSAGE}
+
+    try:
+        if not shopify_product_id:
+            identity_profile = await get_customer_profile(session, recommendation.conversationId)
+            logger.info("SHOPIFY_PRODUCT_CREATE_STARTED %s", json.dumps({"shop": shop, "recommendationId": body.recommendationId}))
+            result = await create_shopify_build_product(
+                session, shop, recommendation=recommendation,
+                custom_name=name or (recommendation.customerFacingJson or {}).get("customerFacingName") or "Custom Blend",
+                ratios=ratios, customer_name=identity_profile.get("name"), customer_email=identity_profile.get("email"),
+            )
+            shopify_product_id = result["productId"]
+            shopify_variant_id = result["variantId"]
+            product_url = result["productUrl"]
+            logger.info("SHOPIFY_VARIANT_RESOLVED %s", json.dumps({"shop": shop, "recommendationId": body.recommendationId, "created": True}))
+        else:
+            reprice = await reprice_existing_build(session, shop, recommendation=recommendation, ratios=ratios, name=name)
+            shopify_variant_id = reprice["variantId"]
+            handle = await get_product_handle(session, shop, shopify_product_id)
+            product_url = f"https://{shop}/products/{handle}" if handle else None
+            logger.info("SHOPIFY_VARIANT_RESOLVED %s", json.dumps({"shop": shop, "recommendationId": body.recommendationId, "created": reprice.get("created")}))
+    except ShopNotAuthenticated:
+        # Session row disappeared between the pre-check above and the actual call (e.g.
+        # APP_UNINSTALLED fired mid-request) -- same customer-safe framing either way.
+        logger.error("SHOPIFY_PRODUCT_CREATE_FAILED %s", json.dumps({"shop": shop, "recommendationId": body.recommendationId, "reason": "not_authenticated"}))
+        return {"error": _NOT_CONNECTED_MESSAGE}
+    except UntrustedShopError:
+        logger.error("SHOPIFY_PRODUCT_CREATE_FAILED %s", json.dumps({"shop": shop, "recommendationId": body.recommendationId, "reason": "untrusted_shop"}))
+        return {"error": _NOT_CONNECTED_MESSAGE}
+    except httpx.HTTPStatusError as err:
+        # The real, previously-swallowed failure mode: a stored token that Shopify itself
+        # rejects (401/403) -- wrong app's token, revoked, or the install was never completed
+        # for this app. Never SHOPIFY_API_SECRET-based workaround here; the fix is a real
+        # offline token for this app, not a different credential.
+        status = err.response.status_code
+        logger.error("SHOPIFY_PRODUCT_CREATE_FAILED %s", json.dumps({"shop": shop, "recommendationId": body.recommendationId, "reason": "shopify_http_error", "status": status}))
+        if status in (401, 403):
             return {"error": _NOT_CONNECTED_MESSAGE}
+        return {"error": "Shopify couldn't process this build right now — please try again shortly."}
+    except (InvalidRatios, InvalidCustomName, InvalidComputedPrice, ProductPricingNotFound, BuildProductNotSaved) as err:
+        logger.info("SHOPIFY_PRODUCT_CREATE_REJECTED %s", json.dumps({"shop": shop, "recommendationId": body.recommendationId, "reason": type(err).__name__}))
+        return {"error": str(err)}
+    except Exception as err:
+        logger.error("SHOPIFY_PRODUCT_CREATE_FAILED %s", json.dumps({"shop": shop, "recommendationId": body.recommendationId, "reason": "unexpected", "errorType": type(err).__name__}))
+        return {"error": "Failed to save the build."}
 
-        try:
-            if not shopify_product_id:
-                identity_profile = await get_customer_profile(session, recommendation.conversationId)
-                logger.info("SHOPIFY_PRODUCT_CREATE_STARTED %s", json.dumps({"shop": shop, "recommendationId": body.recommendationId}))
-                result = await create_shopify_build_product(
-                    session, shop, recommendation=recommendation,
-                    custom_name=body.name or (recommendation.customerFacingJson or {}).get("customerFacingName") or "Custom Blend",
-                    ratios=body.ratios, customer_name=identity_profile.get("name"), customer_email=identity_profile.get("email"),
-                )
-                shopify_product_id = result["productId"]
-                shopify_variant_id = result["variantId"]
-                product_url = result["productUrl"]
-                logger.info("SHOPIFY_VARIANT_RESOLVED %s", json.dumps({"shop": shop, "recommendationId": body.recommendationId, "created": True}))
-            else:
-                reprice = await reprice_existing_build(session, shop, product_id=shopify_product_id, ratios=body.ratios, name=body.name)
-                shopify_variant_id = reprice["variantId"]
-                handle = await get_product_handle(session, shop, shopify_product_id)
-                product_url = f"https://{shop}/products/{handle}" if handle else None
-                logger.info("SHOPIFY_VARIANT_RESOLVED %s", json.dumps({"shop": shop, "recommendationId": body.recommendationId, "created": reprice.get("created")}))
-        except ShopNotAuthenticated:
-            # Session row disappeared between the pre-check above and the actual call (e.g.
-            # APP_UNINSTALLED fired mid-request) -- same customer-safe framing either way.
-            logger.error("SHOPIFY_PRODUCT_CREATE_FAILED %s", json.dumps({"shop": shop, "recommendationId": body.recommendationId, "reason": "not_authenticated"}))
-            return {"error": _NOT_CONNECTED_MESSAGE}
-        except httpx.HTTPStatusError as err:
-            # The real, previously-swallowed failure mode: a stored token that Shopify itself
-            # rejects (401/403) -- wrong app's token, revoked, or the install was never completed
-            # for this app. Never SHOPIFY_API_SECRET-based workaround here; the fix is a real
-            # offline token for this app, not a different credential.
-            status = err.response.status_code
-            logger.error("SHOPIFY_PRODUCT_CREATE_FAILED %s", json.dumps({"shop": shop, "recommendationId": body.recommendationId, "reason": "shopify_http_error", "status": status}))
-            if status in (401, 403):
-                return {"error": _NOT_CONNECTED_MESSAGE}
-            return {"error": "Shopify couldn't process this build right now — please try again shortly."}
-        except (InvalidRatios, InvalidComputedPrice, ProductPricingNotFound) as err:
-            return {"error": str(err)}
-        except Exception as err:
-            logger.error("SHOPIFY_PRODUCT_CREATE_FAILED %s", json.dumps({"shop": shop, "recommendationId": body.recommendationId, "reason": "unexpected", "errorType": type(err).__name__}))
-            return {"error": "Failed to save the build."}
+    await mark_recommendation_saved(session, body.recommendationId, shopify_product_id=shopify_product_id, shopify_variant_id=shopify_variant_id)
 
-        await mark_recommendation_saved(session, body.recommendationId, shopify_product_id=shopify_product_id, shopify_variant_id=shopify_variant_id)
+    if body.intent == "save_build":
+        logger.info("SAVE_BUILD_COMPLETED %s", json.dumps({"shop": shop, "recommendationId": body.recommendationId, "shopifyProductId": shopify_product_id}))
+        return {"status": "saved", "shopifyProductId": shopify_product_id, "shopifyVariantId": shopify_variant_id, "productUrl": product_url}
 
-        if body.intent == "save_build":
-            logger.info("SAVE_BUILD_COMPLETED %s", json.dumps({"shop": shop, "recommendationId": body.recommendationId, "shopifyProductId": shopify_product_id}))
-            return {"status": "saved", "shopifyProductId": shopify_product_id, "shopifyVariantId": shopify_variant_id, "productUrl": product_url}
-
-        numeric_variant_id = _numeric_id_from_gid(shopify_variant_id)
-        logger.info("ADD_TO_CART_COMPLETED %s", json.dumps({"shop": shop, "recommendationId": body.recommendationId, "shopifyProductId": shopify_product_id}))
-        return {"status": "added", "shopifyProductId": shopify_product_id, "shopifyVariantId": shopify_variant_id, "cartUrl": f"https://{shop}/cart/{numeric_variant_id}:1"}
-
-    raise HTTPException(status_code=400, detail=f'Unknown intent "{body.intent}".')
+    numeric_variant_id = _numeric_id_from_gid(shopify_variant_id)
+    logger.info("ADD_TO_CART_COMPLETED %s", json.dumps({"shop": shop, "recommendationId": body.recommendationId, "shopifyProductId": shopify_product_id}))
+    return {"status": "added", "shopifyProductId": shopify_product_id, "shopifyVariantId": shopify_variant_id, "cartUrl": f"https://{shop}/cart/{numeric_variant_id}:1"}

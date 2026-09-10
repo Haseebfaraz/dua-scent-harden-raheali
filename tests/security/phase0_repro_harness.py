@@ -3,10 +3,14 @@ named test_*.py so the normal pytest run never collects it. Every check here PAS
 vulnerability is PRESENT: a green run is a confirmed finding, not a fix. Phase 1 inverts these
 into real regression tests. Network is fully mocked; no real Shopify, OpenAI, Odoo, or database
 is contacted (point DATABASE_URL at a closed port, e.g. postgresql://u:p@127.0.0.1:1/x).
+
+Phase 1 note: app/api/chat.py no longer resolves the shop from the database, so the harness no
+longer patches `resolve_shop_domain`; set SHOPIFY_SHOP_DOMAIN when running it. After Phase 1 the
+F1 / F2 / F2b / F2c checks FAIL (those attacks are closed -- see docs/SECURITY_AUDIT.md section
+12); F3 / F5 / F6 / F7 / F8 still PASS because those findings are scheduled for later phases.
 """
 
 import json
-import os
 
 import httpx
 import pytest
@@ -16,7 +20,7 @@ from app.ai import conversation_flow, tool_executor
 from app.api import chat as chat_module
 from app.config import settings
 from app.main import app
-from app.shopify import admin_auth, admin_client, builds, products
+from app.shopify import admin_auth, builds, products
 
 SENTINEL_KEY = "SENTINEL-CLIENT-ID-abc123"
 SENTINEL_SECRET = "SENTINEL-CLIENT-SECRET-shpss-xyz789"
@@ -300,7 +304,6 @@ def test_F8_caller_supplied_identity_is_treated_as_trusted_and_overwrites_victim
     monkeypatch.setattr(chat_module, "create_or_update_conversation", _fake_create_or_update)
     monkeypatch.setattr(chat_module, "save_message", _fake_save_message)
     monkeypatch.setattr(chat_module, "resolve_legacy_preview_short_circuit", _fake_legacy)
-    monkeypatch.setattr(chat_module, "resolve_shop_domain", _fake_resolve_shop)
     conversation_flow._CONVERSATIONS.clear()
 
     with TestClient(app) as client:
@@ -319,8 +322,9 @@ def test_F8_caller_supplied_identity_is_treated_as_trusted_and_overwrites_victim
     assert captured["email"] == "mallory@attacker.example" and captured["name"] == "Mallory"
     # ... and was persisted onto the victim's Conversation row.
     assert persisted and persisted[0] == {"conversation_id": "victim-conversation-id", "email": "mallory@attacker.example", "name": "Mallory"}
-    # Caller-supplied shop_domain flows into the turn (used for preview URLs).
-    assert captured["shop"] == "attacker.example"
+    # (Phase 1 closed the caller-supplied shop_domain side channel -- N10: the turn now always
+    # uses the configured trusted shop -- so that assertion is gone. F8 itself remains open.)
+    assert captured["shop"] != "attacker.example"
 
 
 def test_F5_greeting_field_lets_caller_inject_an_assistant_turn_on_a_fresh_conversation(monkeypatch):
@@ -340,7 +344,6 @@ def test_F5_greeting_field_lets_caller_inject_an_assistant_turn_on_a_fresh_conve
     monkeypatch.setattr(chat_module, "create_or_update_conversation", _noop)
     monkeypatch.setattr(chat_module, "save_message", _noop)
     monkeypatch.setattr(chat_module, "resolve_legacy_preview_short_circuit", _noop)
-    monkeypatch.setattr(chat_module, "resolve_shop_domain", _fake_resolve_shop)
     conversation_flow._CONVERSATIONS.clear()
 
     with TestClient(app) as client:
@@ -369,7 +372,6 @@ def test_F6_two_megabyte_message_is_accepted_and_forwarded(monkeypatch):
     monkeypatch.setattr(chat_module, "create_or_update_conversation", _noop)
     monkeypatch.setattr(chat_module, "save_message", _noop)
     monkeypatch.setattr(chat_module, "resolve_legacy_preview_short_circuit", _noop)
-    monkeypatch.setattr(chat_module, "resolve_shop_domain", _fake_resolve_shop)
     conversation_flow._CONVERSATIONS.clear()
 
     with TestClient(app) as client:
@@ -392,7 +394,6 @@ def test_F6b_every_anonymous_post_mints_an_unbounded_in_memory_conversation(monk
     monkeypatch.setattr(chat_module, "create_or_update_conversation", _noop)
     monkeypatch.setattr(chat_module, "save_message", _noop)
     monkeypatch.setattr(chat_module, "resolve_legacy_preview_short_circuit", _noop)
-    monkeypatch.setattr(chat_module, "resolve_shop_domain", _fake_resolve_shop)
     conversation_flow._CONVERSATIONS.clear()
 
     with TestClient(app) as client:

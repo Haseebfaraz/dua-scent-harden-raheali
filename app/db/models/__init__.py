@@ -259,3 +259,22 @@ class RecommendationInventoryComponent(Base):
     maxBuildableBottlesForComponent: Mapped[int | None]
 
     snapshot: Mapped["RecommendationInventorySnapshot"] = relationship(back_populates="components")
+
+
+class BuildCapability(Base):
+    """Phase 1 (security): a server-minted capability authorizing preview reads and Shopify build
+    mutations for exactly one recommendation. Python-owned table (migrations/0001_build_capability.sql),
+    not part of the shared Prisma schema. Only the token's SHA-256 hash is stored."""
+
+    __tablename__ = "BuildCapability"
+
+    id: Mapped[str] = mapped_column(primary_key=True)
+    recommendationId: Mapped[str] = mapped_column(
+        ForeignKey("FragranceRecommendation.id", ondelete="CASCADE"), index=True
+    )
+    conversationId: Mapped[str]
+    shop: Mapped[str]
+    tokenHash: Mapped[str] = mapped_column(unique=True)
+    expiresAt: Mapped[datetime]
+    revokedAt: Mapped[datetime | None]
+    createdAt: Mapped[datetime]

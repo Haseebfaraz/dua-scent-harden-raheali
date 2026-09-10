@@ -7,6 +7,6 @@ class ChatRequest(BaseModel):
     customer_email: str | None = None
     customer_name: str | None = None
     greeting: str | None = None
-    # Required from Node (which already resolved it); absent from a direct storefront call, in
-    # which case the /chat route resolves it itself via app.shopify.sessions.resolve_shop_domain.
+    # Accepted for wire compatibility with the Node adapter only. Phase 1 (security): the value
+    # is IGNORED -- the shop is always the configured trusted shop (app/shopify/trusted_shop.py).
     shop_domain: str | None = None

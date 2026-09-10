@@ -19,8 +19,9 @@ from app.db.session import get_session
 from app.schemas.chat import ChatRequest
 from app.services.conversation import create_or_update_conversation, save_message
 from app.services.customer_profile import get_customer_profile, save_customer_profile_field
+from app.services.build_capability import preview_url_for_logging
 from app.services.legacy_preview_recovery import resolve_legacy_preview_short_circuit
-from app.shopify.sessions import resolve_shop_domain
+from app.shopify.trusted_shop import TrustedShopNotConfigured, trusted_shop
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -80,7 +81,12 @@ async def public_chat_history(history: str | None = None, conversation_id: str |
 @router.post("/internal/chat", dependencies=[Depends(require_internal_api_key)])
 @router.post("/chat")
 async def chat_action(body: ChatRequest, session: AsyncSession = Depends(get_session)) -> StreamingResponse:
-    shop_domain = body.shop_domain or await resolve_shop_domain(session)
+    # Phase 1 (security, F1): the shop is the configured trusted shop, never a request value.
+    # body.shop_domain is still accepted for wire compatibility with the Node adapter but ignored.
+    try:
+        shop_domain = trusted_shop()
+    except TrustedShopNotConfigured:
+        raise HTTPException(status_code=503, detail="service not configured") from None
 
     async def _stream():
         try:
@@ -137,7 +143,7 @@ async def chat_action(body: ChatRequest, session: AsyncSession = Depends(get_ses
             if preview_ready_event:
                 logger.info("CHAT_PREVIEW_EVENT %s", json.dumps({
                     "conversationId": conversation_id, "recommendationId": preview_ready_event.get("recommendationId"),
-                    "eventType": preview_ready_event["type"], "previewUrl": preview_ready_event.get("previewUrl"),
+                    "eventType": preview_ready_event["type"], "previewUrl": preview_url_for_logging(preview_ready_event.get("previewUrl")),
                 }))
                 yield _sse_line(preview_ready_event)
             yield _sse_line({"type": "end_turn"})

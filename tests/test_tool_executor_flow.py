@@ -62,7 +62,9 @@ async def test_generate_emits_preview_ready_for_best_recommendation(db_session):
         assert result["sseEvent"]
         assert result["sseEvent"]["type"] == "preview_ready"
         assert result["sseEvent"]["recommendationId"]
-        assert result["sseEvent"]["previewUrl"] == build_preview_url(SHOP_DOMAIN, result["sseEvent"]["recommendationId"])
+        # Phase 1 (security): the preview URL carries a server-minted build capability (`bt`)
+        # that authorizes exactly this recommendation -- see tests/security/test_build_capability.py.
+        assert result["sseEvent"]["previewUrl"].startswith(build_preview_url(SHOP_DOMAIN, result["sseEvent"]["recommendationId"]) + "&bt=")
         assert result["sseEvent"]["type"] != "combination_recommendations"
 
         record = await db_session.scalar(select(FragranceRecommendation).where(FragranceRecommendation.id == result["sseEvent"]["recommendationId"]))
@@ -163,7 +165,7 @@ async def test_refine_emits_preview_ready_not_a_list(db_session):
         assert not result["modelContent"].startswith("Error")
         assert result["sseEvent"]["type"] == "preview_ready"
         assert result["sseEvent"]["type"] != "recommendation_refined"
-        assert result["sseEvent"]["previewUrl"] == build_preview_url(SHOP_DOMAIN, result["sseEvent"]["recommendationId"])
+        assert result["sseEvent"]["previewUrl"].startswith(build_preview_url(SHOP_DOMAIN, result["sseEvent"]["recommendationId"]) + "&bt=")
 
         record = await db_session.scalar(select(FragranceRecommendation).where(FragranceRecommendation.id == result["sseEvent"]["recommendationId"]))
         assert record.status == "confirmed"

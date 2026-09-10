@@ -38,6 +38,11 @@ class Settings(BaseSettings):
     # every real call site must check for a real value before trusting it.
     shopify_api_key: str = ""
     shopify_api_secret: str = ""
+    # Phase 1 (security): the ONE shop this single-store app may ever send its client credentials
+    # or an Admin access token to, e.g. "your-store.myshopify.com". Mandatory: there is no
+    # hard-coded fallback in any environment, and every Shopify Admin call fails closed until this
+    # is set. Validated and allowlist-compared in app/shopify/trusted_shop.py.
+    shopify_shop_domain: str = ""
     shopify_app_url: str = ""
     scopes: str = ""
     # Node hardcodes ApiVersion.October25; shopify.app.toml's [webhooks] separately says 2025-04 --

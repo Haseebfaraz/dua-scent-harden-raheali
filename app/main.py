@@ -8,20 +8,38 @@ from app.api import chat, health, preview, recommendations, save_build
 from app.config import settings
 from app.logging_config import RequestContextMiddleware, configure_logging
 from app.shopify import webhooks as shopify_webhooks
+from app.shopify.trusted_shop import UntrustedShopError, trusted_shop
 
 configure_logging(settings.log_level)
 
 app = FastAPI(title="DUA Scent AI Core Backend")
 
-# Nothing else in the current architecture calls this service from a browser (Node's Shopify
-# adapter is the only other caller, server to server, where CORS doesn't apply) -- allowed_origins
-# defaults to empty (no browser origin allowed) rather than "*", configurable via ALLOWED_ORIGINS
-# should that ever change. save_build.router is the one deliberate exception: the live storefront
-# theme's note sliders call it directly cross-origin, so it sets its own wildcard CORS headers
-# per-response instead of going through this global allowlist (matches the Node route it replaces).
+
+def trusted_browser_origins() -> set[str]:
+    """Exact browser origins allowed to call this API cross-origin: ALLOWED_ORIGINS plus the
+    trusted shop's own storefront origin. Never a wildcard."""
+    origins = set(settings.allowed_origins_list)
+    try:
+        origins.add(f"https://{trusted_shop()}")
+    except UntrustedShopError:
+        pass
+    return origins
+
+
+class TrustedOriginCORSMiddleware(CORSMiddleware):
+    """Starlette's CORSMiddleware with the origin allowlist evaluated per request from settings
+    (so the trusted shop is honoured without an import-time snapshot). Exact match only."""
+
+    def is_allowed_origin(self, origin: str) -> bool:
+        return origin in trusted_browser_origins()
+
+
+# Phase 1 (security): the storefront (chat widget and theme sliders) is the only browser caller.
+# Both the global middleware and app/api/save_build.py's own per-response headers reflect the
+# exact trusted origin; the previous wildcard on the privileged save-build route is gone.
 app.add_middleware(
-    CORSMiddleware,
-    allow_origins=settings.allowed_origins_list,
+    TrustedOriginCORSMiddleware,
+    allow_origins=[],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],

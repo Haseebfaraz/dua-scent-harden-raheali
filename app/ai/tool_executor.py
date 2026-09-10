@@ -32,6 +32,7 @@ from app.fragrance.weather import (
     has_season_weather_conflict,
     weather_direction_to_query_season,
 )
+from app.services.build_capability import issue_build_token, preview_url_for_logging
 from app.services.combination_analysis import (
     check_exact_combination_exists,
     find_combinations_using_similar_notes,
@@ -105,9 +106,10 @@ def _compute_profile_hash(profile: dict) -> str:
 
 
 def _log_preview_event(stage: str, *, conversation_id, recommendation_id, preview_id, event_type, preview_url) -> None:
+    # The preview URL carries the build capability token -- never logged in plaintext.
     logger.info("%s %s", stage, json.dumps({
         "conversationId": conversation_id, "recommendationId": recommendation_id,
-        "previewId": preview_id, "eventType": event_type, "previewUrl": preview_url,
+        "previewId": preview_id, "eventType": event_type, "previewUrl": preview_url_for_logging(preview_url),
     }))
 
 
@@ -263,7 +265,11 @@ async def _auto_select_and_confirm_best(session: AsyncSession, with_ids: list[di
             continue
 
         await save_customer_profile_fields(session, conversation_id, {"selectedRecommendationId": candidate["recommendationId"]})
-        preview_url = build_preview_url(context["shopDomain"], candidate["recommendationId"])
+        # Phase 1 (security): mint the build capability that authorizes this customer's browser
+        # to open the preview and mutate this one build. If minting fails (e.g. the
+        # BuildCapability table is missing) the tool call fails closed -- no preview URL.
+        build_token = await issue_build_token(session, recommendation_id=candidate["recommendationId"], conversation_id=conversation_id, shop=context["shopDomain"])
+        preview_url = build_preview_url(context["shopDomain"], candidate["recommendationId"], build_token)
         _log_preview_event("BEST_RECOMMENDATION_SELECTED", conversation_id=conversation_id, recommendation_id=candidate["recommendationId"], preview_id=candidate["recommendationId"], event_type="preview_ready", preview_url=preview_url)
         _log_preview_event("PREVIEW_READY_EMITTED", conversation_id=conversation_id, recommendation_id=candidate["recommendationId"], preview_id=candidate["recommendationId"], event_type="preview_ready", preview_url=preview_url)
         grounded_facts = {
@@ -700,7 +706,8 @@ async def _handle_confirm_product_combination(session: AsyncSession, conversatio
     if not result["ok"]:
         return _fail(f"{result['reason']} Keep the customer's selected recommendation unchanged — do not propose a different one. You may retry confirm_product_combination with the same recommendationId.")
 
-    legacy_preview_url = build_preview_url(context["shopDomain"], recommendation_id)
+    build_token = await issue_build_token(session, recommendation_id=recommendation_id, conversation_id=conversation_id, shop=context["shopDomain"])
+    legacy_preview_url = build_preview_url(context["shopDomain"], recommendation_id, build_token)
     _log_preview_event("PREVIEW_READY_EMITTED", conversation_id=conversation_id, recommendation_id=recommendation_id, preview_id=recommendation_id, event_type="preview_ready", preview_url=legacy_preview_url)
     return _ok(
         "Confirmed. Tell the customer their fragrance preview is ready — do NOT say a product has been created yet. The frontend will open the preview page automatically.",

@@ -508,3 +508,99 @@ sound and will be preserved.
 **Current public-production readiness: NO-GO.** Two CRITICAL findings (F1, F2/N1/N3) allow an
 unauthenticated internet user to exfiltrate the Shopify app credentials and to rename, re-price,
 or create live store products. These must be closed before any storefront exposure.
+
+
+---
+
+## 12. Phase 1 closure (2026-09-10): critical commerce security hardening
+
+Scope approved: F1, F2, N1, N3 only. Branch `security-hardening`. No push, no deploy, no live
+Shopify / Odoo / OpenAI / production or staging database access. All attack reproduction and
+regression testing used mocked HTTP and a disposable local Postgres 16 (embedded, schema created
+from the SQLAlchemy models plus `migrations/0001_build_capability.sql`, no catalog data).
+
+### Operator note: credential rotation
+
+**The Shopify client credentials (SHOPIFY_API_KEY / SHOPIFY_API_SECRET) should be rotated after
+the vulnerable production path is removed (i.e. after this Phase 1 code is deployed) if the
+pre-Phase-1 code was ever publicly deployed with real credentials.** F1 allowed any internet
+caller to choose the host that received them. Rotation was NOT performed, and the current values
+were neither read, printed, nor tested during this work.
+
+### Architecture change
+
+Before: `Origin` header -> shop hostname -> `https://{shop}/admin/oauth/access_token` with the
+client secret; caller-supplied product GID -> `productUpdate` before any check; ratios only
+required to sum to 100 on first-time creation and not at all on re-price; App Proxy signature +
+recommendation id was enough to create/rename/re-variant products.
+
+After (READ -> AUTHENTICATE -> AUTHORIZE -> VALIDATE PRODUCT -> VALIDATE INPUT -> COMPUTE -> WRITE):
+
+* `app/shopify/trusted_shop.py`: the single canonical shop boundary. `SHOPIFY_SHOP_DOMAIN` is
+  mandatory (no fallback anywhere); candidates must be bare ASCII `<store>.myshopify.com`
+  hostnames and must equal the configured shop exactly (constant-time compare). Enforced INSIDE
+  `admin_auth._request_client_credentials_token`, `admin_auth.get_admin_access_token`,
+  `admin_client.admin_graphql`, `sessions.get_offline_access_token`, `app_proxy.verified_shop`,
+  and `builds.*`, so no caller can bypass it. Credential-bearing httpx clients state
+  `follow_redirects=False` explicitly.
+* `app/services/build_capability.py` + `BuildCapability` table: a random 256-bit capability
+  minted by the backend at every `preview_ready` (auto-select, legacy confirm, legacy recovery),
+  stored only as a SHA-256 hash, scoped to one recommendation, 7-day expiry, revocable. The
+  plaintext travels in the signed App Proxy preview URL (`bt`) and in POST bodies; logs redact it.
+* `app/shopify/build_input.py`: one validator for ratios (integer 1..98 per layer, exactly
+  top/middle/base, sum 100, no bool/str/NaN/inf) and for the custom name (trimmed, NFC, no
+  control/format characters, max 80).
+* `app/shopify/builds.py`: product id comes from the recommendation row; `verify_build_product`
+  checks id, vendor, template suffix, `custom.note_composition.recommendationId`, layer
+  positions, and variants before any write; price must be finite and positive; rename is the
+  last write and only when the validated name differs.
+* `app/api/save_build.py`: new contract `{recommendationId, buildToken, ratios, name?}`; the
+  old `productId` shape is refused (`build_contract_upgraded`); exact-origin CORS with
+  `Vary: Origin`, unknown origins refused, no wildcard; every request needs the capability
+  regardless of Origin.
+* `app/api/preview.py`: GET and every POST intent require the capability before any draft,
+  profile, or Shopify write. The App Proxy shop must be the trusted shop (403 otherwise).
+* `app/main.py`: `TrustedOriginCORSMiddleware` evaluates the exact trusted origins per request.
+* `app/api/chat.py`: the turn's shop is always the trusted shop; caller `shop_domain` is ignored
+  (closes N10 as a side effect); preview URLs are logged without the token.
+
+### Finding status
+
+| ID | Original status | Remediation | Files | Regression tests | Remaining risk | Status |
+|---|---|---|---|---|---|---|
+| F1 | OPEN, CRITICAL, reproduced (7 hostname variants delivered the client secret to the chosen host) | Canonical trusted shop, enforced at the credential-bearing layers; Origin no longer used for identity; no hard-coded fallback | `app/shopify/trusted_shop.py`, `admin_auth.py`, `admin_client.py`, `sessions.py`, `app_proxy.py`, `api/chat.py`, `config.py`, `.env.example`, `render.yaml` | `tests/security/test_trusted_shop.py` (46 rejection cases incl. IPv4/IPv6/localhost/private, userinfo, port, scheme, path, query, fragment, suffix/subdomain tricks, homoglyphs; zero-HTTP assertions for the grant, the GraphQL client, the cache, and the Session fallback; redirect-following asserted off), `test_shopify_app_proxy.py::test_verified_shop_rejects_a_correctly_signed_request_for_a_different_shop`, `test_save_build_api.py::test_save_build_refuses_to_run_without_a_configured_trusted_shop`, `test_shopify_sessions.py` | Production must set `SHOPIFY_SHOP_DOMAIN`; credentials should be rotated (above). | **CLOSED** |
+| F2 | OPEN, CRITICAL, reproduced (rename of an arbitrary GID before any check) | Product id never accepted from callers; loaded from the recommendation row; `verify_build_product` before any write; rename last | `app/shopify/builds.py`, `app/shopify/products.py` (query now returns id/title/vendor/templateSuffix), `app/api/save_build.py`, `app/api/preview.py` | `tests/security/test_save_build_authorization.py` (old contract refused, smuggled GID refused, 11 product-identity mismatch cases with zero writes, DB product-id mismatch, unsaved build, ordering read->create->rename), `test_shopify_builds.py` (no rename before verification, foreign-recommendation product refused, untrusted shop refused before read) | None known for the direct endpoint. | **CLOSED** |
+| N1 | OPEN, HIGH, reproduced ($136 bottle re-priced under $5; negative layers accepted) | Shared integer ratio validator on every path; finite/positive price invariant; incomplete compositions cannot reach the price math | `app/shopify/build_input.py`, `builds.py`, `save_build.py`, `preview.py` | `tests/security/test_build_input.py` (36 invalid shapes incl. 1/1/1, 0/0/0, -100/100/100, 100/100/-100, NaN, Infinity, strings, bools, missing/extra keys; valid 34/33/33, 50/25/25, integral floats), `test_save_build_authorization.py` price section (incl. raw JSON `NaN`/`Infinity` literals), `test_shopify_builds.py` creation cases, `test_preview_authorization.py::test_invalid_ratios_on_save_build_write_nothing` | Zero layers are rejected by design (the UI floor is 5%, the server floor is 1% to accept server-generated defaults). | **CLOSED** |
+| N3 | OPEN, HIGH (recommendation id alone authorized preview reads and product creation/rename) | Build capability tokens on every preview read and mutation; minted only by the backend at preview_ready | `app/services/build_capability.py`, `app/db/models/__init__.py`, `migrations/0001_build_capability.sql`, `app/ai/preview_url.py`, `app/ai/tool_executor.py`, `app/services/legacy_preview_recovery.py`, `app/api/preview.py`, `app/api/save_build.py`, `app/static/js/fragrance_preview.js` | `tests/security/test_build_capability.py` (random, hash-only storage, foreign/expired/revoked/malformed rejected, cascade), `test_preview_authorization.py` (GET/POST without or with foreign token: 403 / `build_not_authorized`, zero writes, zero draft/profile changes; valid flows still work), `test_preview_ready_capability.py` (all three preview_ready paths mint and persist; token absent from logs), `test_save_build_authorization.py` ownership section | (1) The live theme's slider still sends the retired `productId` request and now gets `build_contract_upgraded`; the theme must adopt `docs/SHOPIFY_BUILD_SECURITY_CONTRACT.md`. (2) The token is a query parameter of the App-Proxied GET, so any access log that records full query strings (uvicorn's default access log, Shopify/Render edge logs) can capture it; mitigated by 7-day expiry, single-recommendation scope, and the App Proxy signature requirement, but operators should disable query-string logging or restrict log access. (3) Tokens are not yet revoked automatically when a build is finalized. | **PARTIALLY MITIGATED, BLOCKED ON THEME UPDATE** (backend complete and fail-closed) |
+
+### Test results (this machine, Python 3.11, local disposable Postgres 16 without catalog data)
+
+| Suite | Result |
+|---|---|
+| `tests/security/` (new Phase 1 regression tests) | 258 passed, 0 failed |
+| Full suite after Phase 1 | 778 passed, 57 failed, 6 deselected (live_ai) |
+| Full suite on untouched `main`, same database | 508 passed, 60 failed |
+| Failing after Phase 1 but passing on `main` (regressions) | **none** (set difference computed test-by-test) |
+| Failing on `main` but passing after Phase 1 | the 3 stale `test_shopify_admin_client.py` tests, now fixed |
+| The 57 remaining failures | identical set on both branches; every one needs the real catalog / order-history rows that only the production database holds (`test_recommendation_engine.py`, `test_recommendation_confirmation.py`, `test_tool_executor_flow.py` generate/refine cases, `test_order_history.py`, `test_inventory_snapshot.py`, `test_combination_analysis.py`, `test_product_catalog.py`, `test_legacy_preview_recovery.py`, one case each in `test_odoo_inventory.py`, `test_location_verification.py`, `test_conversation_intelligence.py`). NOT RUN against real data. |
+| Phase 0 harness (`tests/security/phase0_repro_harness.py`, passes = attack works) | F1 (8 cases), F2, F2b, F2c now FAIL (closed). F3, F5, F6, F7, F8 still PASS (open, later phases). |
+| Live Shopify mutation | none (CONFIRMED: every Shopify call mocked at `admin_graphql` / `httpx.AsyncClient.post`) |
+| Production / staging database access | none (CONFIRMED: `DATABASE_URL` pointed at a local Unix socket or a closed port) |
+
+### Exit criteria
+
+* Can arbitrary caller input determine where Shopify client credentials are transmitted? **NO**
+* Can arbitrary caller input determine where a Shopify access token is transmitted? **NO**
+* Can an unauthenticated caller submit an arbitrary product GID and cause a Shopify mutation? **NO**
+* Does any rename happen before product authorization? **NO**
+* Can invalid or incomplete ratios generate an artificially cheap variant? **NO**
+* Can negative percentages reach Shopify product creation? **NO**
+* Is knowledge of a recommendation id alone sufficient for a write? **NO**
+* Does privileged save-build still return wildcard CORS? **NO**
+
+### Out of scope, unchanged (still open)
+
+F3, F4, F5, F6, F7, F8, F9, F10 (version stays 2025-04 pending the Phase 8 GraphQL audit), F11,
+F12, N2, N5, N7, N8. Two additional observations from this phase for later: the live theme
+integration is now a blocking dependency (section above), and `greenlet` should be declared as an
+explicit dependency for non-3.12 interpreters.
