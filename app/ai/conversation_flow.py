@@ -36,6 +36,8 @@ from app.ai.prompt import (
     get_known_profile_field_names,
     validate_customer_response,
 )
+from app.ai.scope_responses import attack_reply, off_topic_reply, scope_redirect_reply, service_meta_reply
+from app.ai.security_gate import GateDecision, classify_deterministically, strip_attack_sentences
 from app.ai.safe_views import (
     STATUS_TOOL_NAME,
     build_customer_safe_profile_view,
@@ -45,7 +47,7 @@ from app.ai.safe_views import (
 )
 from app.ai.tool_executor import STATUS_GUIDANCE, execute_model_tool
 from app.ai.tools import EXTRACTABLE_PROFILE_FIELD_NAMES, FRAGRANCE_AGENT_TOOLS, GENERAL_CONVERSATION_TOOLS, PROFILE_EXTRACTION_TOOL
-from app.services.conversation import get_conversation_history
+from app.services.conversation import get_conversation_history, get_message_classifications
 from app.services.customer_profile import get_customer_profile, get_missing_required_fields
 from app.services.recommendation_pipeline import run_private_recommendation, should_generate
 
@@ -78,7 +80,7 @@ async def get_conversation(session: AsyncSession, conversation_id: str | None) -
 
     if conversation_id:
         db_messages = await get_conversation_history(session, conversation_id)
-        history = [{"role": m.role, "content": m.content} for m in db_messages]
+        history = await project_model_history(session, db_messages)
         # Phase 2: a caller-supplied id is never silently swapped for a fresh one here -- the
         # routes decide (public: must be authorized; internal: must exist), so an authorized but
         # still-empty conversation simply starts with an empty history.
@@ -92,6 +94,43 @@ async def get_conversation(session: AsyncSession, conversation_id: str | None) -
 
 def set_conversation_cache(conversation_id: str, history: list[dict]) -> None:
     _cache_put(conversation_id, history)
+
+
+async def project_model_history(session: AsyncSession, db_messages: list) -> list[dict]:
+    """Phase 4 (F5, history poisoning): the model never sees stored customer turns raw.
+
+    * A persisted classification decides: ATTACK / OFF_TOPIC / INVALID turns are replaced by a
+      neutral marker, MIXED turns are replayed with the attack sentences deterministically
+      stripped, everything else verbatim.
+    * A customer turn with NO persisted classification (legacy history from before Phase 4, or
+      a failed classification write) is screened deterministically and withheld if it carries
+      any attack signal.
+    Stored messages are never modified; only the in-memory model projection changes.
+    """
+    from app.ai.security_gate import screen_legacy_history_message
+
+    user_ids = [m.id for m in db_messages if m.role == "user"]
+    try:
+        classifications = await get_message_classifications(session, user_ids)
+    except Exception:  # noqa: BLE001 -- table missing / DB hiccup: screen everything deterministically
+        logger.warning("SECURITY_HISTORY_CLASSIFICATIONS_UNAVAILABLE")
+        classifications = {}
+    history: list[dict] = []
+    for m in db_messages:
+        content = m.content
+        if m.role == "user":
+            label = classifications.get(m.id)
+            if label is None:
+                if screen_legacy_history_message(content or ""):
+                    content = "[message withheld]"
+            elif label in ("ATTACK_EXTRACTION", "INVALID"):
+                content = "[message withheld]"
+            elif label == "OFF_TOPIC":
+                content = "[the customer asked about something outside fragrance and was redirected]"
+            elif label == "MIXED_ATTACK_FRAGRANCE":
+                content = strip_attack_sentences(content or "") or "[message withheld]"
+        history.append({"role": m.role, "content": content})
+    return history
 
 
 _LEAKED_ID_PATTERN = re.compile(r"\bc[a-z0-9]{20,}\b", re.IGNORECASE)
@@ -188,6 +227,24 @@ async def _extract_and_persist_profile_facts(
     return sse_events, synthetic_messages
 
 
+def _is_scope_violation(violation: str) -> bool:
+    return violation in ("instruction_disclosure", "tool_disclosure", "code_output", "internal_data_disclosure")
+
+
+def contains_system_prompt_fragment(text: str, system_prompt: str, *, window_words: int = 8) -> bool:
+    """True when the reply repeats any run of `window_words` consecutive words from the system
+    prompt (case/whitespace-insensitive). Deterministic: the prompt is compared, never sent
+    anywhere. A window of eight words does not occur by accident in ordinary sales copy."""
+    if not text or not system_prompt:
+        return False
+    norm = lambda s: re.sub(r"\s+", " ", s.lower()).strip()  # noqa: E731
+    prompt_norm = norm(system_prompt)
+    words = norm(text).split()
+    if len(words) < window_words:
+        return len(words) >= 4 and " ".join(words) in prompt_norm
+    return any(" ".join(words[i:i + window_words]) in prompt_norm for i in range(len(words) - window_words + 1))
+
+
 def _is_privacy_violation(violation: str) -> bool:
     return violation in ("brand_name_mention", "sku_like_value") or violation.startswith("blocked_product_title:")
 
@@ -204,14 +261,22 @@ async def _component_titles_for_recommendation(session: AsyncSession, recommenda
     return [p.get("title") for p in products if p.get("title")]
 
 
-async def _validate_and_repair_customer_text(text: str, conversation_id: str, blocked_product_titles: list[str]) -> str:
-    """One deterministic repair pass, tools disabled, for a brand-name/product-title/SKU leak --
-    defense in depth behind the Phase 3 data boundary. The repair model receives ONLY the
-    offending customer-facing text and a static rewrite instruction: never the conversation, the
-    profile, or the recommendation context.
+async def _validate_and_repair_customer_text(text: str, conversation_id: str, blocked_product_titles: list[str], *, system_prompt: str | None = None) -> str:
+    """Output scope/leak validation (Phase 3 + Phase 4).
+
+    * Phase 4: an instruction/tool/internals disclosure, a verbatim fragment of the system prompt,
+      or code output is replaced DETERMINISTICALLY with a fragrance redirect. No repair model is
+      involved, so no private context can reach one.
+    * Phase 3: a brand-name/product-title/SKU leak goes through one repair pass, tools disabled.
+      The repair model receives ONLY the offending customer-facing text and a static rewrite
+      instruction: never the conversation, the profile, or the recommendation context.
     """
     if not text:
         return text
+    scope_violations = [v for v in validate_customer_response(text, blocked_product_titles) if _is_scope_violation(v)]
+    if scope_violations or (system_prompt and contains_system_prompt_fragment(text, system_prompt)):
+        logger.warning("CUSTOMER_RESPONSE_SCOPE_VIOLATION %s", json.dumps({"conversationId": conversation_id, "violations": [v.split(":")[0] for v in scope_violations] or ["system_prompt_fragment"]}))
+        return scope_redirect_reply(f"{conversation_id}:scope")
     violations = [v for v in validate_customer_response(text, blocked_product_titles) if _is_privacy_violation(v)]
     if not violations:
         return text
@@ -228,21 +293,54 @@ async def _bridge_for_recommendation(session: AsyncSession, messages: list[dict]
     bridge_message = (bridge_data["choices"][0]["message"] if bridge_data else {})
     final_text = bridge_message.get("content") or "I've got the blend ready — take a look."
     blocked_titles = await _component_titles_for_recommendation(session, recommendation_id)
-    final_text = await _validate_and_repair_customer_text(final_text, conversation_id, blocked_titles)
+    system_prompt = messages[0]["content"] if messages and messages[0].get("role") == "system" else None
+    final_text = await _validate_and_repair_customer_text(final_text, conversation_id, blocked_titles, system_prompt=system_prompt)
     final_turn = {"role": "assistant", "content": final_text}
     messages.append(final_turn)
     added.append(final_turn)
     return final_text
 
 
+def deterministic_scope_reply(gate: GateDecision, message: str, conversation_id: str, turn_index: int) -> str | None:
+    """Server-authored reply for the routes that never reach a model. None for model routes."""
+    seed = f"{conversation_id}:{turn_index}"
+    if gate.classification == "ATTACK_EXTRACTION":
+        return attack_reply(seed)
+    if gate.classification == "OFF_TOPIC":
+        return off_topic_reply(gate.reason_code, seed)
+    if gate.classification == "SERVICE_META":
+        return service_meta_reply(message)
+    if gate.classification == "INVALID":
+        return "Tell me a little about the scent you have in mind and we'll start from there."
+    return None
+
+
 async def call_ai(
     session: AsyncSession, history: list[dict], conversation_id: str,
     known_customer_email: str | None, known_customer_name: str | None, shop_domain: str,
+    gate: GateDecision | None = None,
 ) -> dict[str, Any]:
     if not _has_openai_key():
         return {"replyText": "Configuration error: missing API key.", "sseEvents": []}
 
     from app.config import settings as _settings
+
+    # ---- Phase 4 scope/security gate (F4/F5) ----
+    # The route normally classifies before calling us (and answers ATTACK / OFF_TOPIC /
+    # SERVICE_META itself). A direct caller gets the deterministic layer here so that no path
+    # reaches the tool-enabled model without a gate decision. Fail safe: uncertain -> degraded.
+    latest_user_index = next((i for i in range(len(history) - 1, -1, -1) if history[i].get("role") == "user"), None)
+    latest_user_text = (history[latest_user_index].get("content") or "") if latest_user_index is not None else ""
+    if gate is None:
+        gate = classify_deterministically(latest_user_text) or GateDecision("FRAGRANCE", "CLASSIFIER_UNAVAILABLE", None, degraded=True)
+        if gate.is_deterministic_reply:
+            reply = deterministic_scope_reply(gate, latest_user_text, conversation_id, len(history))
+            logger.info("SECURITY_GATE_DECISION %s", json.dumps({"conversationId": conversation_id, "classification": gate.classification, "reasonCode": gate.reason_code, "version": gate.version, "route": "deterministic_reply", "caller": "call_ai"}))
+            projected = [*history[:latest_user_index], {"role": "user", "content": gate.model_history_content(latest_user_text)}] if latest_user_index is not None else list(history)
+            return {"replyText": reply, "sseEvents": [], "updatedMessages": [*projected, {"role": "assistant", "content": reply}], "gate": gate}
+        if gate.classification == "MIXED_ATTACK_FRAGRANCE" and latest_user_index is not None:
+            # The raw mixed message never enters model context: only the fragrance remainder.
+            history = [*history[:latest_user_index], {"role": "user", "content": gate.safe_message}, *history[latest_user_index + 1:]]
 
     profile_for_identity = await get_customer_profile(session, conversation_id)
     # Phase 2 (F8): known_customer_* are SELF-REPORTED (request body / adapter assertion). They
@@ -273,6 +371,17 @@ async def call_ai(
     # fragrance tools (verify location / resolve season / refine) are not even offered.
     conversation_mode = determine_conversation_mode(history, profile_for_identity)
     tools_for_turn = GENERAL_CONVERSATION_TOOLS if conversation_mode == "GENERAL_CONVERSATION" else FRAGRANCE_AGENT_TOOLS
+    # Phase 4 tool gating by classification (server decision, not the model's):
+    #   degraded (classifier failed / uncertain) -> NO model tools; small talk -> profile save only.
+    if gate.degraded:
+        tools_for_turn = None
+    elif gate.classification == "SMALL_TALK":
+        tools_for_turn = GENERAL_CONVERSATION_TOOLS
+    logger.info("SECURITY_GATE_DECISION %s", json.dumps({
+        "conversationId": conversation_id, "classification": gate.classification, "reasonCode": gate.reason_code,
+        "version": gate.version, "degraded": gate.degraded, "semanticUsed": gate.semantic_used,
+        "route": "model", "modelTools": [t["function"]["name"] for t in (tools_for_turn or [])],
+    }))
 
     # Batch-extract before building the prompt/context, so the customer context already reflects
     # whatever this message just supplied.
@@ -408,7 +517,7 @@ async def call_ai(
             })
             continue
 
-        final_text = await _validate_and_repair_customer_text(final_text, conversation_id, [])
+        final_text = await _validate_and_repair_customer_text(final_text, conversation_id, [], system_prompt=system_prompt)
         final_turn = {"role": "assistant", "content": final_text}
         messages.append(final_turn)
         added_this_turn.append(final_turn)

@@ -309,3 +309,18 @@ class RateLimitBucket(Base):
     windowStart: Mapped[datetime]
     count: Mapped[int]
     updatedAt: Mapped[datetime] = mapped_column(index=True)
+
+
+class MessageSecurityClassification(Base):
+    """Phase 4 (security): the scope/security classification of one customer message. Used to
+    project a safe model history (blocked turns are never replayed raw). Python-owned table
+    (migrations/0003_message_security_classification.sql)."""
+
+    __tablename__ = "MessageSecurityClassification"
+
+    id: Mapped[str] = mapped_column(primary_key=True)
+    messageId: Mapped[str] = mapped_column(ForeignKey("Message.id", ondelete="CASCADE"), unique=True)
+    classification: Mapped[str]
+    reasonCode: Mapped[str]
+    classifierVersion: Mapped[str]
+    createdAt: Mapped[datetime]

@@ -257,7 +257,7 @@ async def test_second_simultaneous_turn_for_the_same_conversation_is_refused(mon
     started = asyncio.Event()
     release = asyncio.Event()
 
-    async def _slow_call_ai(session, history, conversation_id, email, name, shop):
+    async def _slow_call_ai(session, history, conversation_id, email, name, shop, gate=None):
         started.set()
         await release.wait()
         return {"replyText": "done", "sseEvents": [], "updatedMessages": history}

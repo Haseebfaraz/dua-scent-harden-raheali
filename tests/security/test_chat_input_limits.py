@@ -97,7 +97,7 @@ def downstream(monkeypatch):
     monkeypatch.setattr(chat_module, "save_message", _noop)
     monkeypatch.setattr(chat_module, "resolve_legacy_preview_short_circuit", _noop)
 
-    async def _call_ai(session, history, conversation_id, email, name, shop):
+    async def _call_ai(session, history, conversation_id, email, name, shop, gate=None):
         calls["openai"] += 1
         calls["history"] = list(history)
         return {"replyText": "ok", "sseEvents": [], "updatedMessages": history}

@@ -6,7 +6,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.ids import new_id
-from app.db.models import Conversation, Message
+from app.db.models import Conversation, Message, MessageSecurityClassification
 from app.db.time import utcnow
 
 
@@ -50,3 +50,18 @@ async def get_conversation_history(session: AsyncSession, conversation_id: str) 
             )
         ).scalars()
     )
+
+
+async def save_message_classification(session: AsyncSession, message_id: str, *, classification: str, reason_code: str, version: str) -> None:
+    """Phase 4: persist the scope/security classification of a customer message (operational
+    codes only). Failures are logged by the caller; the chat never depends on this write."""
+    session.add(MessageSecurityClassification(id=new_id(), messageId=message_id, classification=classification, reasonCode=reason_code, classifierVersion=version, createdAt=utcnow()))
+    await session.commit()
+
+
+async def get_message_classifications(session: AsyncSession, message_ids: list[str]) -> dict[str, str]:
+    """messageId -> classification for the given messages (missing = unclassified / legacy)."""
+    if not message_ids:
+        return {}
+    rows = (await session.execute(select(MessageSecurityClassification.messageId, MessageSecurityClassification.classification).where(MessageSecurityClassification.messageId.in_(message_ids)))).all()
+    return {message_id: classification for message_id, classification in rows}

@@ -36,7 +36,8 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.ai.conversation_flow import call_ai, get_conversation, set_conversation_cache
+from app.ai.conversation_flow import call_ai, deterministic_scope_reply, get_conversation, set_conversation_cache
+from app.ai.security_gate import classify_message
 from app.api.client_identity import client_ip
 from app.api.request_limits import InvalidChatInput, validate_chat_message, validate_conversation_id, validate_token_shape
 from app.config import settings
@@ -44,7 +45,7 @@ from app.db.models import Conversation
 from app.db.session import get_session
 from app.schemas.chat import ChatRequest, ChatSessionRequest
 from app.services.build_capability import preview_url_for_logging
-from app.services.conversation import create_or_update_conversation, save_message
+from app.services.conversation import create_or_update_conversation, save_message, save_message_classification
 from app.services.conversation_capability import (
     CONVERSATION_TOKEN_HEADER,
     ConversationNotAuthorized,
@@ -306,6 +307,24 @@ async def _run_chat_turn(
 
     identity: SelfReportedIdentity = self_reported_identity(body.customer_name, body.customer_email)
 
+    # ---- SCOPE / SECURITY GATE (Phase 4: after auth + limits, before any model work) ----
+    # Layer 1 is deterministic; layer 2 is at most one low-privilege structured classifier call
+    # with no history, no tools and no private data. The classification is validated against a
+    # fixed enum and the SERVER routes on it below; it never selects tools or actions itself.
+    gate = await classify_message(user_message)
+    logger.info("SECURITY_GATE_DECISION %s", json.dumps({
+        "conversationId": conversation_id, "classification": gate.classification, "reasonCode": gate.reason_code,
+        "version": gate.version, "degraded": gate.degraded, "semanticUsed": gate.semantic_used,
+        "route": "deterministic_reply" if gate.is_deterministic_reply else "model", "public": public,
+    }))
+    if gate.classification == "ATTACK_EXTRACTION":
+        # Repeated attacks throttle the conversation and the source address for a while. Counting
+        # happens here, so the escalation is a pure server decision.
+        await _enforce_limits(session, [
+            limit("security_denied", conversation_id, settings.rate_limit_security_denied_per_conversation),
+            limit("security_denied_ip", ip_subject, settings.rate_limit_security_denied_per_ip),
+        ])
+
     # ---- CONCURRENCY (one turn per conversation across instances; per-process global cap) ----
     lock = conversation_turn_lock(conversation_id)
     try:
@@ -321,11 +340,23 @@ async def _run_chat_turn(
             try:
                 conv = await get_conversation(session, conversation_id)
                 history = conv["history"]
-                history.append({"role": "user", "content": user_message})
+                # The model-facing history gets the gated projection (raw attack text is never
+                # replayed; a mixed message keeps only its fragrance part). The raw message is
+                # still persisted below, alongside its classification.
+                history.append({"role": "user", "content": gate.model_history_content(user_message)})
 
-                legacy_short_circuit = await resolve_legacy_preview_short_circuit(session, conversation_id, user_message, identity.name, identity.email, shop_domain)
+                deterministic_reply = deterministic_scope_reply(gate, user_message, conversation_id, len(history))
+                legacy_short_circuit = None
+                if deterministic_reply is None:
+                    legacy_short_circuit = await resolve_legacy_preview_short_circuit(session, conversation_id, user_message, identity.name, identity.email, shop_domain)
 
-                if legacy_short_circuit:
+                if deterministic_reply is not None:
+                    # ATTACK / OFF_TOPIC / SERVICE_META / INVALID: no model, no tools, no profile
+                    # writes, no generation. Server-authored redirect only.
+                    reply_text = deterministic_reply
+                    sse_events = []
+                    updated_messages = [*history, {"role": "assistant", "content": reply_text}]
+                elif legacy_short_circuit:
                     reply_text = "Pulling up your fragrance preview now."
                     sse_events = [{
                         "type": "preview_ready", "recommendationId": legacy_short_circuit["recommendationId"],
@@ -334,7 +365,7 @@ async def _run_chat_turn(
                     updated_messages = [*history, {"role": "assistant", "content": reply_text}]
                 else:
                     result = await asyncio.wait_for(
-                        call_ai(session, history, conversation_id, identity.email, identity.name, shop_domain),
+                        call_ai(session, history, conversation_id, identity.email, identity.name, shop_domain, gate=gate),
                         timeout=settings.chat_turn_deadline_seconds,
                     )
                     reply_text, sse_events, updated_messages = result["replyText"], result["sseEvents"], result.get("updatedMessages")
@@ -343,10 +374,18 @@ async def _run_chat_turn(
 
                 try:
                     await create_or_update_conversation(session, conversation_id, identity.email, identity.name)
-                    await save_message(session, conversation_id, "user", user_message)
+                    stored_user_message = await save_message(session, conversation_id, "user", user_message)
                     await save_message(session, conversation_id, "assistant", reply_text)
                 except Exception as err:
                     logger.error("Failed to persist chat log: %s", type(err).__name__)
+                    stored_user_message = None
+                if stored_user_message is not None:
+                    try:
+                        await save_message_classification(session, stored_user_message.id, classification=gate.classification, reason_code=gate.reason_code, version=gate.version)
+                    except Exception as err:
+                        # Without a stored classification the turn is screened deterministically
+                        # on the next load (see project_model_history), so this is safe to lose.
+                        logger.error("SECURITY_CLASSIFICATION_PERSIST_FAILED %s", type(err).__name__)
 
                 # preview_ready makes the widget navigate away the instant it's parsed, so it must
                 # never reach the client before the reasoning bridge text. Every other event keeps

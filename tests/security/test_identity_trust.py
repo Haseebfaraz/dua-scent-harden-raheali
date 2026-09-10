@@ -151,7 +151,7 @@ async def test_self_reported_identity_fills_empty_fields_but_never_overwrites(fa
 async def test_caller_supplied_shop_domain_never_reaches_the_turn(fake_model, monkeypatch):
     captured = {}
 
-    async def _fake_call_ai(session, history, conversation_id, email, name, shop_domain):
+    async def _fake_call_ai(session, history, conversation_id, email, name, shop_domain, gate=None):
         captured["shop"] = shop_domain
         return {"replyText": "ok", "sseEvents": [], "updatedMessages": history}
 

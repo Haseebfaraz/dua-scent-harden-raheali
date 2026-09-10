@@ -100,7 +100,7 @@ async def test_post_internal_chat_streams_expected_sse_event_sequence(monkeypatc
 async def test_reasoning_bridge_chunk_is_emitted_before_preview_ready(monkeypatch):
     # The widget navigates away the instant it parses a preview_ready frame -- text arriving
     # after that is never seen, so the bridge must come first.
-    async def _fake_call_ai(session, history, conversation_id, known_customer_email, known_customer_name, shop_domain):
+    async def _fake_call_ai(session, history, conversation_id, known_customer_email, known_customer_name, shop_domain, gate=None):
         return {
             "replyText": "You wanted something fresh for the wedding with no oud, so I kept it bright and clean.",
             "sseEvents": [{"type": "preview_ready", "recommendationId": "rec_pytest", "previewId": "rec_pytest", "previewUrl": "https://example.test/preview"}],
@@ -121,7 +121,7 @@ async def test_reasoning_bridge_chunk_is_emitted_before_preview_ready(monkeypatc
 
 
 async def test_non_preview_sse_events_keep_their_position_but_are_field_allowlisted(monkeypatch):
-    async def _fake_call_ai(session, history, conversation_id, known_customer_email, known_customer_name, shop_domain):
+    async def _fake_call_ai(session, history, conversation_id, known_customer_email, known_customer_name, shop_domain, gate=None):
         return {
             "replyText": "Got your preferences.",
             "sseEvents": [

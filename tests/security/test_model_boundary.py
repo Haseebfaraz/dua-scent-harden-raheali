@@ -16,6 +16,7 @@ from sqlalchemy import delete, select
 
 from app.ai import conversation_flow, prompt as prompt_module, tool_executor
 from app.ai.conversation_flow import call_ai
+from app.ai.security_gate import GateDecision
 from app.ai.safe_views import (
     CUSTOMER_CONTEXT_TOOL_NAME,
     CustomerSafeRecommendation,
@@ -145,7 +146,11 @@ async def test_full_recommendation_turn_never_exposes_private_data_to_any_model(
         await _ready_profile(db_session, conversation_id)
         captured = capture_model_requests(monkeypatch)
         history = [{"role": "user", "content": MALICIOUS}]
-        result = await call_ai(db_session, history, conversation_id, None, None, SHOP)
+        # Phase 4 would stop this message at the gate before any model work. This test is the
+        # Phase 3 defense-in-depth boundary: even if the gate ever misclassified an attack as a
+        # fragrance turn, no private data may reach any model. So the gate is bypassed here on
+        # purpose with an explicit FRAGRANCE decision.
+        result = await call_ai(db_session, history, conversation_id, None, None, SHOP, gate=GateDecision("FRAGRANCE", "NONE", None))
 
         # The private pipeline ran for real (recommendation persisted, capability minted) ...
         rec = await db_session.scalar(select(FragranceRecommendation).where(FragranceRecommendation.conversationId == conversation_id))

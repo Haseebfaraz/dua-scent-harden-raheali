@@ -71,13 +71,16 @@ request header, query parameter, or body can ever select a different shop. See
 
 ### Database
 
-Two additive migrations are required before running this code against any database, in order:
+Three additive migrations are required before running this code against any database, in order:
 `migrations/0001_build_capability.sql` (build capabilities that authorize preview reads and
-Shopify build mutations -- `docs/SHOPIFY_BUILD_SECURITY_CONTRACT.md`) and
+Shopify build mutations -- `docs/SHOPIFY_BUILD_SECURITY_CONTRACT.md`),
 `migrations/0002_conversation_capability_and_rate_limits.sql` (conversation session secrets and
-the shared rate-limit counters -- `docs/CHAT_SECURITY_CONTRACT.md`). Apply them with `psql -f`
-against staging first. Without them every chat, preview, Save Build, and Add to Cart flow fails
-closed.
+the shared rate-limit counters -- `docs/CHAT_SECURITY_CONTRACT.md`) and
+`migrations/0003_message_security_classification.sql` (per-message scope/security classification
+used to keep blocked customer turns out of model context -- `docs/AI_SECURITY_GATE.md`). Apply
+them with `psql -f` against staging first. Without the first two every chat, preview, Save Build,
+and Add to Cart flow fails closed; without the third the chat runs but screens every stored
+customer turn deterministically on reload.
 
 ### Public chat contract
 

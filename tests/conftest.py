@@ -23,7 +23,8 @@ def _trusted_shop_for_tests(monkeypatch):
     # Every TestClient shares one network identity, so the production abuse limits would trip
     # across the suite. Tests that exercise the limiter set their own thresholds explicitly.
     for name in ("rate_limit_conversation_create_per_ip", "rate_limit_chat_turn_per_conversation", "rate_limit_chat_turn_per_conversation_daily",
-                 "rate_limit_chat_turn_per_ip", "rate_limit_history_read_per_conversation", "rate_limit_history_read_per_ip"):
+                 "rate_limit_chat_turn_per_ip", "rate_limit_history_read_per_conversation", "rate_limit_history_read_per_ip",
+                 "rate_limit_security_denied_per_conversation", "rate_limit_security_denied_per_ip"):
         monkeypatch.setattr(settings, name, "100000/60")
 
 

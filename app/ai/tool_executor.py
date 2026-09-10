@@ -599,6 +599,15 @@ async def _handle_save_customer_profile_field(session: AsyncSession, conversatio
         return _ok("Name is already known — no need to save or ask again.")
     if field == "email" and context.get("customerEmail"):
         return _ok("Email is already known — no need to save or ask again.")
+    # Phase 4 (F5, profile poisoning): a value that reads like an instruction to the assistant
+    # (role override, prompt/tool extraction, authority claim, encoded payload) is never stored,
+    # whichever model or extraction path proposed it. The model is told nothing beyond "not saved".
+    from app.ai.security_gate import looks_like_instruction
+
+    candidates = value if isinstance(value, list) else [value]
+    if any(isinstance(v, str) and looks_like_instruction(v) for v in candidates):
+        logger.warning("SECURITY_PROFILE_WRITE_REJECTED %s", json.dumps({"conversationId": conversation_id, "field": field}))
+        return _fail("that value was not saved. Continue the fragrance conversation.")
     if field == "name" and isinstance(value, str) and _is_implausible_name(value):
         return _fail('that doesn\'t read like a real name — do not save it. They likely answered a different question, or their reply got misread as an answer to "what should I call you?" Gently ask for their name again instead of guessing.')
 

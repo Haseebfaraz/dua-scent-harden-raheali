@@ -818,3 +818,88 @@ still works: YES (model tool, safe result).
 F1, F2, N1, F6, F7, F8, N2: all regression suites unchanged and passing; N3 unchanged (backend
 complete, theme update pending). No trusted-shop, capability, ownership, ratio, rate-limit,
 request-limit, or turn-lock code was modified.
+
+## 15. Phase 4 closure (2026-09-10): fragrance scope, prompt-injection defense, safe routing, adversarial testing
+
+Branch `security-hardening`, continuing after `5b9e6c8`. Nothing deployed, nothing pushed, no
+staging/production data touched, no live Shopify/Odoo mutation, no live model call. Full design
+in `docs/AI_SECURITY_GATE.md`; red-team results in `docs/AI_RED_TEAM_RESULTS.md`.
+
+### Architecture change
+
+A layered scope/security gate now runs on every chat turn after authorization and rate limits
+and before extraction, the main model, tools or generation (`app/ai/security_gate.py`, wired in
+`app/api/chat.py::_run_chat_turn` and `app/ai/conversation_flow.py::call_ai`):
+
+* Layer 1: bounded detection-only normalization (NFKC, zero width, spacing, punctuation, one URL
+  decode, clearly-valid base64, reversed; 4000 chars, no recursion, never executed, never
+  substituted for the customer's message) plus deterministic detectors for prompt / tool /
+  private-data extraction, role and authority override, encoded payloads, off-topic requests,
+  service questions, small talk and a broad fragrance lexicon.
+* Layer 2 (optional): one low-privilege structured classifier call (static instruction, current
+  message, one boolean; no history, profile, tools or private data), strict enum validation, at
+  most one call per turn, used only when layer 1 is uncertain. Any failure degrades to a
+  fragrance turn with no model tools.
+* Server routing on the closed taxonomy FRAGRANCE / SMALL_TALK / SERVICE_META / OFF_TOPIC /
+  ATTACK_EXTRACTION / MIXED_ATTACK_FRAGRANCE / INVALID: attacks, off-topic, service-meta and
+  invalid turns get server-authored replies (`app/ai/scope_responses.py`) with no model, tool,
+  profile write or generation; small talk gets the profile-save tool only; mixed turns feed only
+  the fragrance sentences to the pipeline.
+* History poisoning: raw messages are stored untouched; their classification is persisted in the
+  additive `MessageSecurityClassification` table (migration 0003); the model-facing history
+  replaces blocked turns with neutral markers both in cache and on reload; unclassified legacy
+  turns are screened deterministically.
+* Profile poisoning: instruction-like values are refused at the single profile-write handler.
+* Prompt (F4): general-conversation permissions removed; a short principle-based ROLE AND
+  BOUNDARIES block added to both templates.
+* Output: `validate_customer_response` gained instruction / tool / code / internal-data
+  disclosure flags; a verbatim eight-word run from the system prompt is detected; all of these
+  are repaired deterministically with no repair-model call.
+* Escalation: repeated attack turns count against new per-conversation / per-IP limits (429).
+* Logging: `SECURITY_GATE_DECISION` and related events carry codes only.
+
+### Finding status
+
+| Finding | Status |
+|---|---|
+| F4 general-assistant behaviour | CLOSED: prompt scope removed, off-topic and service-meta turns answered by the server, model tools narrowed by classification |
+| F5 prompt/tool extraction, history and profile poisoning | PARTIAL: architecturally closed and deterministically tested (routing, projections, profile guard, output repair, canaries); live semantic behaviour NOT validated because no safe development OpenAI credential exists in this environment |
+
+### Test results (Python 3.11, disposable local Postgres 16, migrations 0001–0003 applied, no catalog data)
+
+| Suite | Result |
+|---|---|
+| New Phase 4 tests (`test_security_gate.py`, `test_security_routing.py`, `test_prompt_scope.py`) | 74 passed |
+| `tests/security/` (Phases 1–4) | 468 passed, 0 failed |
+| Full suite after Phase 4 | 986 passed, 57 failed, 6 deselected (live_ai) |
+| Failing now but passing on untouched `main` (regressions) | **none** |
+| The 57 remaining failures | the unchanged production-catalog set; NOT RUN against real data |
+| Phase 0 harness | unchanged: F1, F2, F2b, F2c, F3, F3b, F3c, F6, F7, F8, internal-key bypass all FAIL (closed); F5/F6b need the database bootstrap; only the leaked-id-regex note still passes |
+| Deterministic red team (A–O) | 51/51 attacks + 15/15 paraphrases caught by layer 1; 0/76 false positives; see `docs/AI_RED_TEAM_RESULTS.md` |
+| Live red team (`tests/e2e/test_ai_red_team_live.py`) | built, collected, NOT RUN (no safe credential) |
+| Phase 3 canaries | still absent from every captured model request; the full-recommendation boundary test now bypasses the gate on purpose so it keeps proving defense in depth |
+
+### Exit criteria
+
+Gate before extraction/model/tools/generation: YES. Classifier is authorization: NO (server
+routes; output validated against a fixed enum; unknown fails safe). Attack turns reach a model:
+NO. Attack turns reach a tool or generation: NO. Raw attack text replayed into model context
+(cache or reload): NO. Stored history modified: NO. Legacy history screened: YES. Injected
+profile values stored: NO. "What's inside this fragrance?" blocked: NO. Mixed message keeps
+fragrance facts: YES. Deterministic replies contain security jargon: NO. System-prompt canary or
+tool name reaches the customer: NO, repaired without a repair model. Classifier calls per turn:
+≤ 1. Private data given to the classifier, guard or repair model: NO. Phase 1/2/3 suites: all
+passing.
+
+### Phase 1 / 2 / 3 regression check
+
+F1, F2, N1, F6, F7, F8, N2, F3, N5, N8: all regression suites unchanged and passing. Five
+existing tests were adapted only to the new `call_ai(..., gate=)` keyword; the Phase 3
+full-turn boundary test passes an explicit FRAGRANCE decision so it still exercises the
+pipeline. Engine files (`order_history.py`, `recommendation_engine.py`, `app/fragrance/*`)
+have no diff since Phase 0.
+
+### Still open after Phase 4
+
+N3 (theme update for the new build contract), N7 (review item), F5 live validation, F12 (no
+CI), credential rotation (operator action).

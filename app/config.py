@@ -95,6 +95,13 @@ class Settings(BaseSettings):
     # Keyed hash for abuse identifiers (IP addresses are never stored raw). Falls back to
     # CUSTOMER_KEY_HASH_SALT, then to an unkeyed hash, if unset.
     abuse_identity_hash_key: str = ""
+    # ---- Phase 4 (security): scope / security gate ----
+    # Layer 2 (structured semantic classifier) runs only when layer 1 is uncertain. Off means
+    # uncertain messages are handled in degraded mode (fragrance route, no model tools).
+    security_gate_semantic_enabled: bool = True
+    # Temporary per-conversation / per-IP throttle after repeated attack-classified messages.
+    rate_limit_security_denied_per_conversation: str = "15/3600"
+    rate_limit_security_denied_per_ip: str = "40/3600"
     # Server-owned welcome line for a fresh conversation (opt-in per request; the browser can no
     # longer supply assistant text).
     chat_welcome_message: str = "Hi! I help people design a fragrance that feels like their own. What brings you here today?"
