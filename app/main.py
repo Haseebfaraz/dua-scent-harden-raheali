@@ -5,6 +5,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
 from app.api import chat, health, preview, recommendations, save_build
+from app.api.request_limits import RequestBodyLimitMiddleware
 from app.config import settings
 from app.logging_config import RequestContextMiddleware, configure_logging
 from app.shopify import webhooks as shopify_webhooks
@@ -45,6 +46,8 @@ app.add_middleware(
     allow_headers=["*"],
 )
 app.add_middleware(RequestContextMiddleware)
+# Phase 2 (F6): oversized JSON bodies are refused (413) before they are read.
+app.add_middleware(RequestBodyLimitMiddleware)
 
 app.include_router(health.router)
 app.include_router(chat.router)

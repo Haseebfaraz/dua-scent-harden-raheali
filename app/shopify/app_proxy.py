@@ -14,7 +14,11 @@ from app.shopify.hmac import verify_app_proxy_signature
 from app.shopify.trusted_shop import UntrustedShopError, require_trusted_shop
 
 
-def verified_shop(request: Request) -> str:
+def verified_signed_params(request: Request) -> dict:
+    """The App Proxy query parameters, ONLY after the signature verified and the shop matched the
+    trusted shop. `shop` is replaced by its canonical form. `logged_in_customer_id`, when present
+    and non-empty, is a Shopify-verified customer id (see app/services/customer_identity.py) --
+    which still says nothing about which objects that customer owns."""
     params = dict(request.query_params)
     if not verify_app_proxy_signature(params, settings.shopify_api_secret):
         raise HTTPException(status_code=400, detail="invalid app proxy signature")
@@ -22,6 +26,11 @@ def verified_shop(request: Request) -> str:
     if not shop:
         raise HTTPException(status_code=400, detail="missing shop")
     try:
-        return require_trusted_shop(shop)
+        params["shop"] = require_trusted_shop(shop)
     except UntrustedShopError:
         raise HTTPException(status_code=403, detail="shop not trusted") from None
+    return params
+
+
+def verified_shop(request: Request) -> str:
+    return verified_signed_params(request)["shop"]

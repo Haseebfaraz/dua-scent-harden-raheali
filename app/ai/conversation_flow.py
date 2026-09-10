@@ -6,10 +6,12 @@ import json
 import logging
 import re
 import uuid
+from collections import OrderedDict
 from typing import Any
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.ai.model_context import select_model_context
 from app.ai.openai_client import call_openai_once
 from app.ai.prompt import (
     build_response_repair_prompt,
@@ -30,28 +32,41 @@ logger = logging.getLogger(__name__)
 
 # CONVERSATIONS is wiped on every process restart even though every message is also durably saved
 # to Postgres via save_message -- when a returning customer's id isn't in memory, this rehydrates
-# from the DB instead of silently starting a blank conversation.
-_CONVERSATIONS: dict[str, list[dict]] = {}
+# from the DB instead of silently starting a blank conversation. Phase 2: bounded (LRU) so a flood
+# of new conversations cannot grow process memory without limit; the database is the source of
+# truth, an evicted entry is simply rehydrated.
+_CONVERSATIONS: "OrderedDict[str, list[dict]]" = OrderedDict()
+_CONVERSATION_CACHE_MAX_ENTRIES = 500
+
+
+def _cache_put(conversation_id: str, history: list[dict]) -> None:
+    _CONVERSATIONS[conversation_id] = history
+    _CONVERSATIONS.move_to_end(conversation_id)
+    while len(_CONVERSATIONS) > _CONVERSATION_CACHE_MAX_ENTRIES:
+        _CONVERSATIONS.popitem(last=False)
 
 
 async def get_conversation(session: AsyncSession, conversation_id: str | None) -> dict[str, Any]:
     if conversation_id and conversation_id in _CONVERSATIONS:
+        _CONVERSATIONS.move_to_end(conversation_id)
         return {"id": conversation_id, "history": _CONVERSATIONS[conversation_id]}
 
     if conversation_id:
         db_messages = await get_conversation_history(session, conversation_id)
-        if db_messages:
-            history = [{"role": m.role, "content": m.content} for m in db_messages]
-            _CONVERSATIONS[conversation_id] = history
-            return {"id": conversation_id, "history": history}
+        history = [{"role": m.role, "content": m.content} for m in db_messages]
+        # Phase 2: a caller-supplied id is never silently swapped for a fresh one here -- the
+        # routes decide (public: must be authorized; internal: must exist), so an authorized but
+        # still-empty conversation simply starts with an empty history.
+        _cache_put(conversation_id, history)
+        return {"id": conversation_id, "history": history}
 
     new_id = str(uuid.uuid4())
-    _CONVERSATIONS[new_id] = []
+    _cache_put(new_id, [])
     return {"id": new_id, "history": _CONVERSATIONS[new_id]}
 
 
 def set_conversation_cache(conversation_id: str, history: list[dict]) -> None:
-    _CONVERSATIONS[conversation_id] = history
+    _cache_put(conversation_id, history)
 
 
 _LEAKED_ID_PATTERN = re.compile(r"\bc[a-z0-9]{20,}\b", re.IGNORECASE)
@@ -186,8 +201,11 @@ async def call_ai(
         return {"replyText": "Configuration error: missing API key.", "sseEvents": []}
 
     profile_for_identity = await get_customer_profile(session, conversation_id)
-    confirmed_customer_name = known_customer_name or profile_for_identity.get("name")
-    confirmed_customer_email = known_customer_email or profile_for_identity.get("email") or extract_email_from_history(history)
+    # Phase 2 (F8): known_customer_* are SELF-REPORTED (request body / adapter assertion). They
+    # never override what the profile already holds; they only fill a gap. Nothing here is a
+    # verified Shopify identity, and none of it authorizes anything.
+    confirmed_customer_name = profile_for_identity.get("name") or known_customer_name
+    confirmed_customer_email = profile_for_identity.get("email") or known_customer_email or extract_email_from_history(history)
     profiling_question_count_before = count_assistant_question_turns(history)
     latest_user_message = next((m for m in reversed(history) if m.get("role") == "user"), None)
     high_signal_flags = detect_high_signal_flags((latest_user_message or {}).get("content") or "")
@@ -226,17 +244,24 @@ async def call_ai(
         sse_events.extend(extracted_sse_events)
 
     system_prompt = await build_system_prompt(session, history, conversation_id, known_customer_email, known_customer_name)
+    # Phase 2 (F6): the model sees a bounded, deterministic window of the most recent history
+    # (see app/ai/model_context.py); the full history stays in the database and in `history`.
+    from app.config import settings as _settings
+
+    context_window = select_model_context(history, max_messages=_settings.chat_context_max_messages, max_chars=_settings.chat_context_max_chars)
     # The synthetic tool-call/result pair goes AFTER the customer's message so the model sees it as
     # its own completed reaction to that message -- a static "already saved" line in the prompt was
     # not enough on its own to stop the model re-deriving and re-saving everything itself.
-    messages: list[dict] = [{"role": "system", "content": system_prompt}, *history, *extraction_synthetic_messages]
+    messages: list[dict] = [{"role": "system", "content": system_prompt}, *context_window, *extraction_synthetic_messages]
+    # `history` is what gets persisted/cached; keep the two in sync by tracking what this turn adds.
+    added_this_turn: list[dict] = list(extraction_synthetic_messages)
     final_text = ""
     called_tool_names: list[str] = []
 
-    # Up to 10 tool-resolution turns -- 6 wasn't enough headroom for the model to save several
-    # profile fields one at a time (it doesn't batch parallel tool calls) and still reach
-    # analyze_customer_product_candidates/generate_new_product_combinations in the same turn.
-    for turn in range(10):
+    # Up to CHAT_MAX_TOOL_TURNS (default 10) tool-resolution turns -- 6 wasn't enough headroom for
+    # the model to save several profile fields one at a time (it doesn't batch parallel tool
+    # calls) and still reach analyze/generate in the same turn. Explicit, configurable, bounded.
+    for turn in range(_settings.chat_max_tool_turns):
         data = await call_openai_once(messages, tools_for_turn)
         if not data:
             return {"replyText": "Sorry, I'm having trouble reaching the fragrance engine right now.", "sseEvents": sse_events}
@@ -246,7 +271,11 @@ async def call_ai(
         tool_calls = message.get("tool_calls")
 
         if choice.get("finish_reason") == "tool_calls" and tool_calls:
-            messages.append({"role": "assistant", "content": message.get("content"), "tool_calls": tool_calls})
+            # Phase 2 (F6): bound the number of tool calls a single model response may trigger.
+            tool_calls = list(tool_calls)[: _settings.chat_max_tool_calls_per_turn]
+            assistant_turn = {"role": "assistant", "content": message.get("content"), "tool_calls": tool_calls}
+            messages.append(assistant_turn)
+            added_this_turn.append(assistant_turn)
 
             preview_ready = False
             for tool_call in tool_calls:
@@ -256,7 +285,9 @@ async def call_ai(
                 if result.get("sseEvent"):
                     sse_events.append(result["sseEvent"])
 
-                messages.append({"role": "tool", "tool_call_id": tool_call["id"], "content": result["modelContent"]})
+                tool_message = {"role": "tool", "tool_call_id": tool_call["id"], "content": result["modelContent"]}
+                messages.append(tool_message)
+                added_this_turn.append(tool_message)
 
                 # tool_context's identity fields were snapshotted once before this loop started --
                 # but save_customer_profile_field can persist a newly-revealed name/email DURING
@@ -273,8 +304,8 @@ async def call_ai(
                 # actually change these two fields, not after every tool call.
                 if tool_name == "save_customer_profile_field":
                     refreshed_profile = await get_customer_profile(session, conversation_id)
-                    tool_context["customerName"] = known_customer_name or refreshed_profile.get("name")
-                    tool_context["customerEmail"] = known_customer_email or refreshed_profile.get("email")
+                    tool_context["customerName"] = refreshed_profile.get("name") or known_customer_name
+                    tool_context["customerEmail"] = refreshed_profile.get("email") or known_customer_email
 
                 if (result.get("sseEvent") or {}).get("type") == "preview_ready":
                     preview_ready = True
@@ -289,14 +320,15 @@ async def call_ai(
                 final_text = bridge_message.get("content") or "I've got the blend ready — take a look."
                 blocked_titles = await _component_titles_for_recommendation(session, (result.get("sseEvent") or {}).get("recommendationId"))
                 final_text = await _validate_and_repair_customer_text(final_text, conversation_id, blocked_titles)
-                messages.append({"role": "assistant", "content": final_text})
+                final_turn = {"role": "assistant", "content": final_text}
+                messages.append(final_turn)
+                added_this_turn.append(final_turn)
                 logger.info("CHAT_NEXT_ACTION %s", json.dumps({
                     "conversationId": conversation_id, "action": "GENERATE", "reason": "preview_ready",
                     "calledTools": called_tool_names, "profilingQuestionCountBefore": profiling_question_count_before,
                     "profilingQuestionCountAfter": profiling_question_count_before,
                 }))
-                persisted_messages = [m for m in messages if m.get("role") != "system"]
-                return {"replyText": final_text, "sseEvents": sse_events, "updatedMessages": persisted_messages}
+                return {"replyText": final_text, "sseEvents": sse_events, "updatedMessages": [*history, *added_this_turn]}
             continue
 
         final_text = message.get("content") or ""
@@ -306,7 +338,9 @@ async def call_ai(
         # doesn't occur in ordinary English, so this only ever fires on an actual leaked ID.
         leaked_id = turn < 5 and bool(_LEAKED_ID_PATTERN.search(final_text))
         if leaked_id:
-            messages.append({"role": "assistant", "content": final_text})
+            leaked_turn = {"role": "assistant", "content": final_text}
+            messages.append(leaked_turn)
+            added_this_turn.append(leaked_turn)
             messages.append({
                 "role": "system",
                 "content": "CRITICAL: your last reply contained what looks like an internal database identifier — customers must NEVER see this. Rewrite that reply now without any technical ID.",
@@ -314,7 +348,9 @@ async def call_ai(
             continue
 
         final_text = await _validate_and_repair_customer_text(final_text, conversation_id, [])
-        messages.append({"role": "assistant", "content": final_text})
+        final_turn = {"role": "assistant", "content": final_text}
+        messages.append(final_turn)
+        added_this_turn.append(final_turn)
         break
 
     asked_question_this_turn = isinstance(final_text, str) and "?" in final_text
@@ -341,8 +377,7 @@ async def call_ai(
         "profilingQuestionCountAfter": profiling_question_count_before + (1 if asked_question_this_turn else 0),
     }))
 
-    persisted_messages = [m for m in messages if m.get("role") != "system"]
-    return {"replyText": final_text or "Let's get that crafted for you.", "sseEvents": sse_events, "updatedMessages": persisted_messages}
+    return {"replyText": final_text or "Let's get that crafted for you.", "sseEvents": sse_events, "updatedMessages": [*history, *added_this_turn]}
 
 
 def _has_openai_key() -> bool:

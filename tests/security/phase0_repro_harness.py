@@ -8,6 +8,13 @@ Phase 1 note: app/api/chat.py no longer resolves the shop from the database, so 
 longer patches `resolve_shop_domain`; set SHOPIFY_SHOP_DOMAIN when running it. After Phase 1 the
 F1 / F2 / F2b / F2c checks FAIL (those attacks are closed -- see docs/SECURITY_AUDIT.md section
 12); F3 / F5 / F6 / F7 / F8 still PASS because those findings are scheduled for later phases.
+
+Phase 2 note: F7 and F8 now FAIL with 401 (a conversation id / claimed email no longer reads or
+continues a conversation) and F6 FAILS with 413 (body limit); the internal-key bypass check FAILS
+(the key is mandatory). F5 (greeting) and F6b (unbounded conversation creation) can no longer be
+exercised here at all because the public route's server-controlled bootstrap needs the database;
+their closure is proven by tests/security/test_chat_input_limits.py and test_rate_limiting.py.
+F3 still PASSES (Phase 3).
 """
 
 import json

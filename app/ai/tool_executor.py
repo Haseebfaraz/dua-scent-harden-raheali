@@ -472,7 +472,7 @@ async def _handle_save_customer_profile_field(session: AsyncSession, conversatio
         fields_to_save["preferenceVocabularyCorrections"] = [
             *(current_profile.get("preferenceVocabularyCorrections") or []),
             *({"field": field, **c} for c in vocabulary_corrections),
-        ]
+        ][-50:]  # Phase 2: bounded (most recent 50), never an unbounded blob
     profile = await save_customer_profile_fields(session, conversation_id, fields_to_save)
     missing = get_missing_required_fields(profile)
 

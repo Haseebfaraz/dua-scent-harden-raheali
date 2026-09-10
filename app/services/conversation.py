@@ -17,9 +17,10 @@ async def create_or_update_conversation(
     now = utcnow()
     if existing:
         existing.updatedAt = now
-        if customer_email:
+        # Phase 2 (F8): self-reported contact data never overwrites what is already recorded.
+        if customer_email and not existing.customerEmail:
             existing.customerEmail = customer_email
-        if customer_name:
+        if customer_name and not existing.customerName:
             existing.customerName = customer_name
         await session.commit()
         return existing

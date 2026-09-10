@@ -59,6 +59,46 @@ class Settings(BaseSettings):
     # fronted directly, default to "none" instead of "*".
     allowed_origins: str = ""
 
+    # ---- Phase 2 (security): public chat trust boundary, limits, and abuse controls ----
+    # Guest conversation session secret lifetime (idle sessions expire; the stored history stays).
+    conversation_token_ttl_days: int = 30
+    # Hard input limits, enforced at the schema/application layer before any DB or OpenAI work.
+    chat_max_message_chars: int = 4000
+    chat_max_name_chars: int = 100
+    chat_max_email_chars: int = 254
+    # JSON request bodies above this are refused with 413 before being read.
+    max_request_body_bytes: int = 65536
+    # Model-context budget: the most recent messages within BOTH bounds are sent to the model;
+    # everything older stays in the database untouched.
+    chat_context_max_messages: int = 40
+    chat_context_max_chars: int = 24000
+    # Public history endpoint returns at most this many (most recent) customer-visible messages.
+    chat_history_max_messages: int = 100
+    # Per-turn cost ceilings.
+    chat_max_tool_turns: int = 10
+    chat_max_tool_calls_per_turn: int = 6
+    chat_turn_deadline_seconds: int = 90
+    openai_max_output_tokens: int = 700
+    openai_copy_max_output_tokens: int = 200
+    # Per-process cap on simultaneous model-bearing chat turns (multiplied by instance count).
+    chat_max_concurrent_turns: int = 8
+    # Rate limits: "<count>/<window seconds>". Storage is PostgreSQL (multi-instance safe).
+    rate_limit_conversation_create_per_ip: str = "10/3600"
+    rate_limit_chat_turn_per_conversation: str = "12/60"
+    rate_limit_chat_turn_per_conversation_daily: str = "200/86400"
+    rate_limit_chat_turn_per_ip: str = "30/60"
+    rate_limit_history_read_per_conversation: str = "60/60"
+    rate_limit_history_read_per_ip: str = "120/60"
+    # Number of trusted reverse-proxy hops in front of this service. 0 = use the socket peer
+    # address and ignore X-Forwarded-For entirely; 1 = Render's edge proxy (see render.yaml).
+    trusted_proxy_hops: int = 0
+    # Keyed hash for abuse identifiers (IP addresses are never stored raw). Falls back to
+    # CUSTOMER_KEY_HASH_SALT, then to an unkeyed hash, if unset.
+    abuse_identity_hash_key: str = ""
+    # Server-owned welcome line for a fresh conversation (opt-in per request; the browser can no
+    # longer supply assistant text).
+    chat_welcome_message: str = "Hi! I help people design a fragrance that feels like their own. What brings you here today?"
+
     @property
     def allowed_origins_list(self) -> list[str]:
         return [o.strip() for o in self.allowed_origins.split(",") if o.strip()]

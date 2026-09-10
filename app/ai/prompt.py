@@ -892,8 +892,9 @@ async def build_system_prompt(
 
     missing_fields = get_missing_required_fields(profile)
 
-    confirmed_customer_name = known_customer_name or profile.get("name")
-    confirmed_customer_email = known_customer_email or profile.get("email")
+    # Phase 2 (F8): known_customer_* are self-reported and only fill an EMPTY profile field.
+    confirmed_customer_name = profile.get("name") or known_customer_name
+    confirmed_customer_email = profile.get("email") or known_customer_email
 
     if confirmed_customer_name and confirmed_customer_name != profile.get("name"):
         await save_customer_profile_field(

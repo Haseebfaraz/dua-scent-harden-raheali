@@ -604,3 +604,123 @@ F3, F4, F5, F6, F7, F8, F9, F10 (version stays 2025-04 pending the Phase 8 Graph
 F12, N2, N5, N7, N8. Two additional observations from this phase for later: the live theme
 integration is now a blocking dependency (section above), and `greenlet` should be declared as an
 explicit dependency for non-3.12 interpreters.
+
+
+---
+
+## 13. Phase 2 closure (2026-09-10): public API trust boundary, ownership, identity, limits, abuse
+
+Scope approved: F6, F7, F8, N2, and the Phase 1 preview-token follow-up. Branch
+`security-hardening`, on top of `99706bc`. No push, no deploy, no live Shopify / Odoo / OpenAI,
+no production or staging database. Database-backed tests ran against the disposable local
+Postgres 16 with both migrations applied and no catalog data.
+
+### Architecture change
+
+Before: any caller could read or continue any conversation by id; body `customer_name` /
+`customer_email` were treated as the trusted account identity and overwrote stored values; the
+`greeting` field became a persisted assistant turn; no message size, body size, history, tool,
+or output bounds beyond a fixed loop count; no rate limiting; unlimited concurrent turns per
+conversation; the internal-key check was skipped when unset; SSE events carried the full profile
+and candidate scores to the browser.
+
+After:
+
+* `app/services/conversation_capability.py` + `ConversationCapability` table: the server mints
+  the conversation id AND a 256-bit secret together (`POST /chat/session`, or the first
+  `POST /chat` without an id, delivered once in the `id` SSE frame). Only the SHA-256 hash is
+  stored; verification is hash lookup + constant-time compares; 30-day idle expiry, revocable;
+  transported in the `X-Conversation-Token` header (or chat body), never a query string, never
+  logged, never persisted in messages, never placed in model context. Separate in purpose and
+  storage from the Phase 1 build capability: owning a conversation never authorizes a Shopify
+  mutation.
+* `app/api/chat.py`: one authorization path for continuation and history; consistent 401 for
+  missing/wrong/foreign/expired tokens and unknown ids (no enumeration); the internal Node
+  routes require `INTERNAL_API_KEY` unconditionally and only continue ids that exist.
+* `app/services/customer_identity.py`: `SelfReportedIdentity` (body / adapter / typed-in-chat
+  name and email: validated for shape, only ever FILLS an empty profile or Conversation field,
+  never overwrites, never authenticates) versus `VerifiedShopifyCustomer` (a numeric
+  `logged_in_customer_id` from an App-Proxy query whose signature verified). Precedence: a
+  verified binding is never replaced. Verified customers are bound to build capabilities on
+  first use (`BuildCapability.verifiedShopifyCustomerId`); a different signed customer is then
+  refused even with the token. The public `/chat` route has no Shopify session, so nothing it
+  receives is verified; `shop_domain` from the body is ignored.
+* N2: `greeting` is accepted and ignored; the only assistant seed is the server-owned
+  `CHAT_WELCOME_MESSAGE` (opt-in `with_welcome`).
+* `app/api/request_limits.py`: message <= 4000 chars, NFC, no control characters, non-empty;
+  conversation id and token shapes; JSON bodies > 64 KB refused with 413 before reading; chunked
+  bodies without a length refused. Profile string-array items <= 100 chars (20 items), vocabulary
+  corrections capped at 50.
+* `app/ai/model_context.py`: deterministic recent-history window (40 messages / 24,000 chars,
+  tool-call pairs kept intact) sent to the model; stored history untouched. Public history
+  returns the most recent 100 user/assistant messages only.
+* `app/services/rate_limit.py` + `RateLimitBucket` table: fixed-window counters in PostgreSQL
+  (one upsert per limit per request, never per chunk), keyed by limit class plus a keyed hash of
+  the client IP (never raw) or the conversation id; fail closed when the store is unavailable.
+  Defaults: conversation create 10/h per IP, chat turns 12/min and 200/day per conversation and
+  30/min per IP, history reads 60/min per conversation and 120/min per IP. 429 with Retry-After,
+  returned before any stream starts. `app/api/client_identity.py` trusts X-Forwarded-For only
+  for the configured number of proxy hops (Render edge = 1; local = 0).
+* `app/services/turn_lock.py`: one model-bearing turn per conversation across all instances via
+  a PostgreSQL advisory lock on a dedicated connection (409 on overlap); released on success and
+  on exception. `_TurnSlots`: per-process cap of 8 simultaneous turns (503 + Retry-After).
+* Cost ceilings: tool turns 10, tool calls per model response 6, output tokens 700 (copy model
+  200, with the `max_completion_tokens` fallback), turn deadline 90 s, per-call timeout 30 s.
+* SSE allowlist: each event type may carry only named fields; profile dumps, candidate
+  scores/counts, and unknown events never reach the browser.
+* Preview token follow-up: `Cache-Control: no-store` and `Referrer-Policy: no-referrer` on the
+  preview page and its action responses; `--no-access-log` in the uvicorn start commands so the
+  signed preview URL (which carries `bt`) is not written by the app layer; log redaction from
+  Phase 1 retained. The token still travels in the App-Proxied GET query string because the
+  backend must authorize the page render and Shopify's proxy neither forwards fragments nor
+  reliably forwards cookies; a bootstrap-exchange design was judged too much protocol for the
+  gain and is deferred.
+
+### Finding status
+
+| ID | Original risk | Implementation | Tests | Residual risk | Status |
+|---|---|---|---|---|---|
+| F6 | 2 MB messages accepted; unbounded history to OpenAI; unbounded tool loop; no rate limits; unlimited overlapping turns; unbounded in-memory store | Input limits, body limit, bounded context, tool/output/deadline ceilings, PostgreSQL rate limiter with trusted-proxy IP extraction, advisory-lock turn guard, per-process slot cap, LRU conversation cache | `tests/security/test_chat_input_limits.py` (28), `test_rate_limiting.py` (17, incl. forged X-Forwarded-For, cross-conversation IP budget, lock exclusivity and release, slot cap), `test_context_and_cost_bounds.py` (10) | The per-process slot cap multiplies by instance count (documented, by design). Fixed windows allow a burst of up to 2x at a boundary. No semantic/attack throttling yet (Phase 4). No idempotency store: the lock prevents concurrent duplicates; a sequential double-submit is a genuine second turn (decision documented). | **CLOSED** (multi-instance safe: limiter and lock live in PostgreSQL) |
+| F7 | Conversation id alone read and continued any conversation and overwrote its contact fields | Server-minted conversation capability required on every public read/write; no enumeration via consistent 401 | `tests/security/test_conversation_ownership.py` (10), `test_chat_api.py` | The internal Node route remains id-addressed behind the mandatory shared key (trusted server, documented). The token is exposed to storefront JavaScript by necessity (XSS on the storefront could read it; sessionStorage recommended). | **CLOSED** for every public path |
+| F8 | Caller name/email/shop treated as verified identity | Explicit `SelfReportedIdentity` vs `VerifiedShopifyCustomer`; fill-only semantics; verified binding on build capabilities; shop always the trusted shop | `tests/security/test_identity_trust.py` (14) | The recommendation identity gate (`identity_missing`) still accepts a self-reported name and email because the public chat has no Shopify session at all; those values are contact data on the product, not authorization. Chat conversations cannot be bound to a verified customer until the storefront sends a Shopify-signed identity (widget/App Proxy change, later phase). | **CLOSED** for impersonation (email/name cannot authenticate); identity *verification* of chat users remains unavailable by architecture and is documented |
+| N2 | Browser `greeting` persisted as an assistant turn | Field ignored; server-owned welcome only | `test_chat_input_limits.py` greeting section (5), `test_conversation_ownership.py::test_welcome_is_server_owned_and_greeting_is_ignored` | None. | **CLOSED** |
+| Preview token in URL | `bt` in the App-Proxied GET query string | no-store, no-referrer, app access log disabled, log redaction, 7-day expiry, single-recommendation scope, verified-customer binding | `test_identity_trust.py` (headers, binding), `test_build_capability.py` (logging redaction) | Shopify/Render edge logs are outside our control; browser history retains the URL. | **MITIGATED** |
+| N9 (bonus) | Internal-key check skipped when unset; non-constant-time compare | Mandatory key, constant-time compare | `test_chat_api.py::test_internal_routes_fail_closed_when_no_secret_is_configured` | None. | **CLOSED** |
+| N10 (bonus) | Caller `shop_domain` selected the preview host | Ignored; trusted shop only | `test_identity_trust.py::test_caller_supplied_shop_domain_never_reaches_the_turn` | None. | **CLOSED** |
+| N14 (bonus) | State change on history GET | Still present, now behind ownership + rate limit | -- | Low. | OPEN (later) |
+
+### Test results (Python 3.11, disposable local Postgres 16, both migrations applied, no catalog data)
+
+| Suite | Result |
+|---|---|
+| `tests/security/` (Phase 1 + Phase 2) | 342 passed, 0 failed |
+| Full suite after Phase 2 | 875 passed, 57 failed, 6 deselected (live_ai) |
+| Failing after Phase 2 but passing on untouched `main` (regressions) | **none** (set difference computed test-by-test) |
+| The 57 remaining failures | identical to the Phase 1 and `main` sets: every one needs production-only catalog / order-history rows. NOT RUN against real data. |
+| Phase 0 harness | F1, F2, F2b, F2c, F6, F7, F8, and the internal-key bypass now FAIL (closed). F5 and F6b cannot run without a database (bootstrap is server-controlled); their closure is proven by the collected tests. F3 still PASSES (Phase 3). |
+| Live Shopify / OpenAI / Odoo | none (all mocked) |
+| Production / staging database | none |
+
+### Phase 1 regression check
+
+F1, F2, N1 regression suites unchanged and passing (`test_trusted_shop.py`, `test_build_input.py`,
+`test_save_build_authorization.py`, `test_shopify_builds.py`). Build authorization was not
+weakened: the conversation capability is a different table, service, and header, and the only
+change to build capabilities is the additional verified-customer binding check (stricter).
+
+### Exit criteria
+
+* Conversation id alone can read a conversation: **NO**. Continue: **NO**. A's credential on B: **NO**.
+* Caller email authenticates: **NO**. Caller name: **NO**. Caller shop: **NO**. Verified vs self-reported distinguishable: **YES**.
+* Browser greeting injects an assistant/trusted message: **NO**.
+* Max chat message enforced before OpenAI: **YES**. Profile/string/list sizes: **YES**.
+* Model context bounded: **YES**. Customer history access authorized: **YES**.
+* Production-valid rate limiting: **YES** (PostgreSQL). Per-conversation concurrency bounded: **YES**. Forged X-Forwarded-For bypasses controls: **NO**.
+* Plaintext capability tokens absent from logs: **YES**. Conversation secrets absent from URLs: **YES**. Build token URL exposure: **MITIGATED**.
+* Phase 1 regressed: **NO**. Build authorization weakened: **NO**.
+
+### Still open after Phase 2
+
+F3, F4, F5, F9, F10, F11, F12, N5, N7, N8, N14; the theme and widget integrations
+(`docs/SHOPIFY_BUILD_SECURITY_CONTRACT.md`, `docs/CHAT_SECURITY_CONTRACT.md`); credential
+rotation after deployment (section 12).

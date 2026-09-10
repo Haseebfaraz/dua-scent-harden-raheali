@@ -17,6 +17,8 @@ async def call_openai_once(messages: list[dict], tools: list[dict] | None, tool_
         "model": settings.openai_model,
         "messages": messages,
         "temperature": settings.openai_temperature,
+        # Phase 2 (F6): every completion has a hard output ceiling.
+        "max_tokens": settings.openai_max_output_tokens,
     }
     if tools:
         payload["tools"] = tools
@@ -34,12 +36,15 @@ async def call_openai_once(messages: list[dict], tools: list[dict] | None, tool_
             # error and retry rather than hardcoding a model-name allowlist, so this keeps working
             # correctly as OPENAI_MODEL changes. Bounded to a couple of corrections; a genuinely
             # unrelated 400 still surfaces immediately below.
-            for _ in range(2):
+            for _ in range(3):
                 if response.status_code != 400:
                     break
                 error_text = response.text
                 if "temperature" in payload and "temperature" in error_text and "does not support" in error_text:
                     payload.pop("temperature", None)
+                elif "max_tokens" in payload and "max_tokens" in error_text and "max_completion_tokens" in error_text:
+                    # Newer models take the same ceiling under a different name.
+                    payload["max_completion_tokens"] = payload.pop("max_tokens")
                 elif "reasoning_effort" in error_text and payload.get("reasoning_effort") != "none":
                     payload["reasoning_effort"] = "none"
                 else:

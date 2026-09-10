@@ -61,8 +61,8 @@ def validate_profile_field_value(field: str, value: object) -> tuple[bool, objec
             return False, f'invalid value for field "{field}": must be a boolean'
         return True, value
     if kind == "string_array":
-        if not isinstance(value, list) or len(value) > 20 or any(not isinstance(v, str) or not v for v in value):
-            return False, f'invalid value for field "{field}": must be an array of up to 20 non-empty strings'
+        if not isinstance(value, list) or len(value) > 20 or any(not isinstance(v, str) or not v or len(v) > 100 for v in value):
+            return False, f'invalid value for field "{field}": must be an array of up to 20 non-empty strings of at most 100 characters'
         return True, value
     return False, f'invalid value for field "{field}"'
 

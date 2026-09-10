@@ -6,7 +6,9 @@ services:
     runtime: python
     plan: starter
     buildCommand: pip install --no-cache-dir .
-    startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT
+    # --no-access-log: the app already logs one line per request (method/path/status) without the
+    # query string; uvicorn's access log would record preview URLs that carry a capability token.
+    startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT --no-access-log
     healthCheckPath: /health
     envVars:
       - key: APP_ENV
@@ -46,6 +48,11 @@ services:
       - key: SHOPIFY_API_SECRET
         sync: false
       - key: SHOPIFY_SHOP_DOMAIN
+        sync: false
+      # Render's edge proxy is the one trusted hop that appends the real client IP to X-Forwarded-For.
+      - key: TRUSTED_PROXY_HOPS
+        value: "1"
+      - key: ABUSE_IDENTITY_HASH_KEY
         sync: false
       - key: SHOPIFY_APP_URL
         sync: false

@@ -162,6 +162,7 @@ async def call_copy_model(messages: list[dict]) -> dict[str, str] | None:
         "model": settings.openai_copy_model,
         "messages": messages,
         "temperature": settings.openai_copy_temperature,
+        "max_tokens": settings.openai_copy_max_output_tokens,
         "response_format": {"type": "json_object"},
     }
     headers = {"Content-Type": "application/json", "Authorization": f"Bearer {settings.openai_api_key}"}
@@ -169,8 +170,15 @@ async def call_copy_model(messages: list[dict]) -> dict[str, str] | None:
         response = await _http_post("https://api.openai.com/v1/chat/completions", payload, headers)
         # Some models (reasoning-tier ones in particular) only support the default temperature and
         # reject any explicit value with a 400 -- retry once without it, same as openai_client.py.
-        if response.status_code == 400 and "temperature" in response.text and "does not support" in response.text:
-            payload.pop("temperature", None)
+        for _ in range(2):
+            if response.status_code != 400:
+                break
+            if "temperature" in payload and "temperature" in response.text and "does not support" in response.text:
+                payload.pop("temperature", None)
+            elif "max_tokens" in payload and "max_tokens" in response.text and "max_completion_tokens" in response.text:
+                payload["max_completion_tokens"] = payload.pop("max_tokens")
+            else:
+                break
             response = await _http_post("https://api.openai.com/v1/chat/completions", payload, headers)
     except Exception:
         return None

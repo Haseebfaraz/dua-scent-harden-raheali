@@ -59,6 +59,7 @@ async def issue_build_token(session: AsyncSession, *, recommendation_id: str, co
             conversationId=conversation_id,
             shop=shop,
             tokenHash=hash_build_token(token),
+            verifiedShopifyCustomerId=None,
             expiresAt=now + BUILD_TOKEN_TTL,
             revokedAt=None,
             createdAt=now,
@@ -68,9 +69,10 @@ async def issue_build_token(session: AsyncSession, *, recommendation_id: str, co
     return token
 
 
-async def authorize_build_token(session: AsyncSession, *, token: object, recommendation_id: object) -> BuildCapability:
+async def authorize_build_token(session: AsyncSession, *, token: object, recommendation_id: object, verified_shopify_customer_id: str | None = None) -> BuildCapability:
     """Return the matching live capability or raise BuildNotAuthorized. Never raises anything that
-    would reveal which check failed."""
+    would reveal which check failed. Phase 2: a capability bound to a Shopify-verified customer
+    refuses a request that Shopify signed for a DIFFERENT customer."""
     if not isinstance(token, str) or not token or len(token) > _MAX_TOKEN_LENGTH:
         raise BuildNotAuthorized()
     if not isinstance(recommendation_id, str) or not recommendation_id:
@@ -84,7 +86,17 @@ async def authorize_build_token(session: AsyncSession, *, token: object, recomme
         raise BuildNotAuthorized()
     if row.expiresAt <= utcnow():
         raise BuildNotAuthorized()
+    if row.verifiedShopifyCustomerId and verified_shopify_customer_id and not hmac.compare_digest(row.verifiedShopifyCustomerId.encode(), verified_shopify_customer_id.encode()):
+        raise BuildNotAuthorized()
     return row
+
+
+async def bind_build_capability_customer(session: AsyncSession, capability: BuildCapability, verified_shopify_customer_id: str) -> None:
+    """Explicit bind on first use by a Shopify-signed customer. Never replaces an existing binding."""
+    if capability.verifiedShopifyCustomerId:
+        return
+    capability.verifiedShopifyCustomerId = verified_shopify_customer_id
+    await session.commit()
 
 
 async def revoke_build_tokens(session: AsyncSession, recommendation_id: str) -> int:

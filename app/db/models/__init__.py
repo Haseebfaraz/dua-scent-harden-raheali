@@ -275,6 +275,37 @@ class BuildCapability(Base):
     conversationId: Mapped[str]
     shop: Mapped[str]
     tokenHash: Mapped[str] = mapped_column(unique=True)
+    # Phase 2: bound to the Shopify-signed logged_in_customer_id that first used it (if any).
+    verifiedShopifyCustomerId: Mapped[str | None]
     expiresAt: Mapped[datetime]
     revokedAt: Mapped[datetime | None]
     createdAt: Mapped[datetime]
+
+
+class ConversationCapability(Base):
+    """Phase 2 (security): the guest conversation session secret. A conversation id identifies a
+    record; possession of a live capability whose hash matches proves ownership. Python-owned
+    table (migrations/0002_conversation_capability_and_rate_limits.sql)."""
+
+    __tablename__ = "ConversationCapability"
+
+    id: Mapped[str] = mapped_column(primary_key=True)
+    conversationId: Mapped[str] = mapped_column(ForeignKey("Conversation.id", ondelete="CASCADE"), index=True)
+    tokenHash: Mapped[str] = mapped_column(unique=True)
+    verifiedShopifyCustomerId: Mapped[str | None]
+    expiresAt: Mapped[datetime]
+    revokedAt: Mapped[datetime | None]
+    lastUsedAt: Mapped[datetime | None]
+    createdAt: Mapped[datetime]
+
+
+class RateLimitBucket(Base):
+    """Phase 2 (security): fixed-window counters shared across service instances. `key` is a
+    limit class plus a keyed hash of the subject; never a raw IP or token."""
+
+    __tablename__ = "RateLimitBucket"
+
+    key: Mapped[str] = mapped_column(primary_key=True)
+    windowStart: Mapped[datetime]
+    count: Mapped[int]
+    updatedAt: Mapped[datetime] = mapped_column(index=True)

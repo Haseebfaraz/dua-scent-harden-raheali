@@ -71,11 +71,20 @@ request header, query parameter, or body can ever select a different shop. See
 
 ### Database
 
-One additive migration is required before running the Phase 1 code against any database:
-`migrations/0001_build_capability.sql` creates the `BuildCapability` table (server-minted
-capabilities that authorize preview reads and Shopify build mutations -- see
-`docs/SHOPIFY_BUILD_SECURITY_CONTRACT.md`). Apply it with `psql -f` against staging first. Without
-it, every preview / Save Build / Add to Cart flow fails closed.
+Two additive migrations are required before running this code against any database, in order:
+`migrations/0001_build_capability.sql` (build capabilities that authorize preview reads and
+Shopify build mutations -- `docs/SHOPIFY_BUILD_SECURITY_CONTRACT.md`) and
+`migrations/0002_conversation_capability_and_rate_limits.sql` (conversation session secrets and
+the shared rate-limit counters -- `docs/CHAT_SECURITY_CONTRACT.md`). Apply them with `psql -f`
+against staging first. Without them every chat, preview, Save Build, and Add to Cart flow fails
+closed.
+
+### Public chat contract
+
+The storefront must bootstrap a conversation (`POST /chat/session` or a first `POST /chat`
+without an id), keep the returned `conversationToken`, and send it on every later message and
+history read. `INTERNAL_API_KEY` is mandatory for the Node-adapter routes. Rate limits, input
+limits, and the trusted-proxy hop count are environment settings (see `.env.example`).
 
 Everything else maps onto the existing schema with SQLAlchemy models that mirror it exactly (see
 `app/db/models/__init__.py`). If you're pointing at a fresh/staging

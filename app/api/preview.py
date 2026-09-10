@@ -23,19 +23,20 @@ from typing import Any
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Request
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.session import get_session
-from app.services.build_capability import BUILD_TOKEN_QUERY_PARAM, BuildNotAuthorized, authorize_build_token
+from app.services.build_capability import BUILD_TOKEN_QUERY_PARAM, BuildNotAuthorized, authorize_build_token, bind_build_capability_customer
+from app.services.customer_identity import VerifiedShopifyCustomer, verified_shopify_customer_from_signed_params
 from app.services.customer_profile import get_customer_profile, save_customer_profile_field
 from app.services.fragrance_build import compute_default_ratios, compute_note_position_buckets, compute_price_per_5ml_by_position
 from app.services.recommendation_confirmation import get_recommendation, mark_recommendation_draft, mark_recommendation_saved
 from app.shopify.admin_auth import get_admin_access_token
 from app.shopify.admin_client import ShopNotAuthenticated
-from app.shopify.app_proxy import verified_shop
+from app.shopify.app_proxy import verified_signed_params
 from app.shopify.build_input import InvalidCustomName, InvalidRatios, validate_custom_name, validate_ratios
 from app.shopify.builds import BuildProductNotSaved, InvalidComputedPrice, ProductPricingNotFound, create_shopify_build_product, reprice_existing_build
 from app.shopify.products import get_product_handle
@@ -52,9 +53,26 @@ _NOT_AUTHORIZED_MESSAGE = "This fragrance preview link is not valid or has expir
 router = APIRouter()
 templates = Jinja2Templates(directory=str(Path(__file__).resolve().parent.parent / "templates"))
 
+# The preview page and its actions are personalized and carry the build capability: never cache,
+# never leak the URL (which carries `bt`) in a Referer.
+_SENSITIVE_HEADERS = {"Cache-Control": "no-store", "Referrer-Policy": "no-referrer"}
+
+
+async def _authorize_preview(session: AsyncSession, *, token: object, recommendation_id: object, customer: VerifiedShopifyCustomer | None):
+    """Build capability first; then, if Shopify signed a logged-in customer, bind or check it.
+    A capability bound to customer A refuses customer B even with the token."""
+    capability = await authorize_build_token(session, token=token, recommendation_id=recommendation_id, verified_shopify_customer_id=customer.customer_id if customer else None)
+    if customer and not capability.verifiedShopifyCustomerId:
+        await bind_build_capability_customer(session, capability, customer.customer_id)
+    return capability
+
 # Shopify's numeric REST-style ID from a GraphQL GID (e.g. "gid://shopify/ProductVariant/123" ->
 # "123") -- needed for the cart permalink URL format (/cart/{variantId}:{quantity}).
 _NUMERIC_ID_PATTERN = re.compile(r"(\d+)$")
+
+
+def _json(content: dict) -> JSONResponse:
+    return JSONResponse(content=content, headers=_SENSITIVE_HEADERS)
 
 
 def _numeric_id_from_gid(gid: str | None) -> str | None:
@@ -69,7 +87,7 @@ def _safe_json_for_script_tag(data: dict[str, Any]) -> str:
 
 
 @router.get("/apps/scent-library/fragrance-preview", response_class=HTMLResponse)
-async def preview_page(request: Request, shop: str = Depends(verified_shop), session: AsyncSession = Depends(get_session)):
+async def preview_page(request: Request, signed: dict = Depends(verified_signed_params), session: AsyncSession = Depends(get_session)):
     recommendation_id = request.query_params.get("recommendationId")
     if not recommendation_id:
         raise HTTPException(status_code=400, detail="recommendationId is required")
@@ -77,9 +95,9 @@ async def preview_page(request: Request, shop: str = Depends(verified_shop), ses
     # AUTHORIZE before revealing anything about the recommendation (including whether it exists).
     build_token = request.query_params.get(BUILD_TOKEN_QUERY_PARAM)
     try:
-        await authorize_build_token(session, token=build_token, recommendation_id=recommendation_id)
+        await _authorize_preview(session, token=build_token, recommendation_id=recommendation_id, customer=verified_shopify_customer_from_signed_params(signed))
     except BuildNotAuthorized:
-        raise HTTPException(status_code=403, detail=_NOT_AUTHORIZED_MESSAGE) from None
+        raise HTTPException(status_code=403, detail=_NOT_AUTHORIZED_MESSAGE, headers=_SENSITIVE_HEADERS) from None
 
     recommendation = await get_recommendation(session, recommendation_id)
     if not recommendation:
@@ -116,6 +134,7 @@ async def preview_page(request: Request, shop: str = Depends(verified_shop), ses
     return templates.TemplateResponse(
         request, "fragrance_preview.html",
         {"data": data, "data_json": _safe_json_for_script_tag(data)},
+        headers=_SENSITIVE_HEADERS,
     )
 
 
@@ -129,32 +148,33 @@ class PreviewAction(BaseModel):
 
 
 @router.post("/apps/scent-library/fragrance-preview")
-async def preview_action(body: PreviewAction, shop: str = Depends(verified_shop), session: AsyncSession = Depends(get_session)) -> dict:
+async def preview_action(body: PreviewAction, signed: dict = Depends(verified_signed_params), session: AsyncSession = Depends(get_session)) -> JSONResponse:
+    shop = signed["shop"]
     if body.intent not in ("recreate", "save_build", "add_to_cart"):
         raise HTTPException(status_code=400, detail=f'Unknown intent "{body.intent}".')
 
     # ---- AUTHORIZE first: no draft write, no lookup result, no Shopify call before this ----
     try:
-        await authorize_build_token(session, token=body.buildToken, recommendation_id=body.recommendationId)
+        await _authorize_preview(session, token=body.buildToken, recommendation_id=body.recommendationId, customer=verified_shopify_customer_from_signed_params(signed))
     except BuildNotAuthorized:
         logger.info("PREVIEW_ACTION_REJECTED %s", json.dumps({"shop": shop, "recommendationId": body.recommendationId, "intent": body.intent, "reason": "build_not_authorized"}))
-        return {"error": _NOT_AUTHORIZED_MESSAGE, "code": "build_not_authorized"}
+        return _json({"error": _NOT_AUTHORIZED_MESSAGE, "code": "build_not_authorized"})
 
     recommendation = await get_recommendation(session, body.recommendationId)
     if not recommendation:
-        return {"error": "Recommendation not found."}
+        return _json({"error": "Recommendation not found."})
 
     # ---- VALIDATE INPUT (shared rules for every intent) ----
     try:
         name = validate_custom_name(body.name)
         ratios = validate_ratios(body.ratios) if (body.ratios is not None or body.intent != "recreate") else None
     except (InvalidRatios, InvalidCustomName) as err:
-        return {"error": str(err), "code": "invalid_input"}
+        return _json({"error": str(err), "code": "invalid_input"})
 
     if body.intent == "recreate":
         await mark_recommendation_draft(session, body.recommendationId, name=name, ratios=ratios)
         await save_customer_profile_field(session, recommendation.conversationId, "pendingRecreateRecommendationId", body.recommendationId)
-        return {"status": "recreate", "redirectUrl": f"https://{shop}/"}
+        return _json({"status": "recreate", "redirectUrl": f"https://{shop}/"})
 
     log_prefix = "SAVE_BUILD" if body.intent == "save_build" else "ADD_TO_CART"
     logger.info("%s_STARTED %s", log_prefix, json.dumps({"shop": shop, "recommendationId": body.recommendationId}))
@@ -172,11 +192,11 @@ async def preview_action(body: PreviewAction, shop: str = Depends(verified_shop)
         token, auth_source = await get_admin_access_token(session, shop)
     except UntrustedShopError:
         logger.error("SHOPIFY_SESSION_MISSING %s", json.dumps({"shop": shop, "recommendationId": body.recommendationId, "reason": "untrusted_shop"}))
-        return {"error": _NOT_CONNECTED_MESSAGE}
+        return _json({"error": _NOT_CONNECTED_MESSAGE})
     logger.info("SHOPIFY_SESSION_LOOKUP %s", json.dumps({"shop": shop, "hasToken": bool(token), "source": auth_source}))
     if not token:
         logger.error("SHOPIFY_SESSION_MISSING %s", json.dumps({"shop": shop, "recommendationId": body.recommendationId}))
-        return {"error": _NOT_CONNECTED_MESSAGE}
+        return _json({"error": _NOT_CONNECTED_MESSAGE})
 
     try:
         if not shopify_product_id:
@@ -201,10 +221,10 @@ async def preview_action(body: PreviewAction, shop: str = Depends(verified_shop)
         # Session row disappeared between the pre-check above and the actual call (e.g.
         # APP_UNINSTALLED fired mid-request) -- same customer-safe framing either way.
         logger.error("SHOPIFY_PRODUCT_CREATE_FAILED %s", json.dumps({"shop": shop, "recommendationId": body.recommendationId, "reason": "not_authenticated"}))
-        return {"error": _NOT_CONNECTED_MESSAGE}
+        return _json({"error": _NOT_CONNECTED_MESSAGE})
     except UntrustedShopError:
         logger.error("SHOPIFY_PRODUCT_CREATE_FAILED %s", json.dumps({"shop": shop, "recommendationId": body.recommendationId, "reason": "untrusted_shop"}))
-        return {"error": _NOT_CONNECTED_MESSAGE}
+        return _json({"error": _NOT_CONNECTED_MESSAGE})
     except httpx.HTTPStatusError as err:
         # The real, previously-swallowed failure mode: a stored token that Shopify itself
         # rejects (401/403) -- wrong app's token, revoked, or the install was never completed
@@ -213,21 +233,21 @@ async def preview_action(body: PreviewAction, shop: str = Depends(verified_shop)
         status = err.response.status_code
         logger.error("SHOPIFY_PRODUCT_CREATE_FAILED %s", json.dumps({"shop": shop, "recommendationId": body.recommendationId, "reason": "shopify_http_error", "status": status}))
         if status in (401, 403):
-            return {"error": _NOT_CONNECTED_MESSAGE}
-        return {"error": "Shopify couldn't process this build right now — please try again shortly."}
+            return _json({"error": _NOT_CONNECTED_MESSAGE})
+        return _json({"error": "Shopify couldn't process this build right now — please try again shortly."})
     except (InvalidRatios, InvalidCustomName, InvalidComputedPrice, ProductPricingNotFound, BuildProductNotSaved) as err:
         logger.info("SHOPIFY_PRODUCT_CREATE_REJECTED %s", json.dumps({"shop": shop, "recommendationId": body.recommendationId, "reason": type(err).__name__}))
-        return {"error": str(err)}
+        return _json({"error": str(err)})
     except Exception as err:
         logger.error("SHOPIFY_PRODUCT_CREATE_FAILED %s", json.dumps({"shop": shop, "recommendationId": body.recommendationId, "reason": "unexpected", "errorType": type(err).__name__}))
-        return {"error": "Failed to save the build."}
+        return _json({"error": "Failed to save the build."})
 
     await mark_recommendation_saved(session, body.recommendationId, shopify_product_id=shopify_product_id, shopify_variant_id=shopify_variant_id)
 
     if body.intent == "save_build":
         logger.info("SAVE_BUILD_COMPLETED %s", json.dumps({"shop": shop, "recommendationId": body.recommendationId, "shopifyProductId": shopify_product_id}))
-        return {"status": "saved", "shopifyProductId": shopify_product_id, "shopifyVariantId": shopify_variant_id, "productUrl": product_url}
+        return _json({"status": "saved", "shopifyProductId": shopify_product_id, "shopifyVariantId": shopify_variant_id, "productUrl": product_url})
 
     numeric_variant_id = _numeric_id_from_gid(shopify_variant_id)
     logger.info("ADD_TO_CART_COMPLETED %s", json.dumps({"shop": shop, "recommendationId": body.recommendationId, "shopifyProductId": shopify_product_id}))
-    return {"status": "added", "shopifyProductId": shopify_product_id, "shopifyVariantId": shopify_variant_id, "cartUrl": f"https://{shop}/cart/{numeric_variant_id}:1"}
+    return _json({"status": "added", "shopifyProductId": shopify_product_id, "shopifyVariantId": shopify_variant_id, "cartUrl": f"https://{shop}/cart/{numeric_variant_id}:1"})
