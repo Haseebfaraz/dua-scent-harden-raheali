@@ -121,14 +121,10 @@ async def preview_page(request: Request, signed: dict = Depends(verified_signed_
         "name": recommendation.draftName or customer_facing_name,
         "buckets": buckets,
         "ratios": ratios,
-        "buildStatus": recommendation.buildStatus,
-        "shopifyProductId": recommendation.shopifyProductId,
         "pricePer5mlByPosition": price_per_5ml_by_position,
         "profilePills": profile_pills,
-        # Deliberately no product title here -- source/component products are internal evidence
-        # only. "contribution" is a neutral scent-structure ratio, never associated with a real
-        # catalog title in anything customer-facing (this data is embedded in the page's HTML).
-        "productsUsed": [{"contribution": p.get("contribution")} for p in internal_products],
+        # Phase 3: nothing else. No product titles (internal evidence), no Shopify ids, no
+        # build status, no per-component structure -- the page's JS uses none of them.
     }
 
     return templates.TemplateResponse(

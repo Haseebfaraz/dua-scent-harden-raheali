@@ -95,9 +95,18 @@ async def save_recommendation(session: AsyncSession, *, conversation_id: str, pr
             "compatibilityReasons": combination.get("compatibilityReasons"),
             "risks": combination.get("risks"),
             "canonicalKey": combination.get("canonicalKey"),
+            # Phase 3 (N8): everything that names a source product or carries evidence counts
+            # lives here (internal), never in customerFacingJson.
+            "components": combination.get("components"),
+            "customerFacingNotesByProduct": combination.get("customerFacingNotesByProduct"),
+            "whyNotesWork": combination.get("whyNotesWork"),
+            "expectedResult": combination.get("expectedResult"),
+            "customerFacingHistoricalEvidence": combination.get("customerFacingHistoricalEvidence"),
+            "existingCombinationEvidence": combination.get("existingCombinationEvidence"),
         },
         ratiosJson=combination.get("recommendedRatio"),
         evidenceScope=combination.get("evidenceScope"),
+        # Phase 3 (N8): customer-safe by construction -- no source title, count, id, or score.
         customerFacingJson={
             "customerFacingName": combination.get("customerFacingName"),
             "customerFacingDescription": combination.get("customerFacingDescription"),
@@ -106,14 +115,8 @@ async def save_recommendation(session: AsyncSession, *, conversation_id: str, pr
             "customerFacingWeatherSuitability": combination.get("customerFacingWeatherSuitability"),
             "customerFacingStrength": combination.get("customerFacingStrength"),
             "customerFacingRisk": combination.get("customerFacingRisk"),
-            "customerFacingNotesByProduct": combination.get("customerFacingNotesByProduct"),
-            "components": combination.get("components"),
             "combinedDirection": combination.get("combinedDirection"),
             "sharedOrConnectingNotes": combination.get("sharedOrConnectingNotes"),
-            "whyNotesWork": combination.get("whyNotesWork"),
-            "expectedResult": combination.get("expectedResult"),
-            "customerFacingHistoricalEvidence": combination.get("customerFacingHistoricalEvidence"),
-            "existingCombinationEvidence": combination.get("existingCombinationEvidence"),
         },
         status="pending",
         createdAt=now,
@@ -124,19 +127,14 @@ async def save_recommendation(session: AsyncSession, *, conversation_id: str, pr
 
 
 def to_customer_safe_recommendation(record: FragranceRecommendation) -> dict[str, Any]:
-    """The only shape any customer-facing surface may ever read. Never includes productsJson/
-    evidenceJson (real source titles/notes) or scoreJson's raw numbers.
+    """The only shape any customer-facing surface may ever read. Phase 3 (N8): built by the
+    single allowlist in app/ai/safe_views.py -- no source titles, evidence, scores, or ids. The
+    opaque recommendation id is control data the internal caller already holds; it is returned at
+    the top level here and is never part of the safe recommendation itself.
     """
-    score_json = record.scoreJson or {}
-    return {
-        "recommendationId": record.id,
-        "type": record.combinationType,
-        "existsAlready": False,
-        "evidenceScope": record.evidenceScope,
-        "confidence": score_json.get("confidence"),
-        "confidenceBreakdown": score_json.get("confidenceBreakdown"),
-        **(record.customerFacingJson or {}),
-    }
+    from app.ai.safe_views import build_customer_safe_recommendation
+
+    return {"recommendationId": record.id, **build_customer_safe_recommendation(record).model_dump()}
 
 
 async def get_recommendation(session: AsyncSession, recommendation_id: str) -> FragranceRecommendation | None:

@@ -1,7 +1,22 @@
-"""Port of app/tools/fragranceAgentTools.server.js -- the 13 fragrance-agent tools in OpenAI
-function-calling format, and execute_fragrance_tool(), the single dispatch point the conversation
-loop's tool-call loop invokes. Every handler talks to real data only -- no handler ever invents a
-product, note, score, or ratio.
+"""Tool execution, split into two trust levels (Phase 3, finding F3).
+
+  * execute_model_tool(...)     -- the ONLY dispatcher the conversational model can reach. It
+                                   accepts the four model-callable tools in app/ai/tools.py,
+                                   validates arguments against strict schemas (unknown keys
+                                   rejected, bounded, enums), and returns customer-safe results.
+                                   Private catalog / candidate / generation tools are refused by
+                                   name here even if a model asks for them.
+  * execute_fragrance_tool(...) -- the PRIVATE dispatcher (server-only). It still exposes every
+                                   original handler (candidate analysis, catalog lookups,
+                                   generation, refinement, legacy selection/confirmation) for the
+                                   server-side pipeline and for tests. Its results contain
+                                   internal data and are never placed in model context.
+
+The recommendation walk (`run_generate` / `run_refine` / `_auto_select_and_confirm_best`) returns
+a structured outcome: a status, control data for the browser (recommendation id, preview URL),
+and a CustomerSafeRecommendation. The status text handed to the model is server-authored guidance
+only; ids, scores, titles, and inventory internals stay in the outcome fields that the
+orchestrator never serializes for the model.
 """
 
 import hashlib
@@ -15,8 +30,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.ai.preview_url import build_preview_url
 from app.ai.refinement import derive_refinement_adjustments
-from app.ai.tools import validate_profile_field_value
+from app.ai.safe_views import CustomerSafeRecommendation, build_customer_safe_recommendation_from_candidate
+from app.ai.tools import MODEL_CALLABLE_TOOL_NAMES, ModelToolArgumentError, validate_model_tool_arguments, validate_profile_field_value
 from app.db.models import FragranceRecommendation
+from app.db.time import utcnow
 from app.fragrance.compatibility import (
     SEVERITY_RANK,
     literal_note_match_count,
@@ -45,7 +62,6 @@ from app.services.order_history import analyze_customer_product_candidates
 from app.services.product_catalog import get_product_notes_and_combination_status
 from app.services.recommendation_confirmation import confirm_recommendation, save_recommendation
 from app.services.recommendation_engine import CUSTOMER_FIT_LOW_THRESHOLD, generate_new_product_combinations, validate_combination_shape
-from app.db.time import utcnow
 
 logger = logging.getLogger(__name__)
 
@@ -65,6 +81,19 @@ _IMPLAUSIBLE_NAME_PATTERN = re.compile(
     re.IGNORECASE,
 )
 _VOCABULARY_CORRECTED_FIELDS = {"likes", "dislikes", "preferredStyle", "occasion", "additionalPreferences"}
+
+# Outcome statuses of the private recommendation walk. Only these labels (plus the server-authored
+# guidance below) are ever shown to the model.
+STATUS_READY = "READY"
+STATUS_IDENTITY_NEEDED = "IDENTITY_NEEDED"
+STATUS_NEEDS_MORE_DETAIL = "NEEDS_MORE_DETAIL"
+STATUS_TEMPORARILY_UNAVAILABLE = "TEMPORARILY_UNAVAILABLE"
+
+STATUS_GUIDANCE = {
+    STATUS_IDENTITY_NEEDED: "A fragrance is ready to be locked in, but the customer's name and email are not available yet. Do NOT claim this is a stock or availability problem. Ask naturally for what is missing (their name, or to make sure they are signed in so their email is on file).",
+    STATUS_NEEDS_MORE_DETAIL: "Nothing felt like a confident enough match yet. Tell the customer honestly that you want to get this right and ask ONE more useful question about their taste, rather than presenting a weak guess.",
+    STATUS_TEMPORARILY_UNAVAILABLE: "The fragrance couldn't be finalized just now. Tell the customer there was a temporary hiccup preparing it and offer to try again shortly. Do not invent a reason.",
+}
 
 
 def _is_implausible_name(text: str) -> bool:
@@ -94,7 +123,7 @@ def _effective_query_season(profile: dict) -> str:
     return weather_direction_to_query_season(profile.get("weatherDirection"), get_calendar_season(profile.get("country")))
 
 
-def _compute_profile_hash(profile: dict) -> str:
+def compute_profile_hash(profile: dict) -> str:
     relevant = {
         "city": profile.get("city"), "stateRegion": profile.get("stateRegion"), "country": profile.get("country"),
         "requestedSeasonStyle": profile.get("requestedSeasonStyle"), "weatherDirection": profile.get("weatherDirection"),
@@ -103,6 +132,9 @@ def _compute_profile_hash(profile: dict) -> str:
         "strengthPreference": profile.get("strengthPreference"), "occasion": profile.get("occasion"),
     }
     return hashlib.sha256(json.dumps(relevant, sort_keys=False).encode()).hexdigest()
+
+
+_compute_profile_hash = compute_profile_hash
 
 
 def _log_preview_event(stage: str, *, conversation_id, recommendation_id, preview_id, event_type, preview_url) -> None:
@@ -120,10 +152,10 @@ _conversation_scratch: dict[str, dict[str, Any]] = {}
 
 def _get_scratch(conversation_id: str, profile: dict | None = None) -> dict:
     if conversation_id not in _conversation_scratch:
-        _conversation_scratch[conversation_id] = {"candidateProducts": None, "lastCombinations": None, "profileHash": None}
+        _conversation_scratch[conversation_id] = {"candidateProducts": None, "lastCombinations": None, "profileHash": None, "lastGenerationAttemptHash": None}
     scratch = _conversation_scratch[conversation_id]
     if profile:
-        h = _compute_profile_hash(profile)
+        h = compute_profile_hash(profile)
         if scratch["profileHash"] and scratch["profileHash"] != h:
             scratch["candidateProducts"] = None
             scratch["lastCombinations"] = None
@@ -133,6 +165,15 @@ def _get_scratch(conversation_id: str, profile: dict | None = None) -> dict:
 
 def get_scratch_for_testing(conversation_id: str) -> dict | None:
     return _conversation_scratch.get(conversation_id)
+
+
+def mark_generation_attempted(conversation_id: str, profile: dict) -> None:
+    _get_scratch(conversation_id)["lastGenerationAttemptHash"] = compute_profile_hash(profile)
+
+
+def generation_already_attempted(conversation_id: str, profile: dict) -> bool:
+    scratch = _conversation_scratch.get(conversation_id) or {}
+    return scratch.get("lastGenerationAttemptHash") == compute_profile_hash(profile)
 
 
 # ============================================================
@@ -191,10 +232,23 @@ def evaluate_auto_confirm_eligibility(candidate: dict, profile: dict | None) -> 
 
 
 # ============================================================
-# Odoo manufacturing feasibility gate + auto-select walk
+# Odoo manufacturing feasibility gate + auto-select walk (PRIVATE)
 # ============================================================
 
-async def _auto_select_and_confirm_best(session: AsyncSession, with_ids: list[dict], conversation_id: str, context: dict) -> dict:
+def _outcome(status: str, *, recommendation_id: str | None = None, preview_url: str | None = None, safe: CustomerSafeRecommendation | None = None, legacy_text: str = "") -> dict:
+    return {
+        "ok": status == STATUS_READY,
+        "status": status,
+        "recommendationId": recommendation_id,
+        "previewUrl": preview_url,
+        "safeRecommendation": safe,
+        # Legacy text for the private dispatcher only (never model-visible).
+        "modelContent": legacy_text or STATUS_GUIDANCE.get(status, ""),
+        "sseEvent": {"type": "preview_ready", "recommendationId": recommendation_id, "previewId": recommendation_id, "previewUrl": preview_url} if status == STATUS_READY else None,
+    }
+
+
+async def _auto_select_and_confirm_best(session: AsyncSession, with_ids: list[dict], conversation_id: str, context: dict, likes: Any = None) -> dict:
     _log_preview_event("RECOMMENDATIONS_RANKED", conversation_id=conversation_id, recommendation_id=None, preview_id=None, event_type="generate_new_product_combinations", preview_url=None)
 
     def _reject(candidate_index: int, candidate: dict, stage: str, reason: str, inventory: dict | None = None) -> None:
@@ -236,7 +290,7 @@ async def _auto_select_and_confirm_best(session: AsyncSession, with_ids: list[di
                 components=inventory["components"],
             )
         except Exception as err:
-            logger.error("Failed to save inventory snapshot: %s", err)
+            logger.error("Failed to save inventory snapshot: %s", type(err).__name__)
             # A failed flush leaves a SQLAlchemy session's transaction inactive until rolled back
             # -- unlike Prisma, where one failed create() doesn't poison later queries on the same
             # client. Rolling back here is what makes the "log and keep going" contract below
@@ -267,11 +321,12 @@ async def _auto_select_and_confirm_best(session: AsyncSession, with_ids: list[di
         await save_customer_profile_fields(session, conversation_id, {"selectedRecommendationId": candidate["recommendationId"]})
         # Phase 1 (security): mint the build capability that authorizes this customer's browser
         # to open the preview and mutate this one build. If minting fails (e.g. the
-        # BuildCapability table is missing) the tool call fails closed -- no preview URL.
+        # BuildCapability table is missing) the flow fails closed -- no preview URL.
         build_token = await issue_build_token(session, recommendation_id=candidate["recommendationId"], conversation_id=conversation_id, shop=context["shopDomain"])
         preview_url = build_preview_url(context["shopDomain"], candidate["recommendationId"], build_token)
         _log_preview_event("BEST_RECOMMENDATION_SELECTED", conversation_id=conversation_id, recommendation_id=candidate["recommendationId"], preview_id=candidate["recommendationId"], event_type="preview_ready", preview_url=preview_url)
         _log_preview_event("PREVIEW_READY_EMITTED", conversation_id=conversation_id, recommendation_id=candidate["recommendationId"], preview_id=candidate["recommendationId"], event_type="preview_ready", preview_url=preview_url)
+        safe = build_customer_safe_recommendation_from_candidate(candidate, inventory=inventory, likes=likes)
         grounded_facts = {
             "type": candidate.get("type"),
             "whySuits": candidate.get("customerFacingWhySuits"),
@@ -280,19 +335,15 @@ async def _auto_select_and_confirm_best(session: AsyncSession, with_ids: list[di
             "weatherSuitability": candidate.get("customerFacingWeatherSuitability"),
             "risk": candidate.get("customerFacingRisk"),
         }
-        return {
-            "ok": True,
-            "modelContent": (
-                f"The best recommendation (recommendationId {candidate['recommendationId']}) was selected and confirmed "
-                f"automatically. Real grounded facts about it, and only these: {json.dumps(grounded_facts)}. The preview "
-                "page is opening on its own right now. In this reply, write ONE short, warm reasoning bridge (2-3 "
-                "sentences) that connects 2-3 real details the customer actually told you earlier in this conversation "
-                "to 2-3 real characteristics of this selected blend from the facts above -- grounded only in those, "
-                "never invented. Then stop. Do NOT list multiple combinations, do NOT ask the customer to pick one, do "
-                "NOT ask \"how do these sound\", do NOT ask for confirmation of any kind."
-            ),
-            "sseEvent": {"type": "preview_ready", "recommendationId": candidate["recommendationId"], "previewId": candidate["recommendationId"], "previewUrl": preview_url},
-        }
+        legacy_text = (
+            "The best recommendation was selected and confirmed automatically. Real grounded facts about "
+            f"it, and only these: {json.dumps(grounded_facts)}. The preview page is opening on its own right now. In this "
+            "reply, write ONE short, warm reasoning bridge (2-3 sentences) that connects 2-3 real details the customer "
+            "actually told you earlier in this conversation to 2-3 real characteristics of this selected blend from the "
+            "facts above -- grounded only in those, never invented. Then stop. Do NOT list multiple combinations, do NOT "
+            "ask the customer to pick one, do NOT ask \"how do these sound\", do NOT ask for confirmation of any kind."
+        )
+        return _outcome(STATUS_READY, recommendation_id=candidate["recommendationId"], preview_url=preview_url, safe=safe, legacy_text=legacy_text)
 
     # Priority matters: identity_missing is a systemic gate that fails every remaining buildable
     # candidate identically (it's checked before any candidate-specific logic in
@@ -313,28 +364,88 @@ async def _auto_select_and_confirm_best(session: AsyncSession, with_ids: list[di
     }))
 
     if any_identity_missing:
-        return {
-            "ok": False,
-            "modelContent": "a real, buildable combination exists, but the customer's account name and email aren't available yet to attach it to. Do NOT claim this is a stock shortage or that we're waiting on inventory/supply -- that would be false, real buildable stock exists. Tell the customer honestly that we need their Shopify account signed in (with name and email available) before locking in a build, and ask them to make sure they're signed in.",
-        }
+        return _outcome(STATUS_IDENTITY_NEEDED, legacy_text="a real, buildable combination exists, but the customer's account name and email aren't available yet to attach it to. Do NOT claim this is a stock shortage or that we're waiting on inventory/supply -- that would be false, real buildable stock exists. Tell the customer honestly that we need their Shopify account signed in (with name and email available) before locking in a build, and ask them to make sure they're signed in.")
     if any_confidence_gated:
-        return {
-            "ok": False,
-            "modelContent": "every generated combination was too low-confidence to recommend with certainty (thin evidence, weak fit to what the customer said, or a real compatibility risk) — tell the customer honestly that nothing felt like a confident enough match yet, and ask a bit more about their preferences rather than presenting a weak guess as a solid recommendation.",
-        }
+        return _outcome(STATUS_NEEDS_MORE_DETAIL, legacy_text="every generated combination was too low-confidence to recommend with certainty (thin evidence, weak fit to what the customer said, or a real compatibility risk) — tell the customer honestly that nothing felt like a confident enough match yet, and ask a bit more about their preferences rather than presenting a weak guess as a solid recommendation.")
     if any_inventory_rejected:
-        return {
-            "ok": False,
-            "modelContent": "every generated combination that otherwise fit the customer well couldn't be confirmed as buildable from current inventory — tell the customer honestly that we need a moment to find an available option, and offer to try again shortly.",
-        }
-    return {
-        "ok": False,
-        "modelContent": f"every generated combination failed re-verification (catalog changed, ratio drift, or a dislike conflict — {other_rejection_reason or 'reason unavailable'}) — tell the customer there was a temporary issue preparing their fragrance and ask if they'd like to try again.",
-    }
+        return _outcome(STATUS_TEMPORARILY_UNAVAILABLE, legacy_text="every generated combination that otherwise fit the customer well couldn't be confirmed as buildable from current inventory — tell the customer honestly that we need a moment to find an available option, and offer to try again shortly.")
+    return _outcome(STATUS_TEMPORARILY_UNAVAILABLE, legacy_text=f"every generated combination failed re-verification (catalog changed, ratio drift, or a dislike conflict — {other_rejection_reason or 'reason unavailable'}) — tell the customer there was a temporary issue preparing their fragrance and ask if they'd like to try again.")
+
+
+async def run_generate(session: AsyncSession, conversation_id: str, context: dict, *, maximum_results: int = 8, allowed_types: list[str] | None = None) -> dict:
+    """PRIVATE: the full candidate-analysis -> generation -> gating -> inventory -> confirmation
+    walk. Returns an outcome dict (see _outcome). Never model-visible."""
+    profile = await get_customer_profile(session, conversation_id)
+    # Deterministic in Python, not left to the model: the discovery-completeness gate always runs.
+    missing = get_missing_required_fields(profile)
+    if missing:
+        return {**_outcome(STATUS_NEEDS_MORE_DETAIL, legacy_text=f"not enough signal to generate yet -- still missing: {missing[0]}. Ask a natural follow-up to learn this before calling this tool again."), "ok": False, "missing": missing}
+    mark_generation_attempted(conversation_id, profile)
+    queried_profile = {**profile, "season": _effective_query_season(profile)}
+    scratch = _get_scratch(conversation_id, profile)
+    if not scratch["candidateProducts"]:
+        scratch["candidateProducts"] = await analyze_customer_product_candidates(session, queried_profile)
+
+    combinations = await generate_new_product_combinations(
+        session, profile=queried_profile, candidate_products=scratch["candidateProducts"],
+        maximum_results=maximum_results or 8, allowed_types=allowed_types,
+    )
+    for c in combinations:
+        c.update(evaluate_auto_confirm_eligibility(c, queried_profile))
+    recommendation_ids = [await save_recommendation(session, conversation_id=conversation_id, profile=profile, combination=c) for c in combinations]
+    with_ids = [{"recommendationId": rid, **c} for rid, c in zip(recommendation_ids, combinations)]
+    scratch["lastCombinations"] = with_ids
+    if not with_ids:
+        # Parity with the pre-Phase-3 handler: "nothing new to propose" was a non-error result
+        # (with an empty combination_recommendations event) for the private dispatcher.
+        return {**_outcome(STATUS_NEEDS_MORE_DETAIL, legacy_text="No genuinely new combinations could be generated from the current candidates — every viable pairing already exists, or none had a clear complementary role."), "legacyOk": True, "sseEvent": {"type": "combination_recommendations", "combinations": []}}
+
+    return await _auto_select_and_confirm_best(session, with_ids, conversation_id, context, likes=profile.get("likes"))
+
+
+async def run_refine(session: AsyncSession, conversation_id: str, context: dict, feedback: str) -> dict:
+    """PRIVATE: refinement walk. Never model-visible."""
+    profile = await get_customer_profile(session, conversation_id)
+    queried_profile = {**profile, "season": _effective_query_season(profile)}
+    scratch = _get_scratch(conversation_id, profile)
+    if not scratch["candidateProducts"]:
+        scratch["candidateProducts"] = await analyze_customer_product_candidates(session, queried_profile)
+
+    current_notes: list[str] = []
+    if profile.get("selectedRecommendationId"):
+        current_recommendation = await session.scalar(
+            select(FragranceRecommendation).where(FragranceRecommendation.id == profile["selectedRecommendationId"])
+        )
+        if current_recommendation:
+            current_notes = [n for p in (current_recommendation.productsJson or []) for n in (p.get("notes") or [])]
+
+    adjustments = derive_refinement_adjustments(feedback, current_notes)
+    updated_likes = list(dict.fromkeys([*(profile.get("likes") or []), *adjustments["addLikeTerms"]]))
+    updated_dislikes = list(dict.fromkeys([*(profile.get("dislikes") or []), *adjustments["addDislikeTerms"]]))
+    if adjustments["addLikeTerms"] or adjustments["addDislikeTerms"]:
+        await save_customer_profile_fields(session, conversation_id, {"likes": updated_likes, "dislikes": updated_dislikes})
+    adjusted_profile = {**queried_profile, "likes": updated_likes, "dislikes": updated_dislikes}
+    mark_generation_attempted(conversation_id, adjusted_profile)
+
+    hard_exclude_families = text_to_preference_families(adjustments["addDislikeTerms"])
+    combinations = await generate_new_product_combinations(
+        session, profile=adjusted_profile, candidate_products=scratch["candidateProducts"],
+        allowed_types=adjustments["allowedTypes"], hard_exclude_families=hard_exclude_families,
+        hard_exclude_terms=adjustments["addDislikeTerms"],
+    )
+    for c in combinations:
+        c.update(evaluate_auto_confirm_eligibility(c, adjusted_profile))
+    recommendation_ids = [await save_recommendation(session, conversation_id=conversation_id, profile=adjusted_profile, combination=c) for c in combinations]
+    with_ids = [{"recommendationId": rid, **c} for rid, c in zip(recommendation_ids, combinations)]
+    scratch["lastCombinations"] = with_ids
+    if not with_ids:
+        return {**_outcome(STATUS_NEEDS_MORE_DETAIL, legacy_text=f'No genuinely new combinations could be generated from "{feedback}" — every viable pairing already exists, or none had a clear complementary role.'), "legacyOk": True, "sseEvent": {"type": "combination_recommendations", "combinations": []}}
+
+    return await _auto_select_and_confirm_best(session, with_ids, conversation_id, context, likes=updated_likes)
 
 
 # ============================================================
-# Dispatch
+# MODEL-FACING dispatcher (least privilege)
 # ============================================================
 
 def _ok(model_content: str, sse_event: dict | None = None) -> dict:
@@ -345,8 +456,57 @@ def _fail(message: str) -> dict:
     return {"modelContent": f"Error: {message}", "sseEvent": None}
 
 
+def _safe_recommendation_tool_result(outcome: dict) -> dict:
+    """What the model learns from a refinement: the customer-safe recommendation (no ids) or a
+    status label with server-authored guidance."""
+    if outcome["status"] == STATUS_READY:
+        safe = outcome["safeRecommendation"]
+        content = json.dumps({
+            "recommendation": safe.model_dump(),
+            "instruction": "The preview page is opening on its own. Write ONE short, warm bridge (2-3 sentences) connecting what the customer told you to this fragrance's character, notes, and fit. Do not list options, do not ask them to choose, do not ask for confirmation.",
+        }, ensure_ascii=False)
+        return _ok(content, outcome["sseEvent"])
+    return _ok(json.dumps({"status": outcome["status"], "instruction": STATUS_GUIDANCE.get(outcome["status"], "")}), None)
+
+
+async def execute_model_tool(session: AsyncSession, tool_name: str, raw_args_json: str, context: dict) -> dict:
+    """The only entry point the conversational model can reach. Refuses everything that is not a
+    model-callable tool, validates arguments strictly, and returns customer-safe content only."""
+    if tool_name not in MODEL_CALLABLE_TOOL_NAMES:
+        logger.info("MODEL_TOOL_REFUSED %s", json.dumps({"conversationId": context.get("conversationId"), "tool": str(tool_name)[:60]}))
+        return _fail("that action is not available.")
+    try:
+        raw_args = json.loads(raw_args_json) if raw_args_json else {}
+    except (json.JSONDecodeError, TypeError):
+        return _fail(f"couldn't parse arguments as JSON — call {tool_name} again with valid JSON.")
+    try:
+        args = validate_model_tool_arguments(tool_name, raw_args)
+    except ModelToolArgumentError as err:
+        return _fail(str(err))
+
+    try:
+        if tool_name == "save_customer_profile_field":
+            return await _handle_save_customer_profile_field(session, context["conversationId"], args, context)
+        if tool_name == "verify_customer_location":
+            return await _handle_verify_customer_location(session, context["conversationId"], args)
+        if tool_name == "resolve_season_preference":
+            return await _handle_resolve_season_preference(session, context["conversationId"], args)
+        if tool_name == "refine_fragrance_recommendation":
+            outcome = await run_refine(session, context["conversationId"], context, args["feedback"])
+            return _safe_recommendation_tool_result(outcome)
+    except Exception as err:
+        logger.error("model tool %s failed: %s", tool_name, type(err).__name__, exc_info=True)
+        return _fail(f"internal error while running {tool_name}.")
+    return _fail("that action is not available.")
+
+
+# ============================================================
+# PRIVATE dispatcher (server-side pipeline and tests only)
+# ============================================================
+
 async def execute_fragrance_tool(session: AsyncSession, tool_name: str, raw_args_json: str, context: dict) -> dict:
-    """context: {"conversationId", "customerName", "customerEmail", "shopDomain"}."""
+    """context: {"conversationId", "customerName", "customerEmail", "shopDomain"}. Results may
+    contain internal data and must never be placed in model context."""
     conversation_id = context["conversationId"]
 
     try:
@@ -404,17 +564,22 @@ async def execute_fragrance_tool(session: AsyncSession, tool_name: str, raw_args
             return _ok(json.dumps(result))
 
         if tool_name == "generate_new_product_combinations":
-            return await _handle_generate_combinations(session, conversation_id, args, context)
+            outcome = await run_generate(session, conversation_id, context, maximum_results=args.get("maximumResults") or 8, allowed_types=args.get("allowedTypes"))
+            return _ok(outcome["modelContent"], outcome.get("sseEvent")) if (outcome["ok"] or outcome.get("legacyOk")) else _fail(outcome["modelContent"])
 
-        if tool_name == "refine_combination_recommendations":
-            return await _handle_refine_combinations(session, conversation_id, args, context)
+        if tool_name in ("refine_combination_recommendations", "refine_fragrance_recommendation"):
+            feedback = args.get("feedback")
+            if not feedback:
+                return _fail("feedback is required")
+            outcome = await run_refine(session, conversation_id, context, feedback)
+            return _ok(outcome["modelContent"], outcome.get("sseEvent")) if (outcome["ok"] or outcome.get("legacyOk")) else _fail(outcome["modelContent"])
 
         if tool_name == "confirm_product_combination":
             return await _handle_confirm_product_combination(session, conversation_id, args, context)
 
         return _fail(f'unknown tool "{tool_name}".')
     except Exception as err:
-        logger.error("fragranceAgentTools: %s failed: %s", tool_name, err, exc_info=True)
+        logger.error("fragranceAgentTools: %s failed: %s", tool_name, type(err).__name__, exc_info=True)
         return _fail(f"internal error while running {tool_name}.")
 
 
@@ -431,11 +596,11 @@ async def _handle_save_customer_profile_field(session: AsyncSession, conversatio
     # A trusted identity (authenticated Shopify account, or already saved on the profile) can
     # never be overwritten by a model-supplied value.
     if field == "name" and context.get("customerName"):
-        return _ok(f"Name is already known and trusted ({context['customerName']}) — no need to save or ask again.")
+        return _ok("Name is already known — no need to save or ask again.")
     if field == "email" and context.get("customerEmail"):
-        return _ok("Email is already known and trusted — no need to save or ask again.")
+        return _ok("Email is already known — no need to save or ask again.")
     if field == "name" and isinstance(value, str) and _is_implausible_name(value):
-        return _fail(f'"{value}" doesn\'t read like a real name — do not save it. They likely answered a different question, or their reply got misread as an answer to "what should I call you?" Gently ask for their name again instead of guessing.')
+        return _fail('that doesn\'t read like a real name — do not save it. They likely answered a different question, or their reply got misread as an answer to "what should I call you?" Gently ask for their name again instead of guessing.')
 
     vocabulary_corrections: list[dict] = []
     if field in _VOCABULARY_CORRECTED_FIELDS:
@@ -510,7 +675,7 @@ async def _handle_verify_customer_location(session: AsyncSession, conversation_i
         return _fail("cityText is required")
     result = await verify_city(session, city_text)
     if result["needsClarification"]:
-        return _ok(f'Multiple real places match "{city_text}": {json.dumps(result["candidates"])}. Ask the customer which one they mean.')
+        return _ok(f'Multiple real places match that city: {json.dumps(result["candidates"])}. Ask the customer which one they mean.')
     if not result["verified"]:
         return _ok("I couldn't confidently match that location. Which real city are you currently in?")
 
@@ -537,7 +702,7 @@ async def _handle_verify_customer_location(session: AsyncSession, conversation_i
 
     profile = await save_customer_profile_fields(session, conversation_id, fields)
     return _ok(
-        f'Verified "{result["city"]}" ({result["country"] or "country unknown"}) via {result["source"]}. Weather fetched and saved automatically — never ask the customer what season it is, never explain that recommendations will be adjusted "accordingly"; just continue naturally (e.g. into preferences/dislikes).{conflict_message}',
+        f'Verified "{result["city"]}" ({result["country"] or "country unknown"}). Weather fetched and saved automatically — never ask the customer what season it is, never explain that recommendations will be adjusted "accordingly"; just continue naturally (e.g. into preferences/dislikes).{conflict_message}',
         {"type": "profile_progress", "profile": profile, "missingFields": get_missing_required_fields(profile)},
     )
 
@@ -590,9 +755,8 @@ async def _handle_select_recommendation(session: AsyncSession, conversation_id: 
 
 
 def _redact_titles_for_sse(candidates: list[dict]) -> list[dict]:
-    # sse_events reach the browser's network payload unfiltered (app/api/chat.py) even though the
-    # widget never reads this event type -- real product/catalog titles are internal evidence for
-    # the model only (modelContent keeps them in full) and must never leave the backend otherwise.
+    # Kept for the private dispatcher's SSE payload; the public route additionally strips every
+    # field of this event type (app/api/chat.py allowlist).
     return [{k: v for k, v in c.items() if k not in ("productName", "normalizedProductName")} for c in candidates]
 
 
@@ -613,84 +777,6 @@ async def _handle_analyze_candidates(session: AsyncSession, conversation_id: str
         "Call generate_new_product_combinations now to build real Hybrid/Tribrid/Quadbrid combinations from these candidates -- do not stop here.",
         {"type": "candidate_products", "candidateProducts": _redact_titles_for_sse(candidate_products)},
     )
-
-
-async def _handle_generate_combinations(session: AsyncSession, conversation_id: str, args: dict, context: dict) -> dict:
-    profile = await get_customer_profile(session, conversation_id)
-    # Deterministic in Python, not left to the model choosing to call analyze_customer_product_
-    # candidates first: that's only a prompt convention, and calling this tool directly would
-    # otherwise skip the discovery-completeness gate entirely (analyze's own gate never runs).
-    missing = get_missing_required_fields(profile)
-    if missing:
-        return _fail(f"not enough signal to generate yet -- still missing: {missing[0]}. Ask a natural follow-up to learn this before calling this tool again.")
-    queried_profile = {**profile, "season": _effective_query_season(profile)}
-    scratch = _get_scratch(conversation_id, profile)
-    if not scratch["candidateProducts"]:
-        scratch["candidateProducts"] = await analyze_customer_product_candidates(session, queried_profile)
-
-    combinations = await generate_new_product_combinations(
-        session, profile=queried_profile, candidate_products=scratch["candidateProducts"],
-        maximum_results=args.get("maximumResults") or 8, allowed_types=args.get("allowedTypes"),
-    )
-    for c in combinations:
-        c.update(evaluate_auto_confirm_eligibility(c, queried_profile))
-    recommendation_ids = [await save_recommendation(session, conversation_id=conversation_id, profile=profile, combination=c) for c in combinations]
-    with_ids = [{"recommendationId": rid, **c} for rid, c in zip(recommendation_ids, combinations)]
-    scratch["lastCombinations"] = with_ids
-    if not with_ids:
-        return _ok(
-            "No genuinely new combinations could be generated from the current candidates — every viable pairing already exists, or none had a clear complementary role.",
-            {"type": "combination_recommendations", "combinations": []},
-        )
-
-    result = await _auto_select_and_confirm_best(session, with_ids, conversation_id, context)
-    return _ok(result["modelContent"], result.get("sseEvent")) if result["ok"] else _fail(result["modelContent"])
-
-
-async def _handle_refine_combinations(session: AsyncSession, conversation_id: str, args: dict, context: dict) -> dict:
-    feedback = args.get("feedback")
-    if not feedback:
-        return _fail("feedback is required")
-    profile = await get_customer_profile(session, conversation_id)
-    queried_profile = {**profile, "season": _effective_query_season(profile)}
-    scratch = _get_scratch(conversation_id, profile)
-    if not scratch["candidateProducts"]:
-        scratch["candidateProducts"] = await analyze_customer_product_candidates(session, queried_profile)
-
-    current_notes: list[str] = []
-    if profile.get("selectedRecommendationId"):
-        current_recommendation = await session.scalar(
-            select(FragranceRecommendation).where(FragranceRecommendation.id == profile["selectedRecommendationId"])
-        )
-        if current_recommendation:
-            current_notes = [n for p in (current_recommendation.productsJson or []) for n in (p.get("notes") or [])]
-
-    adjustments = derive_refinement_adjustments(feedback, current_notes)
-    updated_likes = list(dict.fromkeys([*(profile.get("likes") or []), *adjustments["addLikeTerms"]]))
-    updated_dislikes = list(dict.fromkeys([*(profile.get("dislikes") or []), *adjustments["addDislikeTerms"]]))
-    if adjustments["addLikeTerms"] or adjustments["addDislikeTerms"]:
-        await save_customer_profile_fields(session, conversation_id, {"likes": updated_likes, "dislikes": updated_dislikes})
-    adjusted_profile = {**queried_profile, "likes": updated_likes, "dislikes": updated_dislikes}
-
-    hard_exclude_families = text_to_preference_families(adjustments["addDislikeTerms"])
-    combinations = await generate_new_product_combinations(
-        session, profile=adjusted_profile, candidate_products=scratch["candidateProducts"],
-        allowed_types=adjustments["allowedTypes"], hard_exclude_families=hard_exclude_families,
-        hard_exclude_terms=adjustments["addDislikeTerms"],
-    )
-    for c in combinations:
-        c.update(evaluate_auto_confirm_eligibility(c, adjusted_profile))
-    recommendation_ids = [await save_recommendation(session, conversation_id=conversation_id, profile=adjusted_profile, combination=c) for c in combinations]
-    with_ids = [{"recommendationId": rid, **c} for rid, c in zip(recommendation_ids, combinations)]
-    scratch["lastCombinations"] = with_ids
-    if not with_ids:
-        return _ok(
-            f'No genuinely new combinations could be generated from "{feedback}" — every viable pairing already exists, or none had a clear complementary role.',
-            {"type": "combination_recommendations", "combinations": []},
-        )
-
-    result = await _auto_select_and_confirm_best(session, with_ids, conversation_id, context)
-    return _ok(result["modelContent"], result.get("sseEvent")) if result["ok"] else _fail(result["modelContent"])
 
 
 async def _handle_confirm_product_combination(session: AsyncSession, conversation_id: str, args: dict, context: dict) -> dict:

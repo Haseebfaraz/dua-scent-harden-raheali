@@ -96,7 +96,9 @@ async def test_giant_stored_history_does_not_produce_giant_model_context(stubbed
     history.append({"role": "user", "content": "I need something fresh for my wedding"})
     result = await call_ai(None, history, "conv-ctx", None, None, "test-shop.myshopify.com")
     main_call = [m for m in seen if m[0]["content"] == "SYSTEM PROMPT"][0]
-    non_system = [m for m in main_call if m["role"] != "system"]
+    # Exclude the system prompt and the Phase 3 customer-context data pair (assistant tool call +
+    # tool result), which are not history.
+    non_system = [m for m in main_call if m["role"] != "system" and not (m.get("tool_calls") and m["tool_calls"][0]["function"]["name"] == "load_customer_context") and not (m["role"] == "tool" and '"customerContext"' in (m.get("content") or ""))]
     assert len(non_system) <= 6
     assert sum(len(m.get("content") or "") for m in non_system) <= 5000
     assert non_system[-1]["content"] == "I need something fresh for my wedding"
@@ -116,15 +118,15 @@ async def test_tool_loop_is_bounded_by_settings(stubbed_flow, monkeypatch):
             return {"choices": [{"finish_reason": "stop", "message": {"content": None}}]}
         completions.append(1)
         return {"choices": [{"finish_reason": "tool_calls", "message": {"content": None, "tool_calls": [
-            {"id": f"c{i}", "type": "function", "function": {"name": "get_customer_profile", "arguments": "{}"}} for i in range(5)
+            {"id": f"c{i}", "type": "function", "function": {"name": "resolve_season_preference", "arguments": json.dumps({"choice": "keep_style"})}} for i in range(5)
         ]}}]}
 
     async def _execute(session, tool_name, args, context):
         executed.append(tool_name)
-        return {"modelContent": "profile", "sseEvent": None}
+        return {"modelContent": "resolved", "sseEvent": None}
 
     monkeypatch.setattr(conversation_flow, "call_openai_once", _always_tool_calls)
-    monkeypatch.setattr(conversation_flow, "execute_fragrance_tool", _execute)
+    monkeypatch.setattr(conversation_flow, "execute_model_tool", _execute)
     history = [{"role": "user", "content": "I need something fresh for my wedding"}]
     result = await call_ai(None, history, "conv-loop", None, None, "test-shop.myshopify.com")
     assert len(completions) == 3          # never a 4th model call

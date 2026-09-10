@@ -15,6 +15,7 @@ import re
 from typing import Any
 
 import httpx
+from pydantic import BaseModel, ConfigDict, Field
 
 from app.config import settings
 from app.fragrance.compatibility import matched_literal_terms
@@ -90,18 +91,37 @@ def _text_leaks(text: str | None, catalog_titles_lowercase: list[str]) -> bool:
     return any(title in lower for title in catalog_titles_lowercase)
 
 
+class CopyModelInput(BaseModel):
+    """Phase 3 (F3): the complete, allowlisted input of the copy model. Note names grouped by
+    the ROLE they play (never the product that carries them), the customer's own stated
+    preferences, and two server-derived categorical labels. Unknown keys are rejected, so a new
+    internal proposal field can never reach this model by accident."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    notesByRole: dict[str, list[str]] = Field(default_factory=dict)
+    likes: list[str] = Field(default_factory=list)
+    dislikes: list[str] = Field(default_factory=list)
+    preferredStyle: str | None = None
+    occasion: str | None = None
+    matchedFamilies: list[str] = Field(default_factory=list)
+    missingFamilies: list[str] = Field(default_factory=list)
+    confidence: str | None = None
+    evidenceScope: str | None = None
+
+
 def _payload(notes_by_role, likes, dislikes, preferred_style, occasion, matched_families, missing_families, confidence, evidence_scope) -> dict:
-    return {
-        "notesByRole": notes_by_role,
-        "likes": likes or [],
-        "dislikes": dislikes or [],
-        "preferredStyle": preferred_style or None,
-        "occasion": occasion or None,
-        "matchedFamilies": matched_families or [],
-        "missingFamilies": missing_families or [],
-        "confidence": confidence,
-        "evidenceScope": evidence_scope,
-    }
+    return CopyModelInput(
+        notesByRole={str(k): [str(n)[:60] for n in (v or [])][:20] for k, v in (notes_by_role or {}).items()},
+        likes=[str(x)[:100] for x in (likes or [])][:20],
+        dislikes=[str(x)[:100] for x in (dislikes or [])][:20],
+        preferredStyle=(str(preferred_style)[:200] if preferred_style else None),
+        occasion=(str(occasion)[:200] if occasion else None),
+        matchedFamilies=[str(x)[:40] for x in (matched_families or [])][:10],
+        missingFamilies=[str(x)[:40] for x in (missing_families or [])][:10],
+        confidence=(str(confidence) if confidence else None),
+        evidenceScope=(str(evidence_scope) if evidence_scope else None),
+    ).model_dump()
 
 
 def _build_prompt_initial(

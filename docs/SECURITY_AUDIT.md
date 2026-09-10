@@ -724,3 +724,97 @@ change to build capabilities is the additional verified-customer binding check (
 F3, F4, F5, F9, F10, F11, F12, N5, N7, N8, N14; the theme and widget integrations
 (`docs/SHOPIFY_BUILD_SECURITY_CONTRACT.md`, `docs/CHAT_SECURITY_CONTRACT.md`); credential
 rotation after deployment (section 12).
+
+
+---
+
+## 14. Phase 3 closure (2026-09-10): LLM data isolation, customer-safe contract, tool least privilege
+
+Scope approved: F3, N5, N8 (plus an N7 review). Branch `security-hardening`, on top of `34f4119`.
+No push, no deploy, no live Shopify / Odoo / OpenAI, no production or staging database. Model
+calls are mocked in every test; database-backed tests used the disposable local Postgres 16.
+Full design in `docs/AI_DATA_BOUNDARY.md`.
+
+### Architecture change
+
+Before: the conversational model held 13 tools, four of which looked up any catalog product by
+title (handle, collection, inspiration brand, combination formulas), one returned raw ranked
+candidates with relevance scores, per-city/state/country/season order counts, cohort and
+repeat-purchase counts, and two ran the generators and returned the recommendation id. The
+entire stored profile (email, internal ids, workflow flags) was serialized into the system
+prompt every turn; stale private tool results stayed in cached history; the extraction model
+saw the last six raw messages including tool results; the "customer safe" serializer and the
+stored customerFacingJson named source products and carried evidence counts.
+
+After: PRIVATE DATA -> private deterministic pipeline -> explicit allowlist -> the model sees only
+safe data -> output validator kept as defense in depth.
+
+* `app/ai/tools.py`: 4 model-callable tools with strict schemas; `execute_model_tool` refuses
+  every other name. Initial generation is not a tool: `app/services/recommendation_pipeline.py`
+  runs the unchanged engine walk when `should_generate()` says the profile is complete.
+* `app/ai/safe_views.py`: `CustomerSafeProfileView` and `CustomerSafeRecommendation`
+  (pydantic, `extra="forbid"`, built field by field). Customer context and the recommendation
+  reach the model as synthetic tool-result DATA messages, never as system-prompt prose (N5).
+  Ids and preview URLs are SSE control data only.
+* `app/ai/conversation_flow.py`: static system prompt; bounded customer-only extraction
+  context; server-triggered generation with a tools-off bridge completion; failure outcomes as
+  status labels with server-authored guidance; repair model gets only the offending text.
+* `app/services/recommendation_confirmation.py`: stored customerFacingJson and the internal
+  serializer are produced by the same allowlist; title/evidence-bearing fields moved to
+  evidenceJson (N8).
+* `app/services/copy_generation.py`: `CopyModelInput` allowlist (notes by role, stated
+  preferences, two categorical labels).
+* `app/api/preview.py`: page data reduced to what the page uses (no Shopify id, no
+  per-component structure).
+
+### Finding status
+
+| ID | Original behaviour | Root cause | Remediation | Tests | Residual risk | Status |
+|---|---|---|---|---|---|---|
+| F3 | Raw candidates, catalog lookups, evidence counts, scores, SKUs (via inventory-driven text), and recommendation ids in model context; catalog enumeration through tools | The model was the security principal driving private queries; a redaction step existed only for the browser copy | Server-only pipeline; 4-tool least-privilege surface with strict arguments; allowlisted safe DTOs; bounded customer-only extraction; repair model isolated; copy-model allowlist | `tests/security/test_model_boundary.py` (canary turn with a malicious customer; refinement; failure statuses; small talk and discovery; extraction; repair; copy; tool surface; refusal of 12 private tool names; 9 strict-argument cases; control data; parity of engine call order) plus the reusable `tests/security/model_boundary.py` helper | Note NAMES of the finished scent are customer-safe by product design and are sent; the copy model receives two categorical labels (confidence, evidence scope). Historical conversation caches from before deployment may still hold old tool results until evicted (process memory only; DB history never stored tool messages). | **CLOSED** (architecturally absent, canary-verified) |
+| N5 | `json.dumps(profile)` and readiness sentences interpolated into the system prompt | Trusted instructions and untrusted data shared one string | Static templates; customer context as a tool-result data message; server-derived lines only | `test_injected_profile_text_never_enters_the_system_prompt_or_changes_tools`, `test_general_conversation_and_discovery_turns_only_carry_safe_context`, converted `test_known_profile_facts_are_always_available_as_customer_context_data` | Semantic prompt injection through the data channel remains Phase 4's problem; the data now contains nothing proprietary. | **CLOSED** |
+| N8 | `to_customer_safe_recommendation` and stored customerFacingJson exposed `components[].productName`, `expectedResult`, `whyNotesWork`, analogous combination titles, and evidence counts | Serializer spread the whole customerFacingJson | One allowlist builder for both; sensitive fields stored under evidenceJson | `test_stored_and_serialized_recommendations_are_customer_safe`, `test_safe_recommendation_is_allowlist_built_and_new_internal_fields_stay_private` | Rows written before deployment keep the old customerFacingJson shape in the database; the builder ignores those keys, so nothing customer-facing reads them, but a later cleanup could strip them. | **CLOSED** |
+| N7 | `custom.internal_components` (source titles), `custom.customer_name`, `custom.customer_email` written to each build product | Product creation carried internal and contact data for downstream tooling | Reviewed only. Nothing in this repository reads these metafields. `custom.note_composition` already carries the recommendation id, from which trusted systems can resolve components from Postgres. However `app/shopify/metafields.py` documents that the Node admin dashboard (`api.customer-builds.jsx`, outside this repo) searches products by the customer-email metafield, so a dependency exists outside this codebase and manufacturing use is UNKNOWN. | -- | Source titles and customer contact data remain on live product records readable by theme Liquid. Removal needs the admin-dashboard/manufacturing dependency confirmed and a migration plan for existing products. | **OPEN** (not in scope; documented) |
+
+### Tool surface
+
+Before: 13 model-callable. After: 4 (`save_customer_profile_field`, `verify_customer_location`,
+`resolve_season_preference`, `refine_fragrance_recommendation`); 1 in small-talk mode. The other
+nine remain as server-only functions behind the private dispatcher.
+
+### Recommendation parity
+
+Candidate, ranking, combination, and ratio logic are untouched (`order_history.py`,
+`recommendation_engine.py`, `compatibility.py`, `scoring.py`, `formulas.py` have no diff). The
+former model-invoked handlers became `run_generate` / `run_refine`, called by the server pipeline
+in the same order (`test_private_pipeline_calls_the_same_engine_functions_in_the_same_order`).
+One behavioural change: generation is triggered by the server the moment the profile is
+complete instead of by the model choosing to call a tool, and is retried only after the profile
+changes. The private dispatcher keeps its former non-error result for "nothing new to propose".
+
+### Test results (Python 3.11, disposable local Postgres 16, no catalog data)
+
+| Suite | Result |
+|---|---|
+| `tests/security/` (Phases 1-3) | 394 passed, 0 failed |
+| Full suite after Phase 3 | 912 passed, 57 failed, 6 deselected (live_ai) |
+| Failing now but passing on untouched `main` (regressions) | **none** |
+| The 57 remaining failures | the unchanged production-catalog set; NOT RUN against real data |
+| Phase 0 harness | F1, F2, F2b, F2c, F3, F3b, F3c, F6, F7, F8, internal-key bypass all FAIL (closed); F5/F6b need the database bootstrap and are proven closed by collected tests |
+| Canaries (source title, second title, handle, SKU, score, cohort, Odoo, Shopify, collection, inspiration, recommendation id, profile control) | absent from every captured model request in every path exercised |
+
+### Exit criteria
+
+Raw candidates to the main model: NO. Source titles: NO. Handles: NO. Raw scores: NO. Raw
+order-history evidence: NO. Ranking mechanics via tool results: NO. Raw Odoo data: NO. SKUs:
+NO. Unnecessary Shopify Admin ids: NO. Arbitrary product lookup: NO. Catalog enumeration via
+tools: NO. Tools before/after: 13 / 4. Safe DTO allowlist-built: YES; a new internal field is
+exposed automatically: NO. Customer data in trusted instruction prose: NO. Every canary absent:
+YES. Ordinary design still reaches a recommendation: YES (server-triggered). Refine/recreate
+still works: YES (model tool, safe result).
+
+### Phase 1 / 2 regression check
+
+F1, F2, N1, F6, F7, F8, N2: all regression suites unchanged and passing; N3 unchanged (backend
+complete, theme update pending). No trusted-shop, capability, ownership, ratio, rate-limit,
+request-limit, or turn-lock code was modified.

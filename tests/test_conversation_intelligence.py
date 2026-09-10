@@ -12,6 +12,7 @@ from sqlalchemy import delete
 
 from app.ai import conversation_flow
 from app.ai.conversation_flow import call_ai
+from app.ai.safe_views import customer_context_messages
 from app.ai.prompt import (
     build_system_prompt,
     detect_high_signal_flags,
@@ -138,13 +139,16 @@ async def test_direct_fragrance_intent_skips_the_early_phase_small_talk_prompt(d
 # Section 3: full context -- known profile facts are visible to every prompt build
 # ---------------------------------------------------------------------------
 
-async def test_known_profile_facts_are_always_injected_into_the_prompt(db_session):
+async def test_known_profile_facts_are_always_available_as_customer_context_data(db_session):
+    # Phase 3 (N5): profile facts reach the model as a DATA message (a tool result), never as
+    # prose inside the trusted system prompt.
     conversation_id = _conversation_id("context")
     await save_customer_profile_fields(db_session, conversation_id, {"occasion": "work party", "preferredStyle": "fresh"})
     history = [{"role": "user", "content": "hey"}, {"role": "assistant", "content": "..."}, {"role": "user", "content": "anyway what do you think"}]
     prompt = await build_system_prompt(db_session, history, conversation_id, None, None)
-    assert "work party" in prompt
-    assert "fresh" in prompt
+    assert "work party" not in prompt
+    context = customer_context_messages(await get_customer_profile(db_session, conversation_id))
+    assert context[1]["role"] == "tool" and "work party" in context[1]["content"] and "fresh" in context[1]["content"]
 
 
 # ---------------------------------------------------------------------------
@@ -206,57 +210,55 @@ async def test_refinement_never_drops_a_previously_saved_dislike(db_session):
 # Section 12: the reasoning bridge is the model's own text, not a canned line
 # ---------------------------------------------------------------------------
 
-async def test_call_ai_gives_the_model_a_second_turn_to_write_the_reasoning_bridge(db_session, monkeypatch):
+def _ready_outcome():
+    from app.ai.safe_views import CustomerSafeRecommendation
+    from app.services.recommendation_pipeline import PipelineOutcome
+
+    return PipelineOutcome(status="READY", recommendation_id="rec_pytest", preview_url="https://example.test/preview", safe_recommendation=CustomerSafeRecommendation(name="Test Blend", whyItMatches="fresh", bestFor="the wedding"))
+
+
+async def test_call_ai_gives_the_model_a_bridge_turn_once_the_server_has_built_the_fragrance(db_session, monkeypatch):
+    # Phase 3: the model never calls a generation tool. The server runs the private pipeline
+    # when the profile is ready and then gives the model ONE completion, tools disabled, to write
+    # the grounded bridge from the customer-safe summary.
     calls = []
 
     async def _fake_call_openai_once(messages, use_tools, tool_choice=None):
         if tool_choice:
             return {"choices": [{"finish_reason": "stop", "message": {"content": None}}]}  # batch-extraction pre-pass: nothing to extract
         calls.append(use_tools)
-        if len(calls) == 1:
-            return {"choices": [{"finish_reason": "tool_calls", "message": {
-                "content": None,
-                "tool_calls": [{"id": "call_1", "function": {"name": "generate_new_product_combinations", "arguments": "{}"}}],
-            }}]}
         return {"choices": [{"finish_reason": "stop", "message": {
             "content": "You wanted something fresh for the wedding with no oud, so I kept the opening bright and the base clean.",
         }}]}
 
-    async def _fake_execute_fragrance_tool(session, tool_name, args, context):
-        return {
-            "modelContent": "grounded facts: whySuits=..., bestUse=...",
-            "sseEvent": {"type": "preview_ready", "recommendationId": "rec_pytest", "previewId": "rec_pytest", "previewUrl": "https://example.test/preview"},
-        }
+    async def _fake_pipeline(session, conversation_id, context):
+        return _ready_outcome()
 
     monkeypatch.setattr(conversation_flow, "call_openai_once", _fake_call_openai_once)
-    monkeypatch.setattr(conversation_flow, "execute_fragrance_tool", _fake_execute_fragrance_tool)
+    monkeypatch.setattr(conversation_flow, "should_generate", lambda cid, profile, mode: True)
+    monkeypatch.setattr(conversation_flow, "run_private_recommendation", _fake_pipeline)
 
     conversation_id = _conversation_id("bridge")
     history = [{"role": "user", "content": "I need something fresh for my wedding, no oud."}]
     result = await call_ai(db_session, history, conversation_id, None, None, SHOP_DOMAIN)
 
-    assert calls[0] and calls[1] is None  # first turn: tools enabled; follow-up: tools disabled
+    assert calls == [None]  # exactly one bridge completion, tools disabled
     assert result["replyText"] == "You wanted something fresh for the wedding with no oud, so I kept the opening bright and the base clean."
-    assert result["sseEvents"][0]["type"] == "preview_ready"
+    assert result["sseEvents"][0]["type"] == "preview_ready" and result["sseEvents"][0]["recommendationId"] == "rec_pytest"
 
 
 async def test_call_ai_falls_back_to_a_generic_line_if_the_bridge_completion_fails(db_session, monkeypatch):
-    calls = []
+    async def _fake_call_openai_once(messages, use_tools, tool_choice=None):
+        if tool_choice:
+            return {"choices": [{"finish_reason": "stop", "message": {"content": None}}]}
+        return None  # simulate the bridge completion itself failing
 
-    async def _fake_call_openai_once(messages, use_tools):
-        calls.append(use_tools)
-        if len(calls) == 1:
-            return {"choices": [{"finish_reason": "tool_calls", "message": {
-                "content": None,
-                "tool_calls": [{"id": "call_1", "function": {"name": "generate_new_product_combinations", "arguments": "{}"}}],
-            }}]}
-        return None  # simulate the follow-up completion itself failing
-
-    async def _fake_execute_fragrance_tool(session, tool_name, args, context):
-        return {"modelContent": "grounded facts", "sseEvent": {"type": "preview_ready", "recommendationId": "rec_pytest", "previewId": "rec_pytest", "previewUrl": "https://example.test/preview"}}
+    async def _fake_pipeline(session, conversation_id, context):
+        return _ready_outcome()
 
     monkeypatch.setattr(conversation_flow, "call_openai_once", _fake_call_openai_once)
-    monkeypatch.setattr(conversation_flow, "execute_fragrance_tool", _fake_execute_fragrance_tool)
+    monkeypatch.setattr(conversation_flow, "should_generate", lambda cid, profile, mode: True)
+    monkeypatch.setattr(conversation_flow, "run_private_recommendation", _fake_pipeline)
 
     conversation_id = _conversation_id("bridge-fallback")
     history = [{"role": "user", "content": "surprise me"}]
@@ -655,12 +657,8 @@ async def test_reasoning_bridge_never_leaks_the_brand_name_or_component_title(db
             return {"choices": [{"finish_reason": "stop", "message": {"content": None}}]}  # extraction pre-pass
         calls.append(use_tools)
         if len(calls) == 1:
-            return {"choices": [{"finish_reason": "tool_calls", "message": {
-                "content": None,
-                "tool_calls": [{"id": "call_1", "function": {"name": "generate_new_product_combinations", "arguments": "{}"}}],
-            }}]}
-        if len(calls) == 2:
-            # Simulated leak: the bridge names the brand and the real component title.
+            # Simulated leak: the bridge names the brand and the real component title (which the
+            # model could only have guessed -- it is no longer in its context).
             return {"choices": [{"finish_reason": "stop", "message": {
                 "content": f"I combined {unusual_title} with a DUA classic for a bold, warm direction.",
             }}]}
@@ -668,14 +666,15 @@ async def test_reasoning_bridge_never_leaks_the_brand_name_or_component_title(db
             "content": "I kept it bold and warm, with real depth that lingers through the day.",
         }}]}
 
-    async def _fake_execute_fragrance_tool(session, tool_name, args, context):
-        return {
-            "modelContent": "grounded facts",
-            "sseEvent": {"type": "preview_ready", "recommendationId": recommendation_id, "previewId": recommendation_id, "previewUrl": "https://example.test/preview"},
-        }
+    async def _fake_pipeline(session, cid, context):
+        from app.services.recommendation_pipeline import PipelineOutcome
+        from app.ai.safe_views import CustomerSafeRecommendation
+
+        return PipelineOutcome(status="READY", recommendation_id=recommendation_id, preview_url="https://example.test/preview", safe_recommendation=CustomerSafeRecommendation(name="Custom Blend"))
 
     monkeypatch.setattr(conversation_flow, "call_openai_once", _fake_call_openai_once)
-    monkeypatch.setattr(conversation_flow, "execute_fragrance_tool", _fake_execute_fragrance_tool)
+    monkeypatch.setattr(conversation_flow, "should_generate", lambda cid, profile, mode: True)
+    monkeypatch.setattr(conversation_flow, "run_private_recommendation", _fake_pipeline)
 
     try:
         history = [{"role": "user", "content": "I need something bold for my wedding"}]
@@ -744,11 +743,12 @@ async def test_name_revealed_and_generation_attempted_in_the_same_turn_succeeds(
                 return {"choices": [{"finish_reason": "stop", "message": {"content": None}}]}
             calls.append(use_tools)
             if len(calls) == 1:
+                # The model saves the name; Phase 3: the server notices the profile is now
+                # complete and runs the private pipeline itself in this same turn.
                 return {"choices": [{"finish_reason": "tool_calls", "message": {
                     "content": None,
                     "tool_calls": [
                         {"id": "call_name", "function": {"name": "save_customer_profile_field", "arguments": json.dumps({"field": "name", "value": "Haseeb"})}},
-                        {"id": "call_generate", "function": {"name": "generate_new_product_combinations", "arguments": "{}"}},
                     ],
                 }}]}
             return {"choices": [{"finish_reason": "stop", "message": {"content": "Here's what I put together for you."}}]}
@@ -758,6 +758,13 @@ async def test_name_revealed_and_generation_attempted_in_the_same_turn_succeeds(
         result = await call_ai(db_session, history, conversation_id, known_email, None, SHOP_DOMAIN)
 
         assert "sign" not in result["replyText"].lower()
+        # The server ran the private pipeline in this same turn: either a fragrance was built
+        # (preview_ready) or, without catalog data, a status label reached the model. Never an
+        # identity complaint, which is the live bug this guards.
+        server_ran = any(e.get("type") == "preview_ready" for e in result["sseEvents"]) or any(
+            m.get("role") == "tool" and '"status"' in (m.get("content") or "") and "IDENTITY_NEEDED" not in m["content"] for m in result["updatedMessages"]
+        )
+        assert server_ran
         profile = await get_customer_profile(db_session, conversation_id)
         assert profile["name"] == "Haseeb"
         assert profile["email"] == known_email
@@ -783,7 +790,6 @@ async def test_name_only_without_email_still_requires_identity(db_session, monke
                     "content": None,
                     "tool_calls": [
                         {"id": "call_name", "function": {"name": "save_customer_profile_field", "arguments": json.dumps({"field": "name", "value": "Haseeb"})}},
-                        {"id": "call_generate", "function": {"name": "generate_new_product_combinations", "arguments": "{}"}},
                     ],
                 }}]}
             return {"choices": [{"finish_reason": "stop", "message": {"content": "Here's what I put together for you."}}]}
@@ -792,12 +798,12 @@ async def test_name_only_without_email_still_requires_identity(db_session, monke
         history = [{"role": "user", "content": "Haseeb"}]
         result = await call_ai(db_session, history, conversation_id, None, None, SHOP_DOMAIN)
 
-        # The final replyText comes from a stubbed model that ignores tool content -- what
-        # matters is the tool's own result (the same layer test_tool_executor_flow.py's identity
-        # tests assert on), not the fake model's canned wording.
+        # Phase 3: the server pipeline ran (profile complete) but the identity gate refused;
+        # the model receives only the IDENTITY_NEEDED status label, never a reason string.
         tool_messages = [m for m in result["updatedMessages"] if m.get("role") == "tool"]
-        generate_result = next(m["content"] for m in tool_messages if "sign" in m["content"].lower() or "account" in m["content"].lower())
-        assert generate_result.lower().startswith("error")
+        status_result = next(m["content"] for m in tool_messages if '"status"' in m["content"])
+        assert json.loads(status_result)["status"] == "IDENTITY_NEEDED"
+        assert not any(e.get("type") == "preview_ready" for e in result["sseEvents"])
         profile = await get_customer_profile(db_session, conversation_id)
         assert profile["name"] == "Haseeb"
         assert not profile.get("email")
@@ -815,16 +821,17 @@ async def test_known_name_and_known_email_generates_normally(db_session, monkeyp
         async def _fake_call_openai_once(messages, use_tools, tool_choice=None):
             if tool_choice:
                 return {"choices": [{"finish_reason": "stop", "message": {"content": None}}]}
-            return {"choices": [{"finish_reason": "tool_calls", "message": {
-                "content": None,
-                "tool_calls": [{"id": "call_generate", "function": {"name": "generate_new_product_combinations", "arguments": "{}"}}],
-            }}]}
+            return {"choices": [{"finish_reason": "stop", "message": {"content": "Here's what I put together for you."}}]}
 
         monkeypatch.setattr(conversation_flow, "call_openai_once", _fake_call_openai_once)
         history = [{"role": "user", "content": "let's do it"}]
         result = await call_ai(db_session, history, conversation_id, "haseeb@example.test", "Haseeb", SHOP_DOMAIN)
 
         assert "sign" not in result["replyText"].lower()
+        # Server-triggered: a fragrance (preview_ready) or, without catalog data, a non-identity status.
+        assert any(e.get("type") == "preview_ready" for e in result["sseEvents"]) or any(
+            m.get("role") == "tool" and '"status"' in (m.get("content") or "") and "IDENTITY_NEEDED" not in m["content"] for m in result["updatedMessages"]
+        )
     finally:
         await db_session.execute(delete(FragranceRecommendation).where(FragranceRecommendation.conversationId == conversation_id))
         await _cleanup(db_session, conversation_id)
@@ -846,13 +853,14 @@ async def test_location_verified_earlier_in_the_same_loop_is_used_by_generation(
         async def _fake_call_openai_once(messages, use_tools, tool_choice=None):
             if tool_choice:
                 return {"choices": [{"finish_reason": "stop", "message": {"content": None}}]}
-            return {"choices": [{"finish_reason": "tool_calls", "message": {
-                "content": None,
-                "tool_calls": [
-                    {"id": "call_location", "function": {"name": "verify_customer_location", "arguments": json.dumps({"cityText": "Los Angeles"})}},
-                    {"id": "call_generate", "function": {"name": "generate_new_product_combinations", "arguments": "{}"}},
-                ],
-            }}]}
+            if not any(m.get("role") == "tool" and "Verified" in (m.get("content") or "") for m in messages):
+                return {"choices": [{"finish_reason": "tool_calls", "message": {
+                    "content": None,
+                    "tool_calls": [
+                        {"id": "call_location", "function": {"name": "verify_customer_location", "arguments": json.dumps({"cityText": "Los Angeles"})}},
+                    ],
+                }}]}
+            return {"choices": [{"finish_reason": "stop", "message": {"content": "Here's what I put together for you."}}]}
 
         monkeypatch.setattr(conversation_flow, "call_openai_once", _fake_call_openai_once)
         history = [{"role": "user", "content": "Los Angeles"}]

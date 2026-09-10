@@ -15,6 +15,12 @@ continues a conversation) and F6 FAILS with 413 (body limit); the internal-key b
 exercised here at all because the public route's server-controlled bootstrap needs the database;
 their closure is proven by tests/security/test_chat_input_limits.py and test_rate_limiting.py.
 F3 still PASSES (Phase 3).
+
+Phase 3 note: the three F3 checks originally called `execute_fragrance_tool`, which was the
+model's dispatcher at the time. It is now the server-only private dispatcher; the model can only
+reach `execute_model_tool`. The checks below call the model-facing dispatcher so they keep
+measuring the model boundary, and they now FAIL (the private tools are refused by name). The
+private dispatcher still returns internal data to the SERVER, by design.
 """
 
 import json
@@ -218,7 +224,7 @@ def test_F3_analyze_tool_result_hands_raw_candidates_to_the_model(monkeypatch):
     monkeypatch.setattr(tool_executor, "analyze_customer_product_candidates", _analyze)
 
     import asyncio
-    result = asyncio.run(tool_executor.execute_fragrance_tool(None, "analyze_customer_product_candidates", "{}", {"conversationId": "c1", "customerName": "Jane", "customerEmail": "j@x.y", "shopDomain": "s.myshopify.com"}))
+    result = asyncio.run(tool_executor.execute_model_tool(None, "analyze_customer_product_candidates", "{}", {"conversationId": "c1", "customerName": "Jane", "customerEmail": "j@x.y", "shopDomain": "s.myshopify.com"}))
     model_text = result["modelContent"]
     for leaked in ("Midnight Saffron Reserve", "relevanceScore", "sameCityOrders", "distinctSimilarCustomers", "repeatPurchaseCustomers", "Oud Collection", "evidenceLevel"):
         assert leaked in model_text, leaked
@@ -235,7 +241,7 @@ def test_F3b_catalog_lookup_tool_exposes_handle_and_inspiration_brand_to_the_mod
 
     monkeypatch.setattr(tool_executor, "get_product_notes_and_combination_status", _lookup)
     import asyncio
-    result = asyncio.run(tool_executor.execute_fragrance_tool(None, "get_product_notes_and_combination_status", '{"productTitle": "anything the customer typed"}', {"conversationId": "c1"}))
+    result = asyncio.run(tool_executor.execute_model_tool(None, "get_product_notes_and_combination_status", '{"productTitle": "anything the customer typed"}', {"conversationId": "c1"}))
     assert "midnight-saffron-reserve" in result["modelContent"]
     assert "Famous Designer House" in result["modelContent"]
 
@@ -246,7 +252,7 @@ def test_F3c_get_customer_profile_tool_returns_pii_and_recommendation_ids_to_mod
 
     monkeypatch.setattr(tool_executor, "get_customer_profile", _profile)
     import asyncio
-    result = asyncio.run(tool_executor.execute_fragrance_tool(None, "get_customer_profile", "{}", {"conversationId": "c1"}))
+    result = asyncio.run(tool_executor.execute_model_tool(None, "get_customer_profile", "{}", {"conversationId": "c1"}))
     assert "jane@example.com" in result["modelContent"]
     assert "selectedRecommendationId" in result["modelContent"]
 
