@@ -29,7 +29,9 @@ _url, _connect_args = _to_asyncpg(settings.database_url)
 # fresh connection per checkout and tears it down on release -- no cross-loop reuse, no crash.
 # Revisit for production (a real pool, one long-lived event loop under uvicorn) if this becomes a
 # throughput concern; it is not a correctness issue there.
-engine = create_async_engine(_url, connect_args=_connect_args, poolclass=NullPool)
+# Phase 6: hide_parameters keeps bound values (customer messages, names, emails, token hashes) out
+# of every SQLAlchemy exception message and therefore out of every logged traceback.
+engine = create_async_engine(_url, connect_args=_connect_args, poolclass=NullPool, hide_parameters=True)
 SessionLocal = async_sessionmaker(engine, expire_on_commit=False)
 
 

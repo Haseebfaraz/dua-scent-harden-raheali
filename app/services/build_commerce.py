@@ -94,7 +94,7 @@ async def _set_build_status(session: AsyncSession, recommendation: Any, status: 
     await session.commit()
 
 
-async def execute_build_commerce(
+async def _execute_build_commerce_locked(
     session: AsyncSession, shop: str, *, recommendation_id: str, ratios: dict[str, int], name: str | None,
     customer_name: str | None = None, customer_email: str | None = None, allow_create: bool = True, want_product_url: bool = True, record_saved: bool = True,
     save_draft: bool = False,
@@ -173,3 +173,23 @@ async def save_recreate_draft(session: AsyncSession, *, recommendation_id: str, 
         if recommendation.buildStatus in (BUILD_STATUS_CREATING, BUILD_STATUS_PENDING_REVIEW):
             raise BuildPendingReview()
         await mark_recommendation_draft(session, recommendation_id, name=name, ratios=dict(ratios) if ratios else None)
+
+
+async def execute_build_commerce(session: AsyncSession, shop: str, *, recommendation_id: str, **kwargs: Any) -> dict[str, Any]:
+    """Public entry point (see _execute_build_commerce_locked). Phase 6: if the owner requested
+    deletion of the conversation while this operation held the build lock, the purge (which
+    minimizes this record instead of removing it) is finished as soon as the lock is released."""
+    conversation_id = None
+    try:
+        existing = await get_recommendation(session, recommendation_id)
+        conversation_id = getattr(existing, "conversationId", None)
+        return await _execute_build_commerce_locked(session, shop, recommendation_id=recommendation_id, **kwargs)
+    finally:
+        if isinstance(conversation_id, str):
+            from app.services.data_lifecycle import complete_pending_deletion
+
+            try:
+                await session.rollback()
+            except Exception:  # noqa: BLE001
+                pass
+            await complete_pending_deletion(session, conversation_id)

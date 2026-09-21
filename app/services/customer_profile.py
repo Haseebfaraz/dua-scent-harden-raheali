@@ -14,6 +14,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.db.ids import new_id
 from app.db.models import CustomerProfileState
 from app.db.time import utcnow
+from app.services.data_lifecycle import ensure_conversation_writable
 
 VALID_SEASONS = ["Winter", "Spring", "Summer", "Fall"]
 VALID_STRENGTH_PREFERENCES = ["light", "moderate", "strong"]
@@ -75,6 +76,7 @@ async def get_customer_profile(session: AsyncSession, conversation_id: str) -> d
 
 
 async def _upsert_profile(session: AsyncSession, conversation_id: str, updated: dict[str, Any]) -> None:
+    await ensure_conversation_writable(session, conversation_id)  # Phase 6: a deleted conversation is never written back
     row = await session.scalar(
         select(CustomerProfileState).where(CustomerProfileState.conversationId == conversation_id)
     )

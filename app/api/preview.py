@@ -31,7 +31,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.db.session import get_session
 from app.services.build_capability import BUILD_TOKEN_QUERY_PARAM, BuildNotAuthorized, authorize_build_token, bind_build_capability_customer
 from app.services.customer_identity import VerifiedShopifyCustomer, verified_shopify_customer_from_signed_params
+from app.services.conversation import save_message
 from app.services.customer_profile import get_customer_profile, save_customer_profile_field
+from app.services.data_lifecycle import ConversationDeleted
 from app.services.fragrance_build import compute_default_ratios, compute_note_position_buckets, compute_price_per_5ml_by_position
 from app.services.build_commerce import BuildOperationInProgress, BuildPendingReview, execute_build_commerce, save_recreate_draft
 from app.services.commerce_inventory import InventoryNotVerified, commerce_failure
@@ -44,6 +46,8 @@ from app.shopify.builds import BuildProductNotSaved, BuildWriteAmbiguous, Invali
 from app.shopify.trusted_shop import UntrustedShopError
 
 logger = logging.getLogger(__name__)
+
+RECREATE_REENTRY_MESSAGE = "What would you like to change about your fragrance?"
 
 # Customer-safe -- never mentions tokens, sessions, or internal auth mechanics. Used whenever this
 # shop has no usable Shopify Admin credentials, whether that's a missing Session row or a token
@@ -175,7 +179,13 @@ async def preview_action(body: PreviewAction, signed: dict = Depends(verified_si
             return _json(commerce_failure("build_in_progress")[1])
         except BuildPendingReview:
             return _json(commerce_failure("build_pending_review")[1])
-        await save_customer_profile_field(session, recommendation.conversationId, "pendingRecreateRecommendationId", body.recommendationId)
+        # Phase 6 (N14): the re-entry prompt is appended HERE, by this explicit authorized POST. The
+        # history GET used to do it as a side effect. Both writes refuse a deleted conversation.
+        try:
+            await save_message(session, recommendation.conversationId, "assistant", RECREATE_REENTRY_MESSAGE)
+            await save_customer_profile_field(session, recommendation.conversationId, "pendingRecreateRecommendationId", body.recommendationId)
+        except ConversationDeleted:
+            return _json({"error": _NOT_AUTHORIZED_MESSAGE, "code": "build_not_authorized"})
         return _json({"status": "recreate", "redirectUrl": f"https://{shop}/"})
 
     log_prefix = "SAVE_BUILD" if body.intent == "save_build" else "ADD_TO_CART"

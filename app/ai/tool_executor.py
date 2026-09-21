@@ -276,8 +276,7 @@ async def _auto_select_and_confirm_best(session: AsyncSession, with_ids: list[di
         logger.info("INVENTORY_CANDIDATE_RESULT %s", json.dumps({
             "conversationId": conversation_id, "recommendationId": candidate.get("recommendationId"), "candidateIndex": candidate_index,
             "inventoryValidated": inventory["inventoryValidated"], "buildable": inventory["buildable"],
-            "limitingSku": inventory["limitingSku"], "maxBuildableBottles": inventory["maxBuildableBottles"],
-        }))
+        }))  # Phase 6: no item code or stock figure in logs (the snapshot row keeps them)
 
         from app.services.inventory_snapshot import save_inventory_snapshot
 
@@ -299,7 +298,7 @@ async def _auto_select_and_confirm_best(session: AsyncSession, with_ids: list[di
 
         if not inventory["buildable"]:
             any_inventory_rejected = True
-            _reject(candidate_index, candidate, "inventory", inventory.get("limitingSku") or "not buildable from current inventory", inventory)
+            _reject(candidate_index, candidate, "inventory", "not_buildable_from_current_inventory", inventory)
             continue
         buildable_candidate_count += 1
 
@@ -308,7 +307,7 @@ async def _auto_select_and_confirm_best(session: AsyncSession, with_ids: list[di
         )
         if not confirm_result["ok"]:
             reason_code = confirm_result.get("reasonCode") or "unknown"
-            _reject(candidate_index, candidate, f"confirmation:{reason_code}", confirm_result.get("reason", ""), inventory)
+            _reject(candidate_index, candidate, f"confirmation:{reason_code}", str(reason_code), inventory)  # Phase 6: the free-text reason can quote a source title
             # identity_missing is a systemic gate (checked before any candidate-specific logic in
             # confirm_recommendation) -- every remaining buildable candidate will fail it identically,
             # so it must never be masked by whatever generic reason the loop would otherwise settle on.

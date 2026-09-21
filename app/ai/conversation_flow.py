@@ -86,8 +86,10 @@ def _cache_put(conversation_id: str, history: list[dict]) -> None:
         _CONVERSATIONS.popitem(last=False)
 
 
-async def get_conversation(session: AsyncSession, conversation_id: str | None) -> dict[str, Any]:
-    if conversation_id and conversation_id in _CONVERSATIONS:
+async def get_conversation(session: AsyncSession, conversation_id: str | None, *, refresh: bool = False) -> dict[str, Any]:
+    """`refresh=True` reloads from the database even when this process has a cached copy (used by
+    the read-only history route when another operation is known to have appended a message)."""
+    if conversation_id and conversation_id in _CONVERSATIONS and not refresh:
         _CONVERSATIONS.move_to_end(conversation_id)
         return {"id": conversation_id, "history": _CONVERSATIONS[conversation_id]}
 

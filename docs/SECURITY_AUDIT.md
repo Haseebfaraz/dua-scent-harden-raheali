@@ -1192,3 +1192,100 @@ Pre-purchase validation, reservation and a post-order webhook are different guar
 Unchanged: F4 PARTIAL, F5 PARTIAL (no live validation; untouched), N3 blocked on the theme update,
 N7, F10, F11, F12, N14 open, credential rotation pending. N13 (real hostname default) is CLOSED by
 this phase. F1, F2, N1, F6, F7, F8, N2, F3, N5, N8: regression suites passing unchanged.
+
+
+---
+
+## 19. Phase 6 (2026-09-21): customer data lifecycle, ownership-aware deletion, retention, privacy-safe observability
+
+Branch `security-hardening`, continuing after `11e96e4`. Nothing deployed or pushed. No production
+or staging data, no external request, no real customer record touched. Synthetic records in a
+disposable local PostgreSQL only. The original F11 and N14 findings above are kept as written.
+Full design: `docs/DATA_RETENTION_AND_DELETION.md`. This is not a legal-compliance claim.
+
+### F11: root cause
+
+Nothing in the backend ever deleted customer data, nothing defined how long it was kept, and the
+write paths were upserts keyed by a conversation id with no foreign keys (`create_or_update_
+conversation`, the profile upsert, recommendation save), so even a manual delete could be undone by
+any late write.
+
+### F11: implementation
+
+* `app/services/data_lifecycle.py`: deletion scoped to one conversation; durable tombstone plus
+  capability revocation in one transaction before anything is removed; explicit per-table deletes;
+  commerce records reduced to an allowlist and detached instead of deleted; non-blocking lock order
+  (conversation, then builds by id); pending state when an operation is in flight, finished by that
+  operation, a repeat, or retention; bounded, single-run, dry-run-first retention.
+* Write guard on every path that can re-create conversation data; tombstone checks on the internal
+  adapter routes; local cache eviction.
+* `POST /chat/delete`; `scripts/data_retention.py`; migration `0004_conversation_deletion.sql`
+  (additive, Python-owned table, two indexes on Python-owned tables).
+* Provisional retention settings; destructive execution disabled by default.
+
+### N14: disposition
+
+Relevant and fixed. `GET /chat?history=true` (and the internal history route) appended and
+persisted an assistant message, upserted the `Conversation` row (which could re-create a deleted
+conversation and refreshed its `updatedAt`) and rewrote the profile. Those changes moved to the
+explicit, build-capability-authorized "recreate" POST; the marker is consumed by the next POST
+turn inside the turn lock; the GET only uses it to force a fresh read. Rate-limit accounting on the
+GET is intended and kept. **N14: CLOSED.**
+
+### Logging and errors: verified leaks and corrections
+
+| Leak (verified in code) | Correction |
+|---|---|
+| `exc_info=True` tracebacks: SQLAlchemy errors quote bound parameters (message text, names, emails, token hashes); validation and HTTP errors quote inputs and URLs | engine `hide_parameters=True`; the formatter now emits exception TYPES, the cause chain and code locations, never exception messages |
+| `httpx` / `httpcore` log every outbound URL at INFO; the inventory lookup URL carries private item codes | those loggers are set to WARNING |
+| Request log used the raw path (can carry identifiers or arbitrary client text) | the matched route template; request id is server-generated |
+| Model-provider errors logged the response body and the exception text | status code / exception type only |
+| Discovery inventory logs carried source product titles, item codes, on-hand and required quantities; candidate rejection logged the limiting item code and a free-text reason that can quote a source title | counts, statuses and reason codes only (the snapshot table keeps the detail) |
+| Maintenance output | counts only; on failure the exception type only (a connection string can never be printed) |
+
+Already safe and unchanged: capability tokens and preview URLs (`preview_url_for_logging`), no
+access log (`--no-access-log`), security events carry codes only. Remaining: conversation and
+recommendation ids are still logged as correlation identifiers and the hosting platform's log
+retention is not controlled here; third-party library logs at WARNING and above were not audited
+line by line.
+
+### Regression tests
+
+`tests/security/test_data_lifecycle.py`, 48 tests: ownership (own token; no token, garbage, another
+customer's token, id only, victim name and email, token in the URL, all identical to an unknown
+id; same email on another conversation untouched; signed identity still needs ownership; no bulk
+entry point); removal and minimization (every table, JSON and free-text markers gone, allowlist
+completeness, retained record unreachable); after deletion (capabilities, history, continuation,
+internal adapter, caches, no deleted value in a model request; every write path refused despite a
+stale cache); races with thread-safe barriers (deletion during an active turn that then completes
+normally, during a build operation, lock order and release on failure, concurrent repeats); N14
+(read-only history, marker consumed by an explicit turn); retention (dry run, disabled by default,
+boundary and activity definition, bounded batches and stable order, single run, partial failure,
+holds, capability / bucket / tombstone clocks, interrupted deletion, command output); logs and
+errors (exception summaries, database errors, turn / failure / deletion logs, provider errors,
+inventory logs, HTTP client loggers); no external call; ordinary guest flow unchanged.
+
+| Suite | Result |
+|---|---|
+| New Phase 6 tests | 48 passed |
+| `tests/security/` | 788 passed, 0 failed |
+| Full suite | 1307 passed, 57 failed, 30 deselected (`live_ai`), 0 skipped, 0 errors |
+| Same environment, `11e96e4` | 1259 passed, 57 failed, 30 deselected |
+| Failing now but passing at `11e96e4` | **none**; identical production-catalog set, not run against real data |
+| Network attempts flagged by the guard | 0 |
+| Phase 0 harness | unchanged |
+
+One existing fixture (the database-free chat fixture) was adapted for two new calls; no assertion
+about an earlier boundary was changed.
+
+### Closure status and remaining risk
+
+**F11: PARTIAL.** Backend mechanisms implemented and tested. Open: the retention policy is
+provisional and unreviewed; execution is disabled and unscheduled; the other application's
+dependence on deleted rows is unverified; `OrderHistory` has no lifecycle; Shopify copies (N7),
+logs, backups and the model provider's copies are not deleted; there is no account-level deletion.
+
+Unchanged: F4 PARTIAL, F5 PARTIAL, F9 PARTIAL (commerce still fails closed; nothing in this phase
+added a default or bypass), N3 blocked on the theme, N7 OPEN (now also documented as a deletion
+dependency), F10, F12 open, credential rotation pending. F1, F2, N1, F6, F7, F8, N2, F3, N5, N8,
+N13: regression suites passing unchanged.

@@ -30,3 +30,12 @@ class ChatSessionRequest(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
     with_welcome: bool = False
+
+
+class ChatDeleteRequest(BaseModel):
+    """Phase 6. The capability travels in the X-Conversation-Token header, never in a URL. Name,
+    email or any other field a caller adds is ignored: none of them authorizes anything."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    conversation_id: Any = None

@@ -8,11 +8,13 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.db.ids import new_id
 from app.db.models import Conversation, Message, MessageSecurityClassification
 from app.db.time import utcnow
+from app.services.data_lifecycle import ensure_conversation_writable
 
 
 async def create_or_update_conversation(
     session: AsyncSession, conversation_id: str, customer_email: str | None = None, customer_name: str | None = None
 ) -> Conversation:
+    await ensure_conversation_writable(session, conversation_id)  # Phase 6: a deleted conversation is never written back
     existing = await session.scalar(select(Conversation).where(Conversation.id == conversation_id))
     now = utcnow()
     if existing:

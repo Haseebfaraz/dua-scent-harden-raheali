@@ -71,7 +71,10 @@ request header, query parameter, or body can ever select a different shop. See
 
 ### Database
 
-Three additive migrations are required before running this code against any database, in order:
+Four additive migrations are required before running this code against any database, in order
+(the fourth, `migrations/0004_conversation_deletion.sql`, adds the deletion tombstone table used by
+`POST /chat/delete` and the retention command -- `docs/DATA_RETENTION_AND_DELETION.md`; without it
+every chat write fails closed):
 `migrations/0001_build_capability.sql` (build capabilities that authorize preview reads and
 Shopify build mutations -- `docs/SHOPIFY_BUILD_SECURITY_CONTRACT.md`),
 `migrations/0002_conversation_capability_and_rate_limits.sql` (conversation session secrets and

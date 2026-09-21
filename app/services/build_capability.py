@@ -32,6 +32,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.db.ids import new_id
 from app.db.models import BuildCapability
 from app.db.time import utcnow
+from app.services.data_lifecycle import ensure_conversation_writable
 
 BUILD_TOKEN_TTL = timedelta(days=7)
 BUILD_TOKEN_QUERY_PARAM = "bt"
@@ -50,6 +51,7 @@ def hash_build_token(token: str) -> str:
 
 
 async def issue_build_token(session: AsyncSession, *, recommendation_id: str, conversation_id: str, shop: str) -> str:
+    await ensure_conversation_writable(session, conversation_id)  # Phase 6: a deleted conversation is never written back
     token = secrets.token_urlsafe(32)
     now = utcnow()
     session.add(

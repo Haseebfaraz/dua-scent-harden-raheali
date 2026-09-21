@@ -34,6 +34,27 @@ class Settings(BaseSettings):
     # that lets unknown or unavailable inventory authorize a commerce write.
     commerce_inventory_max_age_seconds: int = 30
 
+    # ---- Phase 6 (F11): data lifecycle. PROVISIONAL defaults pending operator / policy review ----
+    # None of these is a legal retention period. They are engineering defaults for a guest chat
+    # product, chosen to be short; docs/DATA_RETENTION_AND_DELETION.md section 3 explains each.
+    # All cutoffs are UTC and strictly "older than": a record exactly at the cutoff is kept.
+    #
+    # Destructive retention runs are OFF until an operator reviews the policy. With this false the
+    # maintenance command can only ever dry-run, whatever flags it is given.
+    retention_execution_enabled: bool = False
+    # A guest conversation is inactive when its LAST CUSTOMER MESSAGE (or, with none, its creation)
+    # is older than this. Reads, polling, assistant or server writes never extend it.
+    retention_inactive_conversation_days: int = 90
+    # Expired or revoked capability rows (hashes only) are kept this long for abuse investigation.
+    retention_dead_capability_days: int = 7
+    # A commerce record reduced to its operational minimum is removed this long after creation.
+    # Records in `creating` / `pending_review` are never removed automatically (they are reported).
+    retention_commerce_record_days: int = 365
+    # How long a completed deletion tombstone keeps blocking late writes before it is removed.
+    retention_tombstone_days: int = 7
+    retention_rate_limit_bucket_days: int = 2
+    retention_batch_size: int = 200
+
     # ---- Phase 5A: the inventory SOURCE CONTRACT (docs/INVENTORY_COMMERCE_SECURITY.md section 2a) ----
     # Facts about the inventory source that this backend cannot discover by itself. Each one is an
     # explicit operator declaration with a documented meaning, none has a default, and none of

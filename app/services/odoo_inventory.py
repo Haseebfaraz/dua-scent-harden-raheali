@@ -197,21 +197,11 @@ async def evaluate_candidate_inventory(session: AsyncSession, candidate: dict[st
         titles = [c["productTitle"] for c in formula["components"]]
 
         sku_map = await resolve_odoo_skus_for_titles(session, titles)
-        # Real SKUs are useful, explicitly approved for logging; only the Authorization
-        # header/Bearer token/API key/cookies/raw HTML are ever excluded.
+        # Phase 6: counts only. Source product titles, item codes and quantities are private
+        # business data; the durable detail lives in RecommendationInventorySnapshot, not in logs.
         logger.info("ODOO_INVENTORY_REQUEST %s", json.dumps({
-            "recommendationId": candidate.get("recommendationId"),
-            "candidateIndex": candidate_index,
-            "components": [
-                {
-                    "productTitle": c["productTitle"],
-                    "sku": (sku_map.get(c["productTitle"]) or {}).get("odooSku"),
-                    "ratioPercent": c["ratioPercent"],
-                    "requiredOilMl": c["requiredOilMl"],
-                }
-                for c in formula["components"]
-            ],
-            "skuCount": len(titles),
+            "recommendationId": candidate.get("recommendationId"), "candidateIndex": candidate_index,
+            "componentCount": len(titles), "mappedCount": sum(1 for t in titles if sku_map.get(t)),
         }))
 
         lookup = await get_oil_inventory_for_product_titles(session, titles)
@@ -235,10 +225,7 @@ async def evaluate_candidate_inventory(session: AsyncSession, candidate: dict[st
 
         lookup_failed = [c for c in components if c["mappingStatus"] == "LOOKUP_FAILED"]
         if lookup_failed:
-            logger.info("ODOO_INVENTORY_LOOKUP_FAILED %s", json.dumps({
-                "recommendationId": candidate.get("recommendationId"),
-                "components": [{"productTitle": c["productTitle"], "sku": c["odooSku"]} for c in lookup_failed],
-            }))
+            logger.info("ODOO_INVENTORY_LOOKUP_FAILED %s", json.dumps({"recommendationId": candidate.get("recommendationId"), "componentCount": len(lookup_failed)}))
 
         known_components = [c for c in components if c["mappingStatus"] == "CONNECTED"]
         confirmed_insufficient = bool(known_components) and not compute_feasibility([
@@ -252,7 +239,7 @@ async def evaluate_candidate_inventory(session: AsyncSession, candidate: dict[st
         logger.info("ODOO_INVENTORY_RESPONSE %s", json.dumps({
             "recommendationId": candidate.get("recommendationId"), "candidateIndex": candidate_index,
             "status": status, "inventoryValidated": inventory_validated, "durationMs": duration_ms,
-            "products": [{"sku": c["odooSku"], "onHandQty": c["onHandQty"], "requiredOilMl": c["requiredOilMl"], "sufficient": c["sufficient"]} for c in components],
+            "componentCount": len(components), "sufficientCount": sum(1 for c in components if c["sufficient"]),
         }))
 
         limiting = None

@@ -44,16 +44,18 @@ from app.api.request_limits import InvalidChatInput, validate_chat_message, vali
 from app.config import settings
 from app.db.models import Conversation
 from app.db.session import get_session
-from app.schemas.chat import ChatRequest, ChatSessionRequest
+from app.schemas.chat import ChatDeleteRequest, ChatRequest, ChatSessionRequest
 from app.services.build_capability import preview_url_for_logging
 from app.services.conversation import create_or_update_conversation, save_message, save_user_message_with_classification
 from app.services.conversation_capability import (
+    is_pending_deletion_retry,
     CONVERSATION_TOKEN_HEADER,
     ConversationNotAuthorized,
     authorize_conversation,
     create_conversation_with_capability,
 )
 from app.services.customer_identity import SelfReportedIdentity, self_reported_identity
+from app.services.data_lifecycle import complete_pending_deletion, is_conversation_deleted, request_conversation_deletion
 from app.services.customer_profile import get_customer_profile, save_customer_profile_field
 from app.services.legacy_preview_recovery import resolve_legacy_preview_short_circuit
 from app.services.rate_limit import Limit, RateLimitUnavailable, RateLimited, enforce, hash_abuse_identity, limit
@@ -148,20 +150,19 @@ def public_sse_event(event: dict) -> dict | None:
 # History
 # ---------------------------------------------------------------------------
 
-async def _history_payload(session: AsyncSession, conversation_id: str | None) -> dict:
-    history = (await get_conversation(session, conversation_id))["history"] if conversation_id else []
+RECREATE_REENTRY_MESSAGE = "What would you like to change about your fragrance?"
 
+
+async def _history_payload(session: AsyncSession, conversation_id: str | None) -> dict:
+    """READ ONLY (Phase 6, finding N14). This used to append and persist an assistant message,
+    upsert the Conversation row (which could re-create a deleted conversation and extended its
+    retention) and rewrite the profile, all from a GET. Those changes now happen in the explicit,
+    build-capability-authorized "recreate" POST (app/api/preview.py). The only thing the flag does
+    here is force a fresh read so a message appended by that POST is visible on every instance."""
+    history: list[dict] = []
     if conversation_id:
         profile = await get_customer_profile(session, conversation_id)
-        if profile.get("pendingRecreateRecommendationId"):
-            ask_text = "What would you like to change about your fragrance?"
-            history.append({"role": "assistant", "content": ask_text})
-            set_conversation_cache(conversation_id, history)
-            try:
-                await save_message(session, conversation_id, "assistant", ask_text)
-            except Exception as err:
-                logger.error("Failed to persist recreate re-entry message: %s", type(err).__name__)
-            await save_customer_profile_field(session, conversation_id, "pendingRecreateRecommendationId", None)
+        history = (await get_conversation(session, conversation_id, refresh=bool(profile.get("pendingRecreateRecommendationId"))))["history"]
 
     visible = [
         {"role": m["role"], "content": m["content"]}
@@ -179,6 +180,8 @@ async def chat_history(conversation_id: str | None = None, session: AsyncSession
             validate_conversation_id(conversation_id)
         except InvalidChatInput:
             return JSONResponse({"messages": []}, headers=NO_STORE_HEADERS)
+        if await is_conversation_deleted(session, conversation_id):
+            return JSONResponse({"messages": []}, headers=NO_STORE_HEADERS)  # identical to an unknown id
     return JSONResponse(await _history_payload(session, conversation_id), headers=NO_STORE_HEADERS)
 
 
@@ -274,6 +277,8 @@ async def _resolve_internal_conversation(body: ChatRequest, session: AsyncSessio
             conversation_id = validate_conversation_id(body.conversation_id)
         except InvalidChatInput:
             conversation_id = None
+        if conversation_id and await is_conversation_deleted(session, conversation_id):
+            conversation_id = None  # Phase 6: a deleted conversation is never continued; a fresh one is minted below
         if conversation_id and await session.scalar(select(Conversation.id).where(Conversation.id == conversation_id)):
             await _enforce_limits(session, [
                 limit("chat_turn_conv", conversation_id, settings.rate_limit_chat_turn_per_conversation),
@@ -347,7 +352,12 @@ async def _run_chat_turn(
     async def _stream():
         try:
             try:
-                conv = await get_conversation(session, conversation_id)
+                # Phase 6 (N14): the recreate marker is consumed here, by an explicit authorized
+                # POST inside the turn lock, never by a history read.
+                pending_recreate = bool((await get_customer_profile(session, conversation_id)).get("pendingRecreateRecommendationId"))
+                conv = await get_conversation(session, conversation_id, refresh=pending_recreate)
+                if pending_recreate:
+                    await save_customer_profile_field(session, conversation_id, "pendingRecreateRecommendationId", None)
                 history = conv["history"]
                 # The model-facing history gets the gated projection (raw attack text is never
                 # replayed; a mixed message keeps only its fragrance part). The raw message is
@@ -435,6 +445,9 @@ async def _run_chat_turn(
         finally:
             turn_slots.release()
             await lock.__aexit__(None, None, None)
+            # Phase 6: if the owner asked for deletion while this turn was running, the turn's own
+            # writes were refused (tombstone) and the purge is finished now, not "eventually".
+            await complete_pending_deletion(session, conversation_id)
 
     return StreamingResponse(
         _stream(),
@@ -451,3 +464,54 @@ async def internal_chat_action(request: Request, body: ChatRequest, session: Asy
 @router.post("/chat")
 async def chat_action(request: Request, body: ChatRequest, session: AsyncSession = Depends(get_session)) -> StreamingResponse:
     return await _run_chat_turn(request, body, session, public=True)
+
+
+# ---------------------------------------------------------------------------
+# Phase 6 (F11): owner-requested deletion of ONE conversation
+# ---------------------------------------------------------------------------
+
+_DELETED_BODY = {
+    "status": "deleted",
+    "message": "This conversation and the preferences we stored with it have been deleted from the fragrance designer.",
+    "notCovered": "Anything already created in the store (for example a saved blend or an order) and routine backups are not removed by this request.",
+}
+_DELETION_PENDING_BODY = {
+    "status": "deletion_pending",
+    "message": "Your deletion request is recorded and this conversation can no longer be used. Removal finishes as soon as the step in progress ends.",
+    "notCovered": _DELETED_BODY["notCovered"],
+}
+
+
+@router.post("/chat/delete")
+async def delete_conversation(request: Request, body: ChatDeleteRequest, session: AsyncSession = Depends(get_session)) -> JSONResponse:
+    """Authorized ONLY by the conversation capability (header, never a URL). A conversation id, a
+    name or an email authorizes nothing. Scope: exactly this conversation and the records keyed to
+    it (app/services/data_lifecycle.py). Every refusal is the same 401 used for unknown ids."""
+    try:
+        conversation_id = validate_conversation_id(body.conversation_id)
+        token = validate_token_shape(request.headers.get(CONVERSATION_TOKEN_HEADER))
+    except InvalidChatInput:
+        return JSONResponse(_NOT_AUTHORIZED_BODY, status_code=401, headers=NO_STORE_HEADERS)
+    ip_subject = hash_abuse_identity(client_ip(request))
+    await _enforce_limits(session, [limit("conversation_delete_ip", ip_subject, settings.rate_limit_history_read_per_ip)])
+
+    pending_retry = False
+    try:
+        await authorize_conversation(session, token=token, conversation_id=conversation_id)
+    except ConversationNotAuthorized:
+        # The first request revokes the capability. While removal is still pending, the SAME
+        # token may ask again (idempotent retry); after completion the capability row is gone and
+        # this is indistinguishable from any other unauthorized request.
+        pending_retry = await is_pending_deletion_retry(session, token=token, conversation_id=conversation_id)
+        if not pending_retry:
+            return JSONResponse(_NOT_AUTHORIZED_BODY, status_code=401, headers=NO_STORE_HEADERS)
+
+    try:
+        result = await request_conversation_deletion(session, conversation_id)
+    except Exception as err:
+        logger.error("CONVERSATION_DELETE_FAILED %s", json.dumps({"errorType": type(err).__name__}))
+        return JSONResponse({"error": "We couldn't process this request right now. Please try again.", "code": "deletion_failed"}, status_code=503, headers=NO_STORE_HEADERS)
+    logger.info("CONVERSATION_DELETE %s", json.dumps({"state": result.state, "retry": pending_retry}))
+    if result.completed:
+        return JSONResponse({**_DELETED_BODY, "commerceRecordRetained": result.minimized_commerce_records > 0}, headers=NO_STORE_HEADERS)
+    return JSONResponse(_DELETION_PENDING_BODY, status_code=202, headers=NO_STORE_HEADERS)

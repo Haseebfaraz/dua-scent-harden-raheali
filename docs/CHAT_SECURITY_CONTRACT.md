@@ -88,3 +88,34 @@ on the HTTP status.
 
 To start over, discard the stored pair and bootstrap again. Old history stays retrievable only
 with the old token until it expires.
+
+## 7. Deleting a conversation (Phase 6)
+
+```
+POST /chat/delete
+X-Conversation-Token: <the conversation's token>
+Content-Type: application/json
+
+{"conversation_id": "<id>"}
+```
+
+* The token goes in the header, never in a URL. Name, email or any other field is ignored and
+  authorizes nothing. There is no "delete everything for this email".
+* `200 {"status": "deleted", "message": "...", "notCovered": "...", "commerceRecordRetained": bool}`
+  Show `message`. If you describe the result yourself, do not promise more than `notCovered`
+  allows: anything already created in the store and routine backups are not removed.
+* `202 {"status": "deletion_pending", ...}`: the request is recorded and the conversation is
+  already unusable, but removal finishes when the step in progress ends. Do not tell the customer
+  it is deleted yet. You may repeat the same request with the same token; it returns `202` or `200`.
+* `401 conversation_not_authorized`: not authorized. Also what a repeat returns once deletion has
+  completed, and what any other conversation's token gets.
+* `429` / `503`: try again later. Nothing was reported as deleted.
+
+**Session reset.** On `200` or `202` the widget MUST discard the conversation id and token
+(sessionStorage and memory), clear the visible transcript, and start over with `POST /chat/session`
+for any further chat. Every request with the old id or token returns `401` from that moment.
+
+**History reads are read-only (finding N14).** `GET /chat?history=true` no longer appends the
+"What would you like to change about your fragrance?" prompt or edits the profile. That prompt is
+appended by the preview page's "recreate" action; the widget only has to reload history after the
+redirect, as it already does.

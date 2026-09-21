@@ -13,6 +13,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.db.ids import new_id
 from app.db.models import ExistingCombination, FragranceProduct, FragranceRecommendation
 from app.db.time import utcnow
+from app.services.data_lifecycle import ensure_conversation_writable
 from app.fragrance.compatibility import literal_note_match_count, split_dislikes_by_exactness
 from app.fragrance.normalization import normalize_product_name
 from app.fragrance.scoring import classify_dislike_conflict
@@ -31,6 +32,7 @@ async def save_recommendation(session: AsyncSession, *, conversation_id: str, pr
     generation time, as defense in depth.
     """
     validate_combination_shape(combination["type"], combination["internalProducts"], combination.get("recommendedRatio"))
+    await ensure_conversation_writable(session, conversation_id)  # Phase 6: a deleted conversation is never written back
 
     recent_for_conversation = (
         await session.execute(
@@ -227,6 +229,7 @@ async def mark_recommendation_draft(session: AsyncSession, recommendation_id: st
     record = await get_recommendation(session, recommendation_id)
     if not record:
         return None
+    await ensure_conversation_writable(session, record.conversationId)  # Phase 6: no new draft (a custom name is customer data) after deletion
     # Phase 5: `creating` / `pending_review` mean a Shopify creation may already exist or be in
     # flight (app/services/build_commerce.py). A draft save must never erase that marker, or the
     # next commerce action would blindly create a second product.

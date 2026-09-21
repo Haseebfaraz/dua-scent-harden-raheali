@@ -51,12 +51,13 @@ async def call_openai_once(messages: list[dict], tools: list[dict] | None, tool_
                     break
                 response = await client.post(url, json=payload, headers=headers)
         if response.status_code != 200:
-            logger.error("OpenAI API error: %s %s", response.status_code, response.text)
+            # Phase 6: never the response body (it can echo request content) -- status only.
+            logger.error("OpenAI API error: status=%s", response.status_code)
             return None
         return response.json()
     except httpx.TimeoutException:
         logger.error("OpenAI request failed: timed out after %ss", settings.openai_timeout_seconds)
         return None
     except Exception as err:
-        logger.error("OpenAI request failed: %s", err)
+        logger.error("OpenAI request failed: %s", type(err).__name__)
         return None
