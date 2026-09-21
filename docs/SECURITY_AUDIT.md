@@ -821,6 +821,11 @@ request-limit, or turn-lock code was modified.
 
 ## 15. Phase 4 closure (2026-09-10): fragrance scope, prompt-injection defense, safe routing, adversarial testing
 
+> **Superseded in part by section 16 (Phase 4A, 2026-09-21).** This section is kept as written. Its
+> failure policy ("any failure degrades to a fragrance turn with no model tools") was fail-open,
+> its F4 "CLOSED" status was premature, and its "Still open" list omitted F9, F10, F11 and N14.
+> Section 16 records the gap, the correction and the accurate statuses.
+
 Branch `security-hardening`, continuing after `5b9e6c8`. Nothing deployed, nothing pushed, no
 staging/production data touched, no live Shopify/Odoo mutation, no live model call. Full design
 in `docs/AI_SECURITY_GATE.md`; red-team results in `docs/AI_RED_TEAM_RESULTS.md`.
@@ -903,3 +908,93 @@ have no diff since Phase 0.
 
 N3 (theme update for the new build contract), N7 (review item), F5 live validation, F12 (no
 CI), credential rotation (operator action).
+
+
+---
+
+## 16. Phase 4A correction (2026-09-21): fail-closed gate, execution permissions, independent regression verification
+
+Branch `security-hardening`, continuing after `4461c2c`. Nothing deployed or pushed. No staging or
+production data, no live Shopify/Odoo mutation, no live model call. Synthetic fixtures, mocked
+models and a disposable local PostgreSQL only.
+
+### The gaps, verified by tracing the code at `4461c2c` (not by reading the report)
+
+| # | Gap | Evidence in `4461c2c` |
+|---|---|---|
+| G1 | **Fail-open on classifier failure.** Disabled, unavailable, exception, wrong function, invalid enum, extra fields and bad JSON all returned `GateDecision("FRAGRANCE", ..., degraded=True)`. | `security_gate.classify_semantically` / `classify_message`. `call_ai` then only set `tools_for_turn = None`; `_extract_and_persist_profile_facts` still ran (profile writes, location/weather lookups), `build_system_prompt` still persisted accept/decline flags and identity, `_maybe_generate` still ran the private pipeline (persist, confirm, mint a build capability), and `chat.py` still ran legacy preview recovery because `is_deterministic_reply` was false. |
+| G2 | **`tools=None` treated as a boundary.** A model response carrying tool calls was dispatched through `execute_model_tool`, which checked only the global four-tool allowlist. | `call_ai` tool loop; `tool_executor.execute_model_tool`. Same for early-phase turns that offered only the save tool. |
+| G3 | **Small talk could build.** `SMALL_TALK` was a model route with extraction (discovery mode), the save tool, server-triggered generation and legacy recovery. "thanks" with a ready profile could generate; "yes" matched the legacy recovery pattern and could confirm a build with no question pending. | `call_ai`, `chat.py`, `legacy_preview_recovery._LEGACY_SELECTION_PATTERN`. |
+| G4 | **History protection had holes.** (a) The message and its classification were two commits; if the second failed, a semantically detected attack was stored unclassified and the legacy screen (attack regexes only) replayed it raw after a reload. (b) A semantically detected MIXED turn was replayed whole on reload when layer 1 could strip nothing. (c) A classifier-chosen substring was trusted as model context if it merely appeared in the message. (d) Direct `call_ai` callers got no screening of earlier turns. (e) Unknown stored labels were replayed raw. | `chat.py` persistence block, `conversation_flow.project_model_history`, `security_gate.classify_semantically`. |
+| G5 | **Legacy profile values.** The write-time guard did not apply to values already stored; they still entered model context as customer data. | `safe_views.build_customer_safe_profile_view`. |
+| G6 | **Over-broad "confident" fragrance acceptance.** The lexicon contained generic words (like, love, more, name, work, strong, create, recommend), so almost any sentence was "confidently fragrance" and never reached the classifier. | `security_gate.FRAGRANCE_LEXICON`. |
+| G7 | **Misleading reporting.** Uncertain benign messages were counted as correct; the echo-mock canary test was described as proof the canary cannot reach the customer; F4 was marked CLOSED; the open list dropped F9, F10, F11, N14. | `docs/AI_RED_TEAM_RESULTS.md`, section 15 above. |
+
+### Correction
+
+* `UNRESOLVED` is a server-only decision; every classifier failure, a disabled or unconfigured
+  classifier on an uncertain message, a timeout (new hard ceiling), and an unseparable mixed
+  message produce it. It permits nothing and returns a warm invitation to restate.
+* One server-owned `TurnPermissions` object (default deny) covers extraction, model completion,
+  allowed tools, generation, refinement and legacy recovery, and is enforced at each execution
+  site. `execute_model_tool` requires the per-turn tool set and refuses anything outside it.
+* `SMALL_TALK` is a conversational reply only. A short signal-free reply continues the design
+  workflow only as a contextual answer to a pending assistant question, never if it is a
+  pleasantry, a question, or addressed to the assistant (rules in `docs/AI_SECURITY_GATE.md` 5a).
+* Message and classification are written atomically; unclassified and unknown-label turns are
+  replayed only if layer 1 confidently accepts them; MIXED is replayed only if layer 1 can strip
+  it; classifier text is accepted as the fragrance remainder only as a strictly shorter verbatim
+  fragrance-bearing substring; direct callers get deterministic screening of earlier turns.
+* The model-facing profile projection withholds instruction-like stored values; storage untouched.
+* The strong-only lexicon makes layer 1 acceptance narrow; layer 1 attack patterns gained three
+  paraphrase families.
+* The live simulation harness and the live red-team suite now use the same gate as the route.
+
+### Finding status (accurate as of this commit)
+
+| Finding | Status | Reasoning |
+|---|---|---|
+| F4 general-purpose chat | **PARTIAL** (was reported CLOSED) | Deterministic evidence: prompt permissions removed; recognised off-topic requests never reach a model; uncertain requests fail closed. Not evidenced: that a real model declines an off-topic request that layer 1 accepts as fragrance (for example one carrying a fragrance word) or that the real classifier labels unrecognised off-topic requests correctly. No live run. |
+| F5 prompt/tool extraction, history and profile poisoning | **PARTIAL** | Architecture, routing, permissions, projections and output interception are tested deterministically. Real-model resistance and real-classifier accuracy are unvalidated. Residual bypass class documented (hostile text layer 1 cannot see, carried with a strong fragrance term). |
+| F1, F2, N1, F6, F7, F8, N2, F3, N5, N8 | CLOSED, regression suites passing unchanged | No trusted-shop, capability, ownership, ratio, rate-limit, request-limit, turn-lock or data-boundary code was modified. |
+| N3 | PARTIALLY MITIGATED, blocked on theme update | unchanged |
+| **F9** inventory fails open into irreversible commerce actions | **OPEN (MEDIUM/HIGH)** | untouched; save/add-to-cart never consult inventory |
+| F10 Shopify Admin API version 2025-04 unsupported | OPEN (MEDIUM) | untouched by instruction |
+| F11 no retention / expiry / deletion / anonymization | OPEN (MEDIUM) | untouched; Phase 4 added one more table holding classification codes per message |
+| F12 no CI | OPEN (MEDIUM) | untouched |
+| N4, N6 (partly addressed by name validation), N7, N9 (closed in Phase 2), N11 to N17 | as previously recorded; N7 (source titles and customer PII in product metafields) remains OPEN | |
+| Credential rotation | OPEN, operator action | unchanged |
+
+### Test results (Python 3.11, fresh disposable local Postgres 16, migrations 0001 to 0003, no catalog data)
+
+| Suite | Result |
+|---|---|
+| New Phase 4A regressions (`tests/security/test_gate_fail_closed.py`) | 37 passed |
+| Gate, routing, prompt scope (rewritten where they encoded the fail-open behaviour) | 105 passed |
+| `tests/security/` (Phases 1 to 4A) | 536 passed, 0 failed |
+| Chat and conversation suites (`test_chat_api.py`, `test_conversation_intelligence.py`) | 66 passed, 1 failed (baseline catalog-data failure, fails identically at `4461c2c` and on `main`) |
+| Full suite | 1054 passed, 57 failed, 30 deselected (`live_ai`), 0 skipped |
+| Same environment, `4461c2c` | 986 passed, 57 failed, 30 deselected |
+| Same environment, untouched `main` | 508 passed, 60 failed, 6 deselected |
+| Failing now but passing at `4461c2c` | **none** (identical set of 57) |
+| Failing now but passing on `main` | **none** (3 `main` failures are fixed) |
+| The 57 | production-catalog reference data; NOT RUN against real data; not security evidence |
+| Phase 0 harness | unchanged: all closed findings still FAIL to reproduce; only the leaked-id-regex note passes |
+| Live red team | NOT RUN |
+
+Existing tests changed, and why: six fakes/stubs accept the new keyword arguments; direct
+`execute_model_tool` calls pass the now-mandatory per-turn tool set; seven direct `call_ai` tests
+that used a bare closing word ("ready", "Haseeb", "Los Angeles", "let's do it") as the trigger now
+carry the assistant question that word answers, so they go through the real gate; the identity
+fill test uses fragrance messages because small talk no longer writes profile state; the Phase 3
+injected-profile test now asserts the injection is withheld from the model projection while the
+stored record is unchanged. No assertion about a Phase 1 to 3 boundary was relaxed.
+
+### Residual risk
+
+See `docs/AI_SECURITY_GATE.md` section 14. In short: layer 1 cannot see semantic attacks; a
+message that pairs one with a strong fragrance term is served as a fragrance turn under the Phase
+3 data boundary, the hardened prompt, per-turn tool permissions and output interception, none of
+which has been validated against a live model. Failing closed costs availability when the
+classifier is down (8 of 76 benign corpus messages with no context, 2 of 76 with a pending
+question, get the restate reply).

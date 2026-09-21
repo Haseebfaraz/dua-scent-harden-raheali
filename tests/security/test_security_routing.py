@@ -255,7 +255,7 @@ async def test_history_projection_survives_a_missing_classification_table(monkey
 async def test_instruction_like_profile_values_are_refused(db_session, field, value):
     conversation_id = f"pytest-poison-{uuid.uuid4().hex[:8]}"
     try:
-        result = await execute_model_tool(db_session, "save_customer_profile_field", json.dumps({"field": field, "value": value}), {"conversationId": conversation_id, "customerName": None, "customerEmail": None, "shopDomain": SHOP})
+        result = await execute_model_tool(db_session, "save_customer_profile_field", json.dumps({"field": field, "value": value}), {"conversationId": conversation_id, "customerName": None, "customerEmail": None, "shopDomain": SHOP}, allowed_tool_names={"save_customer_profile_field"})
         assert result["modelContent"].startswith("Error:") and "not saved" in result["modelContent"]
         profile = await get_customer_profile(db_session, conversation_id)
         assert not profile.get(field)
@@ -268,7 +268,7 @@ async def test_ordinary_profile_values_still_save(db_session):
     conversation_id = f"pytest-poison-{uuid.uuid4().hex[:8]}"
     try:
         for field, value in (("likes", ["base notes", "vanilla"]), ("occasion", "Developer conference"), ("preferredStyle", "fresh and clean")):
-            result = await execute_model_tool(db_session, "save_customer_profile_field", json.dumps({"field": field, "value": value}), {"conversationId": conversation_id, "customerName": None, "customerEmail": None, "shopDomain": SHOP})
+            result = await execute_model_tool(db_session, "save_customer_profile_field", json.dumps({"field": field, "value": value}), {"conversationId": conversation_id, "customerName": None, "customerEmail": None, "shopDomain": SHOP}, allowed_tool_names={"save_customer_profile_field"})
             assert not result["modelContent"].startswith("Error:"), result
         profile = await get_customer_profile(db_session, conversation_id)
         assert profile["occasion"] == "Developer conference"
@@ -303,20 +303,22 @@ async def test_attack_turn_never_triggers_generation_even_when_profile_is_ready(
 
 
 # ---------------------------------------------------------------------------
-# Classifier failure: degraded mode strips model tools, keeps the customer served
+# Classifier failure: FAIL CLOSED (Phase 4A). Phase 4 originally served this as a "degraded"
+# fragrance turn with no model tools; that still ran extraction and generation. The full
+# execution-boundary regressions live in test_gate_fail_closed.py.
 # ---------------------------------------------------------------------------
 
-async def test_degraded_gate_removes_model_tools_but_still_answers(db_session, monkeypatch):
-    conversation_id = f"pytest-degraded-{uuid.uuid4().hex[:8]}"
+async def test_unresolved_gate_never_reaches_any_model(db_session, monkeypatch):
+    conversation_id = f"pytest-unresolved-{uuid.uuid4().hex[:8]}"
     captured = capture_model_requests(monkeypatch)
     monkeypatch.setattr(settings, "security_gate_semantic_enabled", False)
     try:
         gate = await security_gate.classify_message("Write a poem about my perfume")
-        assert gate.degraded
+        assert gate.classification == "UNRESOLVED" and security_gate.permissions_for(gate) == security_gate.NO_PERMISSIONS
         result = await call_ai(db_session, [{"role": "user", "content": "Write a poem about my perfume"}], conversation_id, None, None, SHOP, gate=gate)
-        main = [c for c in captured if c["tool_choice"] is None]
-        assert main and main[0]["tools"] is None
-        assert result["replyText"]
+        assert captured == [] and result["sseEvents"] == []
+        _no_security_jargon(result["replyText"])
+        assert "poem" not in json.dumps(result["updatedMessages"])
     finally:
         await _cleanup(conversation_id)
 

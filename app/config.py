@@ -97,8 +97,10 @@ class Settings(BaseSettings):
     abuse_identity_hash_key: str = ""
     # ---- Phase 4 (security): scope / security gate ----
     # Layer 2 (structured semantic classifier) runs only when layer 1 is uncertain. Off means
-    # uncertain messages are handled in degraded mode (fragrance route, no model tools).
+    # uncertain messages are UNRESOLVED: a server-authored invitation to restate, nothing else runs.
     security_gate_semantic_enabled: bool = True
+    # Hard ceiling for the single classifier call; exceeding it leaves the turn UNRESOLVED.
+    security_gate_classifier_timeout_seconds: float = 8.0
     # Temporary per-conversation / per-IP throttle after repeated attack-classified messages.
     rate_limit_security_denied_per_conversation: str = "15/3600"
     rate_limit_security_denied_per_ip: str = "40/3600"

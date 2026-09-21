@@ -36,8 +36,21 @@ from app.ai.prompt import (
     get_known_profile_field_names,
     validate_customer_response,
 )
-from app.ai.scope_responses import attack_reply, off_topic_reply, scope_redirect_reply, service_meta_reply
-from app.ai.security_gate import GateDecision, classify_deterministically, strip_attack_sentences
+from app.ai.scope_responses import attack_reply, off_topic_reply, scope_redirect_reply, service_meta_reply, unresolved_reply
+from app.ai.security_gate import (
+    EXTRACTION_TOOL_NAMES,
+    OFF_TOPIC_MARKER,
+    UNRESOLVED_MARKER,
+    WITHHELD_MARKER,
+    GateDecision,
+    TurnPermissions,
+    classify_deterministically,
+    permissions_for,
+    project_unclassified_for_model,
+    screen_legacy_history_message,
+    strip_attack_sentences,
+    unresolved,
+)
 from app.ai.safe_views import (
     STATUS_TOOL_NAME,
     build_customer_safe_profile_view,
@@ -96,41 +109,66 @@ def set_conversation_cache(conversation_id: str, history: list[dict]) -> None:
     _cache_put(conversation_id, history)
 
 
+def project_stored_turn(content: str | None, label: str | None) -> str:
+    """Model-facing text for ONE stored customer turn given its persisted classification
+    (None = unclassified). Raw stored content is never modified; this is a projection only."""
+    if label is None:
+        return project_unclassified_for_model(content)
+    if label in ("FRAGRANCE", "SMALL_TALK", "SERVICE_META"):
+        # Defense in depth: a stored "safe" label never overrides a deterministic attack signal.
+        return WITHHELD_MARKER if screen_legacy_history_message(content or "") else (content or "")
+    if label == "OFF_TOPIC":
+        return OFF_TOPIC_MARKER
+    if label == "UNRESOLVED":
+        return UNRESOLVED_MARKER
+    if label == "MIXED_ATTACK_FRAGRANCE":
+        # Only a deterministic separation is trusted on reload. If layer 1 cannot strip anything
+        # (the attack was only visible to the classifier), the whole turn is withheld: the
+        # classifier's text is never stored and never replayed.
+        original = (content or "").strip()
+        stripped = strip_attack_sentences(original)
+        return stripped if stripped and stripped != original else WITHHELD_MARKER
+    return WITHHELD_MARKER  # ATTACK_EXTRACTION, INVALID, or any label this version does not know
+
+
 async def project_model_history(session: AsyncSession, db_messages: list) -> list[dict]:
-    """Phase 4 (F5, history poisoning): the model never sees stored customer turns raw.
+    """Phase 4 / 4A (F5, history poisoning): the model never sees stored customer turns raw.
 
-    * A persisted classification decides: ATTACK / OFF_TOPIC / INVALID turns are replaced by a
-      neutral marker, MIXED turns are replayed with the attack sentences deterministically
-      stripped, everything else verbatim.
-    * A customer turn with NO persisted classification (legacy history from before Phase 4, or
-      a failed classification write) is screened deterministically and withheld if it carries
-      any attack signal.
-    Stored messages are never modified; only the in-memory model projection changes.
+    Every customer turn goes through project_stored_turn. A turn with NO persisted classification
+    (pre-Phase-4 history, a database without migration 0003, a fallback write) is replayed only if
+    layer 1 confidently accepts it; otherwise it is withheld. So a semantically detected attack
+    whose classification could not be stored is never restored as safe on the next reload.
     """
-    from app.ai.security_gate import screen_legacy_history_message
-
     user_ids = [m.id for m in db_messages if m.role == "user"]
     try:
         classifications = await get_message_classifications(session, user_ids)
-    except Exception:  # noqa: BLE001 -- table missing / DB hiccup: screen everything deterministically
+    except Exception:  # noqa: BLE001 -- table missing / DB hiccup: everything is treated as unclassified
         logger.warning("SECURITY_HISTORY_CLASSIFICATIONS_UNAVAILABLE")
+        try:
+            await session.rollback()
+        except Exception:  # noqa: BLE001
+            pass
         classifications = {}
     history: list[dict] = []
     for m in db_messages:
         content = m.content
         if m.role == "user":
-            label = classifications.get(m.id)
-            if label is None:
-                if screen_legacy_history_message(content or ""):
-                    content = "[message withheld]"
-            elif label in ("ATTACK_EXTRACTION", "INVALID"):
-                content = "[message withheld]"
-            elif label == "OFF_TOPIC":
-                content = "[the customer asked about something outside fragrance and was redirected]"
-            elif label == "MIXED_ATTACK_FRAGRANCE":
-                content = strip_attack_sentences(content or "") or "[message withheld]"
+            content = project_stored_turn(content, classifications.get(m.id))
         history.append({"role": m.role, "content": content})
     return history
+
+
+def screen_prior_user_turns(history: list[dict]) -> list[dict]:
+    """For any caller of call_ai (the route passes an already projected history; a direct caller
+    may not): every customer turn BEFORE the latest one that carries a deterministic attack signal
+    is withheld from every model path in this turn (extraction, main, bridge, refinement)."""
+    latest = next((i for i in range(len(history) - 1, -1, -1) if history[i].get("role") == "user"), None)
+    out = []
+    for i, m in enumerate(history):
+        if m.get("role") == "user" and i != latest and isinstance(m.get("content"), str) and screen_legacy_history_message(m["content"]):
+            m = {**m, "content": WITHHELD_MARKER}
+        out.append(m)
+    return out
 
 
 _LEAKED_ID_PATTERN = re.compile(r"\bc[a-z0-9]{20,}\b", re.IGNORECASE)
@@ -143,7 +181,7 @@ def _customer_visible_history(history: list[dict], *, max_messages: int, max_cha
 
 
 async def _extract_and_persist_profile_facts(
-    session: AsyncSession, history: list[dict], conversation_id: str, tool_context: dict,
+    session: AsyncSession, history: list[dict], conversation_id: str, tool_context: dict, permissions: TurnPermissions,
 ) -> tuple[list[dict], list[dict]]:
     """One forced, structured extraction call up front instead of the model spending one full
     round trip per fact via repeated save_customer_profile_field calls -- verified live that a
@@ -161,6 +199,11 @@ async def _extract_and_persist_profile_facts(
     conversational memory that it already acted on this message. Purely additive: on any failure
     this just no-ops and the normal tool loop below still catches anything missed.
     """
+    # Phase 4A: extraction changes profile state and may call an external service (location /
+    # weather). It runs only on an explicitly permitted route.
+    permissions.require("extraction")
+    extraction_tools = EXTRACTION_TOOL_NAMES & permissions.allowed_tools
+
     latest_user_message = next((m for m in reversed(history) if m.get("role") == "user"), None)
     if not latest_user_message:
         return [], []
@@ -205,7 +248,7 @@ async def _extract_and_persist_profile_facts(
     async def _run(tool_name: str, tool_args: dict) -> None:
         call_id = f"extract_{uuid.uuid4().hex[:12]}"
         synthetic_calls.append({"id": call_id, "type": "function", "function": {"name": tool_name, "arguments": json.dumps(tool_args)}})
-        result = await execute_model_tool(session, tool_name, json.dumps(tool_args), tool_context)
+        result = await execute_model_tool(session, tool_name, json.dumps(tool_args), tool_context, allowed_tool_names=extraction_tools)
         synthetic_results.append({"role": "tool", "tool_call_id": call_id, "content": result["modelContent"]})
         if result.get("sseEvent"):
             sse_events.append(result["sseEvent"])
@@ -312,6 +355,8 @@ def deterministic_scope_reply(gate: GateDecision, message: str, conversation_id:
         return service_meta_reply(message)
     if gate.classification == "INVALID":
         return "Tell me a little about the scent you have in mind and we'll start from there."
+    if gate.classification == "UNRESOLVED":
+        return unresolved_reply(seed)
     return None
 
 
@@ -325,22 +370,27 @@ async def call_ai(
 
     from app.config import settings as _settings
 
-    # ---- Phase 4 scope/security gate (F4/F5) ----
-    # The route normally classifies before calling us (and answers ATTACK / OFF_TOPIC /
-    # SERVICE_META itself). A direct caller gets the deterministic layer here so that no path
-    # reaches the tool-enabled model without a gate decision. Fail safe: uncertain -> degraded.
+    # ---- Phase 4 / 4A scope/security gate (F4/F5) ----
+    # The route classifies before calling us and answers the no-permission routes itself. A direct
+    # caller gets layer 1 only, and an uncertain message is UNRESOLVED (never fragrance by default).
+    # Whatever the source of the decision, ONE permissions object decides what this turn may do.
+    history = screen_prior_user_turns(history)
     latest_user_index = next((i for i in range(len(history) - 1, -1, -1) if history[i].get("role") == "user"), None)
     latest_user_text = (history[latest_user_index].get("content") or "") if latest_user_index is not None else ""
     if gate is None:
-        gate = classify_deterministically(latest_user_text) or GateDecision("FRAGRANCE", "CLASSIFIER_UNAVAILABLE", None, degraded=True)
-        if gate.is_deterministic_reply:
-            reply = deterministic_scope_reply(gate, latest_user_text, conversation_id, len(history))
-            logger.info("SECURITY_GATE_DECISION %s", json.dumps({"conversationId": conversation_id, "classification": gate.classification, "reasonCode": gate.reason_code, "version": gate.version, "route": "deterministic_reply", "caller": "call_ai"}))
-            projected = [*history[:latest_user_index], {"role": "user", "content": gate.model_history_content(latest_user_text)}] if latest_user_index is not None else list(history)
-            return {"replyText": reply, "sseEvents": [], "updatedMessages": [*projected, {"role": "assistant", "content": reply}], "gate": gate}
-        if gate.classification == "MIXED_ATTACK_FRAGRANCE" and latest_user_index is not None:
-            # The raw mixed message never enters model context: only the fragrance remainder.
-            history = [*history[:latest_user_index], {"role": "user", "content": gate.safe_message}, *history[latest_user_index + 1:]]
+        previous_assistant = next((m.get("content") for m in reversed(history[:latest_user_index or 0]) if m.get("role") == "assistant" and isinstance(m.get("content"), str)), None)
+        gate = classify_deterministically(latest_user_text, pending_question=isinstance(previous_assistant, str) and "?" in previous_assistant[-400:]) or unresolved("CLASSIFIER_DISABLED")
+    permissions = permissions_for(gate)
+    if not permissions.model_completion:
+        reply = deterministic_scope_reply(gate, latest_user_text, conversation_id, len(history)) or unresolved_reply(f"{conversation_id}:{len(history)}")
+        logger.info("SECURITY_GATE_DECISION %s", json.dumps({"conversationId": conversation_id, "classification": gate.classification, "reasonCode": gate.reason_code, "version": gate.version, "route": "deterministic_reply", "caller": "call_ai"}))
+        projected = list(history)
+        if latest_user_index is not None:
+            projected[latest_user_index] = {"role": "user", "content": gate.model_history_content(latest_user_text)}
+        return {"replyText": reply, "sseEvents": [], "updatedMessages": [*projected, {"role": "assistant", "content": reply}], "gate": gate}
+    if gate.classification == "MIXED_ATTACK_FRAGRANCE" and latest_user_index is not None:
+        # The raw mixed message never enters model context: only the fragrance remainder.
+        history = [*history[:latest_user_index], {"role": "user", "content": gate.safe_message}, *history[latest_user_index + 1:]]
 
     profile_for_identity = await get_customer_profile(session, conversation_id)
     # Phase 2 (F8): known_customer_* are SELF-REPORTED (request body / adapter assertion). They
@@ -371,27 +421,27 @@ async def call_ai(
     # fragrance tools (verify location / resolve season / refine) are not even offered.
     conversation_mode = determine_conversation_mode(history, profile_for_identity)
     tools_for_turn = GENERAL_CONVERSATION_TOOLS if conversation_mode == "GENERAL_CONVERSATION" else FRAGRANCE_AGENT_TOOLS
-    # Phase 4 tool gating by classification (server decision, not the model's):
-    #   degraded (classifier failed / uncertain) -> NO model tools; small talk -> profile save only.
-    if gate.degraded:
-        tools_for_turn = None
-    elif gate.classification == "SMALL_TALK":
-        tools_for_turn = GENERAL_CONVERSATION_TOOLS
+    # Phase 4A: what is OFFERED is the mode's tools intersected with this turn's permissions, and
+    # the same permission set is enforced again at dispatch (the offer is not the boundary).
+    tools_for_turn = [t for t in tools_for_turn if permissions.tool_allowed(t["function"]["name"])] or None
+    offered_tool_names = frozenset(t["function"]["name"] for t in (tools_for_turn or []))
     logger.info("SECURITY_GATE_DECISION %s", json.dumps({
         "conversationId": conversation_id, "classification": gate.classification, "reasonCode": gate.reason_code,
-        "version": gate.version, "degraded": gate.degraded, "semanticUsed": gate.semantic_used,
-        "route": "model", "modelTools": [t["function"]["name"] for t in (tools_for_turn or [])],
+        "version": gate.version, "semanticUsed": gate.semantic_used, "route": "model",
+        "extraction": permissions.extraction, "generation": permissions.generation, "modelTools": sorted(offered_tool_names),
     }))
 
     # Batch-extract before building the prompt/context, so the customer context already reflects
     # whatever this message just supplied.
     sse_events: list[dict] = []
     extraction_synthetic_messages: list[dict] = []
-    if conversation_mode == "FRAGRANCE_DISCOVERY":
-        extracted_sse_events, extraction_synthetic_messages = await _extract_and_persist_profile_facts(session, history, conversation_id, tool_context)
+    if conversation_mode == "FRAGRANCE_DISCOVERY" and permissions.extraction:
+        extracted_sse_events, extraction_synthetic_messages = await _extract_and_persist_profile_facts(session, history, conversation_id, tool_context, permissions)
         sse_events.extend(extracted_sse_events)
 
-    system_prompt = await build_system_prompt(session, history, conversation_id, known_customer_email, known_customer_name)
+    # Without the extraction permission the prompt builder persists nothing (no accept/decline
+    # flags, no identity fill): a small-talk turn cannot change profile state.
+    system_prompt = await build_system_prompt(session, history, conversation_id, known_customer_email, known_customer_name, persist_profile=permissions.extraction)
     profile_after_extraction = await get_customer_profile(session, conversation_id)
     tool_context["customerName"] = profile_after_extraction.get("name") or known_customer_name
     tool_context["customerEmail"] = profile_after_extraction.get("email") or confirmed_customer_email
@@ -414,10 +464,13 @@ async def call_ai(
     async def _maybe_generate() -> str | None:
         """Server-controlled recommendation trigger. Returns the bridge text when a fragrance was
         built (the turn is complete), None otherwise."""
+        if not permissions.generation:
+            return None  # a complete profile never bypasses the gate (small talk, unresolved, denied)
         profile_now = await get_customer_profile(session, conversation_id)
         mode_now = determine_conversation_mode(history, profile_now)
         if not should_generate(conversation_id, profile_now, mode_now):
             return None
+        permissions.require("generation")
         outcome = await run_private_recommendation(session, conversation_id, tool_context)
         called_tool_names.append("server:generate")
         if outcome.ready:
@@ -465,7 +518,12 @@ async def call_ai(
                 tool_name = tool_call["function"]["name"]
                 called_tool_names.append(tool_name)
                 # Phase 3: the model can only reach the least-privilege dispatcher.
-                result = await execute_model_tool(session, tool_name, tool_call["function"]["arguments"], tool_context)
+                # Phase 4A: and only with the tools OFFERED on this turn. A tool call the model
+                # invents (nothing offered, or a globally valid tool this turn did not permit) is
+                # refused at the dispatcher and logged; it never executes.
+                if tool_name not in offered_tool_names:
+                    logger.warning("SECURITY_TOOL_CALL_REFUSED %s", json.dumps({"conversationId": conversation_id, "tool": str(tool_name)[:60], "classification": gate.classification}))
+                result = await execute_model_tool(session, tool_name, tool_call["function"]["arguments"], tool_context, allowed_tool_names=offered_tool_names)
                 if result.get("sseEvent"):
                     sse_events.append(result["sseEvent"])
 

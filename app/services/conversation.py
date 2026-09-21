@@ -52,6 +52,22 @@ async def get_conversation_history(session: AsyncSession, conversation_id: str) 
     )
 
 
+async def save_user_message_with_classification(session: AsyncSession, conversation_id: str, content: str, *, classification: str, reason_code: str, version: str) -> Message:
+    """Phase 4A: the raw customer message and its classification are written in ONE transaction,
+    so a stored customer turn can never exist without its classification because the second write
+    failed. On any error nothing is written and the exception propagates to the caller."""
+    await create_or_update_conversation(session, conversation_id)
+    message = Message(id=new_id(), conversationId=conversation_id, role="user", content=content, createdAt=utcnow())
+    session.add(message)
+    session.add(MessageSecurityClassification(id=new_id(), messageId=message.id, classification=classification, reasonCode=reason_code, classifierVersion=version, createdAt=utcnow()))
+    try:
+        await session.commit()
+    except Exception:
+        await session.rollback()
+        raise
+    return message
+
+
 async def save_message_classification(session: AsyncSession, message_id: str, *, classification: str, reason_code: str, version: str) -> None:
     """Phase 4: persist the scope/security classification of a customer message (operational
     codes only). Failures are logged by the caller; the chat never depends on this write."""

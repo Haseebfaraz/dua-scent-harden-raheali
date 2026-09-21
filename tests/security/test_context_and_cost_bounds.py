@@ -68,7 +68,7 @@ def stubbed_flow(monkeypatch):
     async def _save_field(session, cid, field, value):
         return await _profile(session, cid)
 
-    async def _build_prompt(session, history, cid, email, name):
+    async def _build_prompt(session, history, cid, email, name, **kw):
         return "SYSTEM PROMPT"
 
     monkeypatch.setattr(conversation_flow, "get_customer_profile", _profile)
@@ -121,7 +121,7 @@ async def test_tool_loop_is_bounded_by_settings(stubbed_flow, monkeypatch):
             {"id": f"c{i}", "type": "function", "function": {"name": "resolve_season_preference", "arguments": json.dumps({"choice": "keep_style"})}} for i in range(5)
         ]}}]}
 
-    async def _execute(session, tool_name, args, context):
+    async def _execute(session, tool_name, args, context, **kw):
         executed.append(tool_name)
         return {"modelContent": "resolved", "sseEvent": None}
 

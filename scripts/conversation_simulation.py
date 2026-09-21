@@ -36,6 +36,7 @@ import httpx
 from sqlalchemy import delete, select
 
 from app.ai.conversation_flow import call_ai
+from app.ai.security_gate import classify_message
 from app.config import settings
 from app.db.models import CustomerProfileState, FragranceRecommendation
 from app.db.session import SessionLocal
@@ -254,7 +255,12 @@ async def run_simulation(
             agent_history.append({"role": "user", "content": customer_message})
             visible_transcript.append({"role": "user", "content": customer_message})
 
-            result = await call_ai(session, agent_history, conversation_id, None, None, SHOP_DOMAIN)
+            # Same gate the chat route runs (layer 1, then the live classifier when uncertain), with
+            # the previous assistant reply as the only context. Without this a direct call_ai gets
+            # layer 1 only and an uncertain message is answered with the restate invitation.
+            last_assistant = next((m["content"] for m in reversed(agent_history[:-1]) if m.get("role") == "assistant" and isinstance(m.get("content"), str)), None)
+            gate = await classify_message(customer_message, last_assistant_message=last_assistant, conversation_has_fragrance_context=len(agent_history) > 1)
+            result = await call_ai(session, agent_history, conversation_id, None, None, SHOP_DOMAIN, gate=gate)
             reply_text = result.get("replyText") or ""
             events = result.get("sseEvents") or []
             sse_events_log.extend(events)

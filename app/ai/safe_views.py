@@ -101,8 +101,27 @@ class CustomerSafeProfileView(BaseModel):
     stillNeeded: list[str] = Field(default_factory=list)
 
 
+def _without_instruction_like(profile: dict[str, Any]) -> dict[str, Any]:
+    """Phase 4A (defense in depth): values stored BEFORE the write-time guard existed may read
+    like instructions to the assistant. They are withheld from the MODEL projection only; the
+    stored profile is untouched. Legitimate fragrance terms and unusual names pass
+    (see security_gate.looks_like_instruction). This does not claim to catch every semantic
+    injection; customer data also stays outside trusted instructions (N5)."""
+    from app.ai.security_gate import looks_like_instruction
+
+    cleaned: dict[str, Any] = {}
+    for key, value in profile.items():
+        if isinstance(value, str):
+            cleaned[key] = None if looks_like_instruction(value) else value
+        elif isinstance(value, list):
+            cleaned[key] = [v for v in value if not (isinstance(v, str) and looks_like_instruction(v))]
+        else:
+            cleaned[key] = value
+    return cleaned
+
+
 def build_customer_safe_profile_view(profile: dict[str, Any]) -> CustomerSafeProfileView:
-    profile = profile or {}
+    profile = _without_instruction_like(profile or {})
     weather = profile.get("currentWeather") or {}
     return CustomerSafeProfileView(
         name=_clean_text(profile.get("name"), 100),

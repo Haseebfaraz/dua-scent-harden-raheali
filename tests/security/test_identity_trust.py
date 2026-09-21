@@ -137,8 +137,8 @@ async def test_self_reported_identity_fills_empty_fields_but_never_overwrites(fa
         data = client.post("/chat/session", json={}).json()
         cid, token = data["conversationId"], data["conversationToken"]
         try:
-            client.post("/chat", json={"conversation_id": cid, "message": "hi", "customer_name": "Jane", "customer_email": "jane@example.test"}, headers={CONVERSATION_TOKEN_HEADER: token})
-            client.post("/chat", json={"conversation_id": cid, "message": "hi again", "customer_name": "Mallory", "customer_email": "mallory@attacker.example"}, headers={CONVERSATION_TOKEN_HEADER: token})
+            client.post("/chat", json={"conversation_id": cid, "message": "I love vanilla and sandalwood scents", "customer_name": "Jane", "customer_email": "jane@example.test"}, headers={CONVERSATION_TOKEN_HEADER: token})
+            client.post("/chat", json={"conversation_id": cid, "message": "something warm for winter evenings", "customer_name": "Mallory", "customer_email": "mallory@attacker.example"}, headers={CONVERSATION_TOKEN_HEADER: token})
             async with SessionLocal() as session:
                 row = await session.scalar(select(Conversation).where(Conversation.id == cid))
                 assert (row.customerName, row.customerEmail) == ("Jane", "jane@example.test")

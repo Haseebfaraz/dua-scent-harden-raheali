@@ -224,7 +224,7 @@ def test_F3_analyze_tool_result_hands_raw_candidates_to_the_model(monkeypatch):
     monkeypatch.setattr(tool_executor, "analyze_customer_product_candidates", _analyze)
 
     import asyncio
-    result = asyncio.run(tool_executor.execute_model_tool(None, "analyze_customer_product_candidates", "{}", {"conversationId": "c1", "customerName": "Jane", "customerEmail": "j@x.y", "shopDomain": "s.myshopify.com"}))
+    result = asyncio.run(tool_executor.execute_model_tool(None, "analyze_customer_product_candidates", "{}", {"conversationId": "c1", "customerName": "Jane", "customerEmail": "j@x.y", "shopDomain": "s.myshopify.com"}, allowed_tool_names=tool_executor.MODEL_CALLABLE_TOOL_NAMES))
     model_text = result["modelContent"]
     for leaked in ("Midnight Saffron Reserve", "relevanceScore", "sameCityOrders", "distinctSimilarCustomers", "repeatPurchaseCustomers", "Oud Collection", "evidenceLevel"):
         assert leaked in model_text, leaked
@@ -241,7 +241,7 @@ def test_F3b_catalog_lookup_tool_exposes_handle_and_inspiration_brand_to_the_mod
 
     monkeypatch.setattr(tool_executor, "get_product_notes_and_combination_status", _lookup)
     import asyncio
-    result = asyncio.run(tool_executor.execute_model_tool(None, "get_product_notes_and_combination_status", '{"productTitle": "anything the customer typed"}', {"conversationId": "c1"}))
+    result = asyncio.run(tool_executor.execute_model_tool(None, "get_product_notes_and_combination_status", '{"productTitle": "anything the customer typed"}', {"conversationId": "c1"}, allowed_tool_names=tool_executor.MODEL_CALLABLE_TOOL_NAMES))
     assert "midnight-saffron-reserve" in result["modelContent"]
     assert "Famous Designer House" in result["modelContent"]
 
@@ -252,7 +252,7 @@ def test_F3c_get_customer_profile_tool_returns_pii_and_recommendation_ids_to_mod
 
     monkeypatch.setattr(tool_executor, "get_customer_profile", _profile)
     import asyncio
-    result = asyncio.run(tool_executor.execute_model_tool(None, "get_customer_profile", "{}", {"conversationId": "c1"}))
+    result = asyncio.run(tool_executor.execute_model_tool(None, "get_customer_profile", "{}", {"conversationId": "c1"}, allowed_tool_names=tool_executor.MODEL_CALLABLE_TOOL_NAMES))
     assert "jane@example.com" in result["modelContent"]
     assert "selectedRecommendationId" in result["modelContent"]
 

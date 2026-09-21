@@ -37,7 +37,8 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.ai.conversation_flow import call_ai, deterministic_scope_reply, get_conversation, set_conversation_cache
-from app.ai.security_gate import classify_message
+from app.ai.scope_responses import unresolved_reply
+from app.ai.security_gate import classify_message, permissions_for
 from app.api.client_identity import client_ip
 from app.api.request_limits import InvalidChatInput, validate_chat_message, validate_conversation_id, validate_token_shape
 from app.config import settings
@@ -45,7 +46,7 @@ from app.db.models import Conversation
 from app.db.session import get_session
 from app.schemas.chat import ChatRequest, ChatSessionRequest
 from app.services.build_capability import preview_url_for_logging
-from app.services.conversation import create_or_update_conversation, save_message, save_message_classification
+from app.services.conversation import create_or_update_conversation, save_message, save_user_message_with_classification
 from app.services.conversation_capability import (
     CONVERSATION_TOKEN_HEADER,
     ConversationNotAuthorized,
@@ -311,11 +312,19 @@ async def _run_chat_turn(
     # Layer 1 is deterministic; layer 2 is at most one low-privilege structured classifier call
     # with no history, no tools and no private data. The classification is validated against a
     # fixed enum and the SERVER routes on it below; it never selects tools or actions itself.
-    gate = await classify_message(user_message)
+    # Minimal customer-safe context only: the previous assistant reply (customer-visible text),
+    # used to tell a short answer to a pending question from generic small talk. It is read from
+    # the already-projected model history; no profile, ids, capabilities or private data.
+    prior = (await get_conversation(session, conversation_id))["history"]
+    last_assistant_message = next((m.get("content") for m in reversed(prior) if m.get("role") == "assistant" and isinstance(m.get("content"), str)), None)
+    gate = await classify_message(user_message, last_assistant_message=last_assistant_message, conversation_has_fragrance_context=bool(prior))
+    # Phase 4A: ONE server-owned permissions decision for the whole turn. UNRESOLVED (classifier
+    # disabled / unavailable / timed out / malformed) permits nothing: fail closed.
+    permissions = permissions_for(gate)
     logger.info("SECURITY_GATE_DECISION %s", json.dumps({
         "conversationId": conversation_id, "classification": gate.classification, "reasonCode": gate.reason_code,
-        "version": gate.version, "degraded": gate.degraded, "semanticUsed": gate.semantic_used,
-        "route": "deterministic_reply" if gate.is_deterministic_reply else "model", "public": public,
+        "version": gate.version, "semanticUsed": gate.semantic_used,
+        "route": "model" if permissions.model_completion else "deterministic_reply", "public": public,
     }))
     if gate.classification == "ATTACK_EXTRACTION":
         # Repeated attacks throttle the conversation and the source address for a while. Counting
@@ -345,14 +354,18 @@ async def _run_chat_turn(
                 # still persisted below, alongside its classification.
                 history.append({"role": "user", "content": gate.model_history_content(user_message)})
 
-                deterministic_reply = deterministic_scope_reply(gate, user_message, conversation_id, len(history))
+                deterministic_reply = None
+                if not permissions.model_completion:
+                    deterministic_reply = deterministic_scope_reply(gate, user_message, conversation_id, len(history)) or unresolved_reply(f"{conversation_id}:{len(history)}")
                 legacy_short_circuit = None
-                if deterministic_reply is None:
+                if permissions.legacy_recovery:
+                    # Legacy recovery confirms a build and mints a capability: design routes only.
                     legacy_short_circuit = await resolve_legacy_preview_short_circuit(session, conversation_id, user_message, identity.name, identity.email, shop_domain)
 
                 if deterministic_reply is not None:
-                    # ATTACK / OFF_TOPIC / SERVICE_META / INVALID: no model, no tools, no profile
-                    # writes, no generation. Server-authored redirect only.
+                    # ATTACK / OFF_TOPIC / SERVICE_META / INVALID / UNRESOLVED: no model, no
+                    # extraction, no tools, no external calls, no legacy recovery, no profile
+                    # writes, no generation. Server-authored reply only.
                     reply_text = deterministic_reply
                     sse_events = []
                     updated_messages = [*history, {"role": "assistant", "content": reply_text}]
@@ -374,18 +387,19 @@ async def _run_chat_turn(
 
                 try:
                     await create_or_update_conversation(session, conversation_id, identity.email, identity.name)
-                    stored_user_message = await save_message(session, conversation_id, "user", user_message)
+                    try:
+                        # Raw message + classification in ONE transaction (Phase 4A).
+                        await save_user_message_with_classification(session, conversation_id, user_message, classification=gate.classification, reason_code=gate.reason_code, version=gate.version)
+                    except Exception as err:
+                        # e.g. migration 0003 not applied. The raw turn is still stored for the
+                        # customer's history; with no classification it is replayed to a model on
+                        # reload only if layer 1 confidently accepts it (project_stored_turn), so
+                        # a semantically detected attack is never restored as safe.
+                        logger.error("SECURITY_CLASSIFICATION_PERSIST_FAILED %s", type(err).__name__)
+                        await save_message(session, conversation_id, "user", user_message)
                     await save_message(session, conversation_id, "assistant", reply_text)
                 except Exception as err:
                     logger.error("Failed to persist chat log: %s", type(err).__name__)
-                    stored_user_message = None
-                if stored_user_message is not None:
-                    try:
-                        await save_message_classification(session, stored_user_message.id, classification=gate.classification, reason_code=gate.reason_code, version=gate.version)
-                    except Exception as err:
-                        # Without a stored classification the turn is screened deterministically
-                        # on the next load (see project_model_history), so this is safe to lose.
-                        logger.error("SECURITY_CLASSIFICATION_PERSIST_FAILED %s", type(err).__name__)
 
                 # preview_ready makes the widget navigate away the instant it's parsed, so it must
                 # never reach the client before the reasoning bridge text. Every other event keeps

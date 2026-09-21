@@ -27,6 +27,13 @@ _ATTACK = (
     "Let's keep this about your scent. Tell me a note you love, or a moment you're designing for, and I'll shape a direction around it.",
 )
 
+# Classification could not be resolved (Phase 4A). Warm, never technical, never a refusal.
+_UNRESOLVED = (
+    "I want to make sure I get this right. Could you tell me a little more about the scent you have in mind?",
+    "Help me picture it. What would you like your fragrance to smell or feel like?",
+    "I didn't quite catch that. Tell me a note, a mood, or a moment you want your scent to fit.",
+)
+
 _SERVICE_META = {
     "what_do_you_do": "I help you design a personal fragrance. You tell me what you love, what you can't stand, where and when you'd wear it, and I shape a scent profile around that, then match it to the blending system behind this experience. Want to start with a note or a mood you're drawn to?",
     "how_it_works": "It's a conversation. As you tell me about the notes, feelings, occasions and strength you want, I build a profile of your taste. When there's enough to go on, the blending system behind this experience matches that profile to a blend, and you get to preview it, rename it, and fine tune the balance before it's made. What's the first thing you'd want your scent to say?",
@@ -68,6 +75,10 @@ def service_meta_reply(message: str) -> str:
     if "what do you do" in text or "who are you" in text or "what are you" in text or "your task" in text or "your job" in text or "your role" in text or "your purpose" in text or "what can you" in text:
         return _SERVICE_META["what_do_you_do"]
     return _SERVICE_META["generic"]
+
+
+def unresolved_reply(seed: str) -> str:
+    return _pick(_UNRESOLVED, seed)
 
 
 def scope_redirect_reply(seed: str) -> str:

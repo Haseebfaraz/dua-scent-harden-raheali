@@ -754,7 +754,7 @@ async def test_name_revealed_and_generation_attempted_in_the_same_turn_succeeds(
             return {"choices": [{"finish_reason": "stop", "message": {"content": "Here's what I put together for you."}}]}
 
         monkeypatch.setattr(conversation_flow, "call_openai_once", _fake_call_openai_once)
-        history = [{"role": "user", "content": "Haseeb"}]
+        history = [{"role": "assistant", "content": "What should I call you?"}, {"role": "user", "content": "Haseeb"}]
         result = await call_ai(db_session, history, conversation_id, known_email, None, SHOP_DOMAIN)
 
         assert "sign" not in result["replyText"].lower()
@@ -795,7 +795,7 @@ async def test_name_only_without_email_still_requires_identity(db_session, monke
             return {"choices": [{"finish_reason": "stop", "message": {"content": "Here's what I put together for you."}}]}
 
         monkeypatch.setattr(conversation_flow, "call_openai_once", _fake_call_openai_once)
-        history = [{"role": "user", "content": "Haseeb"}]
+        history = [{"role": "assistant", "content": "What should I call you?"}, {"role": "user", "content": "Haseeb"}]
         result = await call_ai(db_session, history, conversation_id, None, None, SHOP_DOMAIN)
 
         # Phase 3: the server pipeline ran (profile complete) but the identity gate refused;
@@ -824,7 +824,7 @@ async def test_known_name_and_known_email_generates_normally(db_session, monkeyp
             return {"choices": [{"finish_reason": "stop", "message": {"content": "Here's what I put together for you."}}]}
 
         monkeypatch.setattr(conversation_flow, "call_openai_once", _fake_call_openai_once)
-        history = [{"role": "user", "content": "let's do it"}]
+        history = [{"role": "assistant", "content": "Shall I put the blend together for you?"}, {"role": "user", "content": "let's do it"}]
         result = await call_ai(db_session, history, conversation_id, "haseeb@example.test", "Haseeb", SHOP_DOMAIN)
 
         assert "sign" not in result["replyText"].lower()
@@ -863,7 +863,7 @@ async def test_location_verified_earlier_in_the_same_loop_is_used_by_generation(
             return {"choices": [{"finish_reason": "stop", "message": {"content": "Here's what I put together for you."}}]}
 
         monkeypatch.setattr(conversation_flow, "call_openai_once", _fake_call_openai_once)
-        history = [{"role": "user", "content": "Los Angeles"}]
+        history = [{"role": "assistant", "content": "Which city are you in?"}, {"role": "user", "content": "Los Angeles"}]
         result = await call_ai(db_session, history, conversation_id, "haseeb@example.test", "Haseeb", SHOP_DOMAIN)
 
         assert "not enough signal" not in result["replyText"].lower()

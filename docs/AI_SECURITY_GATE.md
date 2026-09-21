@@ -1,8 +1,16 @@
 # AI security gate (Phase 4): fragrance scope, prompt-injection defense, safe routing
 
-Findings closed: **F4** (general-assistant behaviour permitted by the prompt) and **F5**
-(prompt/tool extraction and history/profile poisoning). Phase 3's data boundary
+Findings addressed: **F4** (general-assistant behaviour permitted by the prompt) and **F5**
+(prompt/tool extraction and history/profile poisoning). Both are PARTIAL until a live-model
+validation has been run; see `docs/SECURITY_AUDIT.md` section 16 for the reasoning. Phase 3's data boundary
 (`docs/AI_DATA_BOUNDARY.md`) is unchanged and remains the last line of defense behind this gate.
+
+> **Phase 4A correction (2026-09-21).** As first shipped in Phase 4 (`4461c2c`), a classifier
+> failure produced a "degraded FRAGRANCE" turn: the main model lost its tools, but profile
+> extraction still ran and the server pipeline could still generate, persist and confirm a build.
+> That was fail-open. It is corrected: an unresolved decision now permits nothing. Sections 2, 4,
+> 5, 6, 7 and 14 below describe the corrected behaviour; the history is in
+> `docs/SECURITY_AUDIT.md` section 16.
 
 ## 1. The rule
 
@@ -27,17 +35,19 @@ Nothing in step 5 sees the message before step 2 has run.
 | Classification | Meaning | Route |
 |---|---|---|
 | `FRAGRANCE` | anything about scent, notes, preferences, occasions, strength, naming, changes to the design, or the customer describing themselves in a way that feeds the design | model pipeline, normal tools |
-| `SMALL_TALK` | greetings, thanks, short pleasantries | model pipeline, profile-save tool only |
+| `SMALL_TALK` | greetings, thanks, short pleasantries, short signal-free messages with no pending question | conversational model reply only: no tools, no extraction, no generation |
 | `SERVICE_META` | how the service works, is it AI, what happens next, can it change | server reply (no model) |
 | `OFF_TOPIC` | a substantive non-fragrance request (code, homework, politics, medical, legal, finance, trivia, writing tasks) | server reply (no model) |
 | `ATTACK_EXTRACTION` | prompt / tool / private-data extraction, role or authority override, encoded payload | server reply (no model), throttle counter |
 | `MIXED_ATTACK_FRAGRANCE` | genuine fragrance content plus an attack | model pipeline receives ONLY the fragrance sentences |
 | `INVALID` | empty / meaningless | server reply |
+| `UNRESOLVED` | **server-only.** Layer 1 was uncertain and layer 2 was disabled, unavailable, timed out, malformed, or could not separate a mixed message. The classifier can never select this label. | server reply inviting the customer to restate; nothing else runs |
 
 Reason codes (operational, never free text): `NONE`, `PROMPT_EXTRACTION`, `TOOL_EXTRACTION`,
 `ROLE_OVERRIDE`, `AUTHORITY_CLAIM`, `ENCODED_PAYLOAD`, `PRIVATE_DATA_EXTRACTION`,
-`OFF_TOPIC_CODE`, `OFF_TOPIC_GENERAL`, `SMALL_TALK`, `SERVICE_META`, `CLASSIFIER_UNAVAILABLE`,
-`CLASSIFIER_INVALID`, `SEMANTIC`.
+`OFF_TOPIC_CODE`, `OFF_TOPIC_GENERAL`, `SMALL_TALK`, `SERVICE_META`, `SEMANTIC`, and the server-only
+`CONTEXTUAL_ANSWER`, `CLASSIFIER_DISABLED`, `CLASSIFIER_UNAVAILABLE`, `CLASSIFIER_TIMEOUT`,
+`CLASSIFIER_INVALID`, `MIXED_UNSEPARABLE`.
 
 ## 3. Layer 1: deterministic normalization + detection
 
@@ -58,55 +68,128 @@ explicitly benign and never an attack.
 Letter-spaced or zero-width-split payloads are additionally matched in compact form (all
 non-alphanumerics removed) with a short pattern set that ordinary text never triggers.
 
+**Confident acceptance is narrow (Phase 4A).** The fragrance lexicon holds strong vocabulary only
+(scent words, materials, families, descriptors, occasions/seasons, explicit refinement and naming
+requests). Generic words such as like, love, more, name, work, strong, create, recommend were
+removed: a message carrying only those is *uncertain*, not "probably fragrance". `None` from
+`classify_deterministically` is never treated as acceptance by any caller.
+
+**Pleasantries vs contextual answers.** See section 5a.
+
 Mixed messages: `strip_attack_sentences` keeps only sentences with no attack signal. The result
 is composed of the customer's original sentences, never decoded content, never a rewrite.
 
 ## 4. Layer 2: structured semantic classifier (optional, low privilege)
 
-Used only when layer 1 is uncertain, at most once per turn, no retries
-(`classify_semantically`). The request contains a static instruction, the current message
-(truncated) and one boolean (`conversationHasFragranceContext`). No history, no profile, no tool
-results, no private data, no tools other than the forced `classify_customer_message` function.
-The answer is validated with a strict pydantic model (`extra="forbid"`, enum fields). A
-`MIXED_ATTACK_FRAGRANCE` rewrite from the classifier is accepted only if it is a verbatim
-substring of the customer's own words and carries no attack signal; otherwise the deterministic
-stripper is used.
+Used only when layer 1 is uncertain, at most once per turn, no retries, hard timeout
+`SECURITY_GATE_CLASSIFIER_TIMEOUT_SECONDS` (default 8 s). The request contains a static
+instruction, the current message (truncated), one boolean, and at most the last 300 characters of
+the previous assistant reply (customer-visible text, used only to judge whether the customer is
+answering a fragrance question). No history, no profile, no ids, no capabilities, no tool results,
+no private data, no tools other than the forced `classify_customer_message` function. The answer
+is validated with a strict pydantic model (`extra="forbid"`, closed enums that exclude every
+server-only label and reason code; exactly one call to the right function).
 
-Failure policy (unavailable, timeout, exception, wrong tool, invalid enum, extra fields, bad
-JSON): **degraded** decision = `FRAGRANCE` with `degraded=True`. A degraded turn is served
-without any model tools (extraction still runs through the server-validated dispatcher and
-readiness-driven generation is unaffected). `SECURITY_GATE_SEMANTIC_ENABLED=false` makes every
-uncertain message degraded.
+The classifier never authors model context. For `MIXED_ATTACK_FRAGRANCE` its `fragrance_content`
+is accepted only if it is a strictly shorter verbatim substring of the customer's own words,
+carries no attack signal and carries a deterministic fragrance signal; otherwise the
+deterministic stripper is tried, and if that cannot separate anything the turn is `UNRESOLVED`.
 
-## 5. Server routing
+**Failure policy: fail closed.** Disabled, not configured, unavailable, exception, timeout, wrong
+function, more than one call, malformed JSON, unknown enum, server-only label, extra fields,
+classifier answering `INVALID`, or an unseparable mixed message all yield `UNRESOLVED`. An
+unresolved turn:
 
-* `ATTACK_EXTRACTION`, `OFF_TOPIC`, `SERVICE_META`, `INVALID`: a server-authored reply from
-  `app/ai/scope_responses.py`. No model call, no tool, no profile write, no generation, no
-  SSE event other than the reply. The wording is that of a specialised fragrance designer staying
-  in its lane; it never mentions prompts, instructions, tools, rules, attacks, classification
-  or security, never confirms or denies what exists, and always hands back to fragrance.
-  Variation is picked deterministically from conversation id and turn number.
-* `SMALL_TALK`: model pipeline with only `save_customer_profile_field` offered.
-* `FRAGRANCE`: the Phase 3 pipeline unchanged.
-* `MIXED_ATTACK_FRAGRANCE`: the Phase 3 pipeline, but the model-facing history holds only the
-  fragrance remainder; the raw message never enters any model context.
-* Degraded: fragrance pipeline with `tools=None`.
+* does not run profile extraction, does not call the conversation model, does not dispatch a tool,
+* does not verify a location or call any external service, does not run legacy preview recovery,
+* does not generate, refine, persist, confirm or mint a capability for a recommendation,
+* does not mutate the fragrance profile (the prompt builder's accept/decline/identity writes are
+  skipped too),
+* returns a short warm invitation to restate (`scope_responses.unresolved_reply`), with no
+  technical or security wording,
+* is stored raw with classification `UNRESOLVED` and replaced by a neutral marker in every
+  model-facing history.
 
-`call_ai` also computes a deterministic-only decision when called without one, so no direct
-caller can reach the tool-enabled model without a gate.
+A confidently accepted deterministic fragrance request never touches the classifier, so an outage
+degrades only the uncertain remainder.
 
-## 6. History poisoning
+## 5. Server routing and execution permissions
 
-* The raw customer message is stored untouched (audit record). Its classification is stored in
-  the additive table `MessageSecurityClassification` (migration 0003: id, messageId, enum,
-  reason code, classifier version, timestamp; never chain of thought, never the message).
-* The in-memory model history receives `GateDecision.model_history_content`: attacks and invalid
-  turns become `[message withheld]`, off-topic turns a neutral marker, mixed turns their
-  fragrance remainder.
-* On reload from the database (`conversation_flow.project_model_history`) the same projection is
-  applied from the stored classifications. A customer turn WITHOUT a stored classification
-  (history from before Phase 4, or a failed classification write, or the table missing) is
-  screened deterministically with layer 1 and withheld if it carries any attack signal.
+One server-owned object decides what a turn may do: `security_gate.TurnPermissions`, built only by
+`permissions_for(decision)`. Default is nothing; an unknown label or a missing decision gets
+nothing.
+
+| Classification | extraction (+ prompt-builder profile writes) | model completion | tools offered AND dispatchable | generation | refinement | legacy recovery |
+|---|---|---|---|---|---|---|
+| FRAGRANCE, MIXED (fragrance remainder only) | yes (discovery mode) | yes | the conversation mode's tools | yes | yes | yes |
+| SMALL_TALK | no | yes | none | no | no | no |
+| SERVICE_META, OFF_TOPIC, ATTACK_EXTRACTION, INVALID, UNRESOLVED, unknown | no | no | none | no | no | no |
+
+Enforcement happens where things execute, not in the prompt and not in what is offered:
+
+* `chat.py`: no `model_completion` means a server reply; `legacy_recovery` gates the legacy
+  preview short circuit (which confirms a build and mints a capability).
+* `conversation_flow.call_ai`: `_extract_and_persist_profile_facts` calls
+  `permissions.require("extraction")`; `build_system_prompt(persist_profile=permissions.extraction)`;
+  `_maybe_generate` returns immediately without `permissions.generation` (a complete profile never
+  bypasses the gate) and calls `permissions.require("generation")` before the pipeline.
+* `tool_executor.execute_model_tool(..., allowed_tool_names=)`: the per-turn set is a REQUIRED
+  argument. A tool that is globally valid but was not offered on this turn is refused before
+  dispatch, whatever the model returned. `tools=None` on the request is not relied on. Refusals
+  log `SECURITY_TOOL_CALL_REFUSED`.
+* `call_ai` without a decision (direct callers) runs layer 1 only and treats uncertain as
+  `UNRESOLVED`.
+
+Server replies come from `app/ai/scope_responses.py`: a specialised fragrance designer staying in
+its lane; never prompts, instructions, tools, rules, attacks, classification, errors or security;
+always handing back to fragrance; varied deterministically by conversation id and turn.
+
+## 5a. Small talk and contextual answers
+
+A short message is ambiguous: "thanks" is a pleasantry, "yes" may be the answer that starts a
+build. The rules, in order, after hostile / off-topic / service-meta detection:
+
+1. **Pleasantries** (closed set: greetings, thanks, laughs, "how are you", "cool", "bye", ...) are
+   always `SMALL_TALK`, even when a question is pending and the profile is complete. They get a
+   conversational reply and nothing else: no extraction, no tools, no generation, no legacy
+   recovery, no profile write.
+2. **Contextual answer**: only when the server knows a question is pending (the previous
+   assistant turn in the projected history contains a question mark), the message is at most
+   eight words, contains no question mark, and contains none of the words that address the
+   assistant or phrase a request (you, your, they, system, tell, show, explain, list, share,
+   what, which, how, why, ...). It is classified `FRAGRANCE / CONTEXTUAL_ANSWER` and gets the
+   design workflow. This is the ONLY way a signal-free short message ("yes", "none", "Sarah",
+   "Toronto", "mostly evenings", "1", "let's do it") can change profile state, run extraction,
+   verify a location, accept a build invitation, trigger legacy recovery, or reach generation.
+3. Any other short message with no signal (three words or fewer) is `SMALL_TALK`.
+4. Everything else is uncertain and goes to layer 2, or is `UNRESOLVED`.
+
+The same "yes" with no pending question is small talk and changes nothing.
+
+## 6. History poisoning (all model paths)
+
+Raw customer history and model history are separate. Raw messages are stored untouched and are
+never deleted to sanitize context. Every model path (extraction, main, bridge, refinement) reads
+the same projected history, so protecting the projection protects them all.
+
+* **Write**: the raw message and its classification are written in ONE transaction
+  (`save_user_message_with_classification`). If that fails (for example migration 0003 missing)
+  the raw message is stored without a classification.
+* **Cache**: the in-process history receives `GateDecision.model_history_content`: attack and
+  invalid turns become `[message withheld]`, off-topic and unresolved turns a neutral marker,
+  mixed turns their fragrance remainder, unknown labels withheld.
+* **Reload** (`project_stored_turn`): a stored safe label never overrides a deterministic attack
+  signal; MIXED is replayed only if layer 1 itself can strip the attack, otherwise the whole turn
+  is withheld (the classifier's text is never stored or replayed); unknown labels are withheld.
+* **Unclassified turns** (pre-Phase-4 history, missing table, fallback write) are replayed only if
+  layer 1 confidently accepts them; anything it cannot place is withheld. A semantically detected
+  attack whose classification could not be stored is therefore not restored as safe.
+* **Direct callers** of `call_ai`: every earlier customer turn with a deterministic attack signal
+  is withheld for that call (`screen_prior_user_turns`). A direct caller that bypasses the route
+  does not get semantic screening of earlier turns; the route is the only production caller.
+
+Cost: in a legacy conversation, long signal-free customer turns are withheld from model context
+after a reload. The structured profile still carries the facts.
 
 ## 7. Profile poisoning
 
@@ -115,6 +198,13 @@ instruction to the assistant (`looks_like_instruction`, same detectors as layer 
 encoded forms), whichever model or extraction path proposed it. The model learns only "not
 saved". Ordinary values such as "base notes", "Developer conference" or a fragrance name pass.
 Attack-classified turns never reach extraction at all.
+
+**Read-time projection (Phase 4A).** The write guard does not clean data stored before it
+existed. `build_customer_safe_profile_view` now withholds instruction-like string values and list
+items from the model projection; the stored profile is untouched; legitimate terms and unusual
+names ("Developer", "base notes", "System of a Down concert scent") pass. Customer data still
+travels only as tool-result data, never inside trusted instructions (N5). This is defense in
+depth, not a claim to catch every semantic injection.
 
 ## 8. Prompt scope (F4)
 
@@ -151,7 +241,8 @@ unavailable/invalid warnings. No raw message text, no tokens, no prompt content.
 
 | Setting | Default | Purpose |
 |---|---|---|
-| `SECURITY_GATE_SEMANTIC_ENABLED` | `true` | layer 2 on/off |
+| `SECURITY_GATE_SEMANTIC_ENABLED` | `true` | layer 2 on/off; off means uncertain messages are UNRESOLVED |
+| `SECURITY_GATE_CLASSIFIER_TIMEOUT_SECONDS` | `8` | hard ceiling for the single classifier call |
 | `RATE_LIMIT_SECURITY_DENIED_PER_CONVERSATION` | `15/3600` | attack throttle per conversation |
 | `RATE_LIMIT_SECURITY_DENIED_PER_IP` | `40/3600` | attack throttle per source |
 
@@ -164,13 +255,22 @@ unavailable/invalid warnings. No raw message text, no tokens, no prompt content.
 * The live red-team suite (`tests/e2e/test_ai_red_team_live.py`, marker `live_ai`) must only be
   run with a development credential against a disposable database.
 
-## 14. Known limits
+## 14. Known limits and residual risk
 
+* **A hostile request that layer 1 cannot see, inside a message that also carries a strong
+  fragrance term, is accepted as FRAGRANCE without the classifier.** This follows from the
+  requirement that fragrance requests must not depend on classifier availability. What still
+  applies on that turn: the Phase 3 data boundary (no private data in any model context), the
+  hardened prompt, per-turn tool permissions, strict tool argument validation, the profile write
+  guard, and deterministic output repair. Not validated against a live model.
+* Likewise a short hostile message (eight words or fewer) that avoids every detector and every
+  not-an-answer word is treated as a contextual answer when a question is pending.
 * Layer 1 is regex-based; novel phrasings depend on layer 2, whose live behaviour has not been
-  validated in this phase (no safe credential). With layer 2 off, those messages are served in
-  degraded mode rather than blocked.
-* Three benign self-description messages in the false-positive corpus ("I'm getting married in
-  June", "I just moved to Toronto", "I'm in Dubai, it's hot all year") are uncertain at layer 1
-  and go to layer 2 (or degraded mode); they are never blocked.
-* The `MIXED` sentence stripper splits on sentence punctuation; a single run-on sentence that
-  mixes both is treated as an attack (fail closed) and the customer is invited to restate.
+  validated (no safe credential). When layer 2 is down those messages get the restate reply.
+* Availability cost of failing closed: with no context, 8 of 76 benign corpus messages are
+  uncertain at layer 1 (2 of 76 when a question is pending). With the classifier down those
+  customers are asked to restate. This is deliberate.
+* A single run-on sentence mixing attack and fragrance fails closed as an attack.
+* The turn still writes the chat log, the classification row, rate-limit counters and the
+  fill-only contact fields on the `Conversation` row (Phase 2 behaviour). None of these is
+  fragrance profile state.

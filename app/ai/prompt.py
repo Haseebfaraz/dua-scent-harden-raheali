@@ -886,8 +886,18 @@ async def build_system_prompt(
     conversation_id: str,
     known_customer_email: str | None,
     known_customer_name: str | None,
+    *,
+    persist_profile: bool = True,
 ) -> str:
+    """`persist_profile=False` (Phase 4A: turns without the extraction permission, e.g. small
+    talk) builds the same prompt but writes NOTHING: the decline/accept flags and identity fill
+    below are applied to a local copy only."""
     profile = await get_customer_profile(session, conversation_id)
+    async def _local_only(_session, _conversation_id, field, value, _profile=profile):
+        _profile[field] = value
+        return _profile
+
+    _save = save_customer_profile_field if persist_profile else _local_only
 
     # Deterministic decline detection: once a pivot has been offered, a clear short decline from
     # the customer is unambiguous evidence -- persisted here rather than left to the model
@@ -898,7 +908,7 @@ async def build_system_prompt(
         and not profile.get("customBuildInvited")
         and is_fragrance_pivot_decline(_last_user_message_content(history))
     ):
-        profile = await save_customer_profile_field(session, conversation_id, "fragrancePivotDeclined", True)
+        profile = await _save(session, conversation_id, "fragrancePivotDeclined", True)
 
     # Same idea, one stage later: once the customer has actually been invited to a custom build,
     # a clear short decline there is unambiguous too, and distinct from declining the earlier,
@@ -909,21 +919,21 @@ async def build_system_prompt(
         and not profile.get("customBuildAccepted")
         and is_fragrance_pivot_decline(_last_user_message_content(history))
     ):
-        profile = await save_customer_profile_field(session, conversation_id, "customBuildDeclined", True)
+        profile = await _save(session, conversation_id, "customBuildDeclined", True)
 
     # Custom-build acceptance: persisted the moment Python detects it -- via a direct request, a
     # concrete occasion/gift context, or contextual acceptance of either invitation -- so mode
     # stays in FRAGRANCE_DISCOVERY on every later turn without re-deriving a transient "was the
     # last message a yes" check once the conversation has moved on to other topics.
     if not profile.get("customBuildAccepted") and determine_conversation_mode(history, profile) == "FRAGRANCE_DISCOVERY":
-        profile = await save_customer_profile_field(session, conversation_id, "customBuildAccepted", True)
+        profile = await _save(session, conversation_id, "customBuildAccepted", True)
 
     # Phase 2 (F8): known_customer_* are self-reported and only fill an EMPTY profile field.
     confirmed_customer_name = profile.get("name") or known_customer_name
     confirmed_customer_email = profile.get("email") or known_customer_email
 
     if confirmed_customer_name and confirmed_customer_name != profile.get("name"):
-        await save_customer_profile_field(
+        await _save(
             session,
             conversation_id,
             "name",
@@ -931,7 +941,7 @@ async def build_system_prompt(
         )
 
     if confirmed_customer_email and confirmed_customer_email != profile.get("email"):
-        await save_customer_profile_field(
+        await _save(
             session,
             conversation_id,
             "email",

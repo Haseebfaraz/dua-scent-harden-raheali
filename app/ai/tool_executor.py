@@ -469,10 +469,15 @@ def _safe_recommendation_tool_result(outcome: dict) -> dict:
     return _ok(json.dumps({"status": outcome["status"], "instruction": STATUS_GUIDANCE.get(outcome["status"], "")}), None)
 
 
-async def execute_model_tool(session: AsyncSession, tool_name: str, raw_args_json: str, context: dict) -> dict:
+async def execute_model_tool(session: AsyncSession, tool_name: str, raw_args_json: str, context: dict, *, allowed_tool_names) -> dict:
     """The only entry point the conversational model can reach. Refuses everything that is not a
-    model-callable tool, validates arguments strictly, and returns customer-safe content only."""
-    if tool_name not in MODEL_CALLABLE_TOOL_NAMES:
+    model-callable tool, validates arguments strictly, and returns customer-safe content only.
+
+    Phase 4A: `allowed_tool_names` is REQUIRED and is this turn's permission set (from
+    security_gate.TurnPermissions). A tool that exists in the global allowlist but was not
+    permitted for this turn is refused here, before dispatch -- whatever the model returned and
+    whatever was (or was not) offered to it. `tools=None` on the request is not a boundary."""
+    if tool_name not in MODEL_CALLABLE_TOOL_NAMES or tool_name not in frozenset(allowed_tool_names or ()):
         logger.info("MODEL_TOOL_REFUSED %s", json.dumps({"conversationId": context.get("conversationId"), "tool": str(tool_name)[:60]}))
         return _fail("that action is not available.")
     try:
