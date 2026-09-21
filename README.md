@@ -143,3 +143,14 @@ INTERNAL_API_KEY=<same value as this service's INTERNAL_API_KEY>
 `app/routes/chat.jsx` in the Node repo proxies `/chat` requests to this service's
 `POST /internal/chat` and `GET /internal/chat/history`, streaming the SSE response straight
 through to the storefront widget with no changes to the widget's contract.
+
+### Test network isolation
+
+The deterministic test suite cannot use the network. `tests/conftest.py` intercepts socket
+connects, UDP sends and hostname resolution for every client and import path and allows exactly one
+destination: the database named by `DATABASE_URL` (its unix-socket directory, or its exact
+host and port; `localhost` is not a wildcard). Anything else raises before a packet leaves, and the
+test is failed at teardown even if application code swallowed the error. Fake HTTP transports and
+the in-process test client are unaffected. Live suites (`-m live_ai`) additionally require
+`ALLOW_LIVE_NETWORK=1`; nothing in the normal run can enable them. The Odoo integration has no
+built-in destination: unset means no request is ever made.

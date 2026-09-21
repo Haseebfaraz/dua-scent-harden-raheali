@@ -42,7 +42,7 @@ from app.services import build_commerce, commerce_inventory, odoo_inventory
 from app.services.build_capability import issue_build_token
 from app.services.build_commerce import BuildOperationInProgress, BuildPendingReview, build_commerce_lock, execute_build_commerce
 from app.services.commerce_inventory import (
-    COMMERCE_FAILURES, InventoryNotVerified, InventoryState, InventoryVerification, RequirementsUnknown,
+    COMMERCE_FAILURES, InventoryNotVerified, InventoryState, InventoryDecision, RequirementsUnknown,
     compute_build_requirements, require_commerce_inventory, verify_build_inventory,
 )
 from app.services.conversation_capability import create_conversation_with_capability
@@ -55,7 +55,8 @@ SHOP = "test-shop.myshopify.com"
 RATIOS = {"top": 34, "middle": 33, "base": 33}
 REQUIRED = float(MAX_OIL_ML)  # per distinct Odoo item, per bottle
 PREFIX = "pytest-f9"
-PRIVATE = ("FAKE-OIL-", "on_hand_qty", "default_code", "odooSku", "onHandQty", "requiredOilMl", "limitingSku")
+LOCATION = "SYNTH/Stock"
+PRIVATE = ("FAKE-OIL-", "SYNTH/Stock", "available_qty", "on_hand_qty", "default_code", "odooSku", "onHandQty", "requiredOilMl", "limitingSku")
 
 
 def _sign(params: dict) -> str:
@@ -79,6 +80,12 @@ def _env(monkeypatch):
 
     monkeypatch.setattr(preview_module, "get_admin_access_token", _fake_token)
     odoo_inventory.clear_odoo_inventory_cache_for_testing()
+    # Phase 5A: a complete SYNTHETIC source contract. Every fact the policy needs is declared here
+    # and echoed by the mocked source below; test_commerce_policy_5a.py removes them one by one.
+    monkeypatch.setattr(settings, "odoo_inventory_url", "https://odoo.synthetic.invalid/api/get-inventory")
+    monkeypatch.setattr(settings, "odoo_inventory_location_scope", LOCATION)
+    monkeypatch.setattr(settings, "odoo_inventory_quantity_semantics", "UNRESERVED_AVAILABLE")
+    monkeypatch.setattr(settings, "manufacturing_max_oil_ml_per_bottle", float(MAX_OIL_ML))
 
 
 class Catalog:
@@ -162,7 +169,7 @@ class Odoo:
                 raise self.raises
             if self.response is not None:
                 return self.response(skus) if callable(self.response) else self.response
-            return {"ok": True, "status": 200, "json": {"success": True, "products": [{"name": "x", "default_code": s, "on_hand_qty": self.stock[s]} for s in skus if s in self.stock]}}
+            return {"ok": True, "status": 200, "json": {"success": True, "location": LOCATION, "products": [{"name": "x", "default_code": s, "uom": "ml", "available_qty": self.stock[s], "on_hand_qty": self.stock[s]} for s in skus if s in self.stock]}}
 
         monkeypatch.setattr(odoo_client, "get_inventory_by_skus", _lookup)
         # The discovery path imported the function by name: patch that reference too, so no test in
@@ -178,7 +185,7 @@ def odoo(monkeypatch):
 class ShopifyWrites:
     """Spies on EVERY Shopify build write plus the pricing read."""
 
-    WRITES = ("create_product", "attach_product_media", "publish_to_all_channels", "set_variant_price", "create_variant", "rename_product", "set_inventory_item_untracked")
+    WRITES = ("create_product", "attach_product_media", "publish_to_all_channels", "set_variant_price", "activate_product", "create_variant", "rename_product", "set_inventory_item_untracked")
 
     def __init__(self, monkeypatch, *, existing_variants=None, recommendation_id=None, product_id="gid://shopify/Product/555"):
         self.calls: list[str] = []
@@ -197,6 +204,7 @@ class ShopifyWrites:
         monkeypatch.setattr(builds, "attach_product_media", _spy("attach_product_media"))
         monkeypatch.setattr(builds, "publish_to_all_channels", _spy("publish_to_all_channels"))
         monkeypatch.setattr(builds, "set_variant_price", _spy("set_variant_price"))
+        monkeypatch.setattr(builds, "activate_product", _spy("activate_product"))
         monkeypatch.setattr(builds, "create_variant", _spy("create_variant", {"id": "gid://shopify/ProductVariant/2", "price": "60.00"}))
         monkeypatch.setattr(builds, "rename_product", _spy("rename_product"))
         monkeypatch.setattr(builds, "set_inventory_item_untracked", _spy("set_inventory_item_untracked"))
@@ -231,7 +239,7 @@ async def _two_component_build(catalog, odoo, *, stock=(100.0, 100.0), **rec_ove
     return await catalog.add_recommendation([(1, 60), (2, 40)], **rec_overrides)
 
 
-async def _verify(recommendation, ratios=RATIOS, quantity=1) -> InventoryVerification:
+async def _verify(recommendation, ratios=RATIOS, quantity=1) -> InventoryDecision:
     async with SessionLocal() as session:
         return (await verify_build_inventory(session, recommendation=recommendation, ratios=ratios, quantity=quantity))[1]
 
@@ -243,26 +251,26 @@ async def _verify(recommendation, ratios=RATIOS, quantity=1) -> InventoryVerific
 async def test_every_component_available_is_verified_available(catalog, odoo):
     rec = await _two_component_build(catalog, odoo)
     result = await _verify(rec)
-    assert result.state is InventoryState.VERIFIED_AVAILABLE and result.reasons == () and result.item_count == 2
+    assert result.state is InventoryState.POLICY_SATISFIED and result.reasons == () and result.observation.item_count == 2
     assert odoo.calls == [sorted([catalog.sku(1), catalog.sku(2)])]  # ONE batched request for every item
 
 
 async def test_exact_stock_boundary(catalog, odoo):
     rec = await _two_component_build(catalog, odoo, stock=(REQUIRED, REQUIRED))
-    assert (await _verify(rec)).state is InventoryState.VERIFIED_AVAILABLE
+    assert (await _verify(rec)).state is InventoryState.POLICY_SATISFIED
     odoo.stock[catalog.sku(2)] = REQUIRED - 0.01
-    assert (await _verify(rec)).state is InventoryState.VERIFIED_INSUFFICIENT
+    assert (await _verify(rec)).state is InventoryState.INSUFFICIENT
 
 
 async def test_one_insufficient_component_is_never_hidden_by_an_available_one(catalog, odoo):
     rec = await _two_component_build(catalog, odoo, stock=(5000.0, 1.0))
     result = await _verify(rec)
-    assert result.state is InventoryState.VERIFIED_INSUFFICIENT and result.reasons == (commerce_inventory.INSUFFICIENT,)
+    assert result.state is InventoryState.INSUFFICIENT and result.reasons == (commerce_inventory.INSUFFICIENT,)
 
 
 async def test_all_components_insufficient(catalog, odoo):
     rec = await _two_component_build(catalog, odoo, stock=(0, 0.5))
-    assert (await _verify(rec)).state is InventoryState.VERIFIED_INSUFFICIENT
+    assert (await _verify(rec)).state is InventoryState.INSUFFICIENT
 
 
 @pytest.mark.parametrize("setup, reason", [
@@ -280,7 +288,7 @@ async def test_mapping_and_unit_problems_are_unknown_and_never_query_odoo(catalo
     odoo.stock = {catalog.sku(1): 5000.0, catalog.sku(2): 5000.0}
     rec = await catalog.add_recommendation([(1, 60), (2, 40)])
     result = await _verify(rec)
-    assert result.state is InventoryState.UNKNOWN and reason in result.reasons
+    assert result.state is InventoryState.UNCONFIRMED and reason in result.reasons
     assert odoo.calls == []  # no partial lookup that could be misread as partial approval
 
 
@@ -288,21 +296,21 @@ async def test_component_missing_from_the_catalog_is_unknown(catalog, odoo):
     await catalog.add_product(1)
     odoo.stock = {catalog.sku(1): 5000.0}
     rec = await catalog.add_recommendation([(1, 60), (2, 40)])  # product 2 has no catalog row at all
-    assert (await _verify(rec)).state is InventoryState.UNKNOWN
+    assert (await _verify(rec)).state is InventoryState.UNCONFIRMED
 
 
 async def test_missing_response_entry_and_truncated_batch_are_unknown(catalog, odoo):
     rec = await _two_component_build(catalog, odoo)
     del odoo.stock[catalog.sku(2)]  # Odoo answers, but only for one of the two items asked about
     result = await _verify(rec)
-    assert result.state is InventoryState.UNKNOWN and result.reasons == (commerce_inventory.RESPONSE_INCOMPLETE,)
+    assert result.state is InventoryState.UNCONFIRMED and result.reasons == (commerce_inventory.RESPONSE_INCOMPLETE,)
 
 
 async def test_duplicate_rows_for_one_item_are_ambiguous(catalog, odoo):
     rec = await _two_component_build(catalog, odoo)
-    odoo.response = lambda skus: {"ok": True, "json": {"success": True, "products": [{"default_code": s, "on_hand_qty": 5000} for s in skus] + [{"default_code": skus[0], "on_hand_qty": 0}]}}
+    odoo.response = lambda skus: {"ok": True, "json": {"success": True, "location": LOCATION, "products": [{"default_code": s, "available_qty": 5000} for s in skus] + [{"default_code": skus[0], "available_qty": 0}]}}
     result = await _verify(rec)
-    assert result.state is InventoryState.UNKNOWN and commerce_inventory.RESPONSE_AMBIGUOUS in result.reasons
+    assert result.state is InventoryState.UNCONFIRMED and commerce_inventory.RESPONSE_AMBIGUOUS in result.reasons
 
 
 @pytest.mark.parametrize("response", [
@@ -345,13 +353,13 @@ async def test_invalid_quantities_are_unknown_never_coerced(catalog, odoo, bad):
     rec = await _two_component_build(catalog, odoo)
     odoo.stock[catalog.sku(2)] = bad
     result = await _verify(rec)
-    assert result.state is InventoryState.UNKNOWN and commerce_inventory.QUANTITY_INVALID in result.reasons
+    assert result.state is InventoryState.UNCONFIRMED and commerce_inventory.QUANTITY_INVALID in result.reasons
 
 
 async def test_rows_without_an_item_code_make_the_answer_unusable(catalog, odoo):
     rec = await _two_component_build(catalog, odoo)
-    odoo.response = lambda skus: {"ok": True, "json": {"success": True, "products": [{"on_hand_qty": 5000}, "junk", *[{"default_code": s, "on_hand_qty": 5000} for s in skus]]}}
-    assert (await _verify(rec)).state is InventoryState.UNKNOWN
+    odoo.response = lambda skus: {"ok": True, "json": {"success": True, "location": LOCATION, "products": [{"available_qty": 5000}, "junk", *[{"default_code": s, "available_qty": 5000} for s in skus]]}}
+    assert (await _verify(rec)).state is InventoryState.UNCONFIRMED
 
 
 # ===========================================================================
@@ -388,7 +396,6 @@ def test_phase_one_ratio_rules_are_unchanged(ratios):
 def test_different_final_ratios_or_quantity_or_recipe_change_the_fingerprint():
     base = compute_build_requirements(_rec(), RATIOS).fingerprint
     assert compute_build_requirements(_rec(), {"top": 50, "middle": 25, "base": 25}).fingerprint != base
-    assert compute_build_requirements(_rec(), RATIOS, quantity=2).fingerprint != base
     assert compute_build_requirements(_rec(id="other"), RATIOS).fingerprint != base
     changed = _rec(productsJson=[{"title": "Alpha"}, {"title": "Gamma"}], ratiosJson=[{"productTitle": "Alpha", "ratioPercent": 60}, {"productTitle": "Gamma", "ratioPercent": 40}])
     assert compute_build_requirements(changed, RATIOS).fingerprint != base
@@ -396,9 +403,9 @@ def test_different_final_ratios_or_quantity_or_recipe_change_the_fingerprint():
     assert compute_build_requirements(reweighted, RATIOS).fingerprint != base
 
 
-def test_quantity_scales_the_requirement_and_is_bounded():
-    assert compute_build_requirements(_rec(), RATIOS, quantity=3).required_ml_per_item == Decimal("42.00")
-    for bad in (0, -1, 11, 1.5, "2", True, None):
+def test_only_the_single_bottle_the_product_actually_sells_is_supported():
+    assert compute_build_requirements(_rec(), RATIOS, quantity=1).required_ml_per_item == Decimal("14.00")
+    for bad in (0, -1, 2, 3, 10, 1.0, 1.5, "1", True, None):
         with pytest.raises(RequirementsUnknown):
             compute_build_requirements(_rec(), RATIOS, quantity=bad)
 
@@ -424,7 +431,7 @@ def test_missing_or_incoherent_requirement_information_is_unknown(overrides):
 async def test_requirements_unknown_blocks_without_any_lookup(catalog, odoo):
     rec = await _two_component_build(catalog, odoo, ratiosJson=[])
     result = await _verify(rec)
-    assert result.state is InventoryState.UNKNOWN and result.reasons == (commerce_inventory.REQUIREMENTS_UNKNOWN,) and odoo.calls == []
+    assert result.state is InventoryState.UNCONFIRMED and result.reasons == (commerce_inventory.REQUIREMENTS_UNKNOWN,) and odoo.calls == []
 
 
 async def test_components_sharing_one_odoo_item_are_aggregated_into_one_demand(catalog, odoo):
@@ -434,16 +441,10 @@ async def test_components_sharing_one_odoo_item_are_aggregated_into_one_demand(c
     rec = await catalog.add_recommendation([(1, 60), (2, 40)])
     odoo.stock = {shared: REQUIRED}
     result = await _verify(rec)
-    assert odoo.calls == [[shared]] and result.item_count == 1  # asked once, checked once against the whole bottle's oil
-    assert result.state is InventoryState.VERIFIED_AVAILABLE
+    assert odoo.calls == [[shared]] and result.observation.item_count == 1  # asked once, checked once against the whole bottle's oil
+    assert result.state is InventoryState.POLICY_SATISFIED
     odoo.stock[shared] = REQUIRED - 0.5
-    assert (await _verify(rec)).state is InventoryState.VERIFIED_INSUFFICIENT
-
-
-async def test_multiple_bottles_need_proportionally_more(catalog, odoo):
-    rec = await _two_component_build(catalog, odoo, stock=(REQUIRED * 2, REQUIRED * 2))
-    assert (await _verify(rec, quantity=2)).state is InventoryState.VERIFIED_AVAILABLE
-    assert (await _verify(rec, quantity=3)).state is InventoryState.VERIFIED_INSUFFICIENT
+    assert (await _verify(rec)).state is InventoryState.INSUFFICIENT
 
 
 # ===========================================================================
@@ -453,15 +454,17 @@ async def test_multiple_bottles_need_proportionally_more(catalog, odoo):
 async def test_stale_mismatched_or_forged_evidence_never_authorizes(catalog, odoo):
     rec = await _two_component_build(catalog, odoo)
     async with SessionLocal() as session:
-        requirements, ok = await verify_build_inventory(session, recommendation=rec, ratios=RATIOS)
-    assert ok.authorizes(requirements.fingerprint) == (True, None)
+        fingerprint, ok = await verify_build_inventory(session, recommendation=rec, ratios=RATIOS)
+        other_fingerprint, _ = await verify_build_inventory(session, recommendation=rec, ratios={"top": 50, "middle": 25, "base": 25})
+    assert ok.authorizes(fingerprint) == (True, None)
     later = utcnow() + timedelta(seconds=settings.commerce_inventory_max_age_seconds + 1)
-    assert ok.authorizes(requirements.fingerprint, now=later) == (False, commerce_inventory.STALE)
-    assert ok.authorizes(requirements.fingerprint, now=utcnow() - timedelta(seconds=5)) == (False, commerce_inventory.STALE)
-    other = compute_build_requirements(rec, {"top": 50, "middle": 25, "base": 25}).fingerprint
-    assert ok.authorizes(other) == (False, commerce_inventory.FINGERPRINT_MISMATCH)
-    forged = InventoryVerification(state=InventoryState.VERIFIED_AVAILABLE, reasons=(), fingerprint=requirements.fingerprint, checked_at=utcnow())
-    assert forged.authorizes(requirements.fingerprint)[0] is False  # not issued by the gate
+    assert ok.authorizes(fingerprint, now=later) == (False, commerce_inventory.STALE)
+    assert ok.authorizes(fingerprint, now=utcnow() - timedelta(seconds=5)) == (False, commerce_inventory.STALE)
+    assert other_fingerprint != fingerprint and ok.authorizes(other_fingerprint) == (False, commerce_inventory.FINGERPRINT_MISMATCH)
+    assert ok.authorizes("") == (False, commerce_inventory.FINGERPRINT_MISMATCH)
+    # A caller cannot construct its own approval: only decisions sealed inside the gate count.
+    forged = InventoryDecision(state=InventoryState.POLICY_SATISFIED, reasons=(), observation=ok.observation, operation_fingerprint=fingerprint, checked_at=utcnow())
+    assert forged.authorizes(fingerprint) == (False, commerce_inventory.NOT_ISSUED_BY_GATE)
 
 
 async def test_failed_refresh_after_an_earlier_success_blocks_and_every_action_looks_up_again(catalog, odoo):
@@ -491,7 +494,7 @@ async def test_recommendation_time_evidence_and_the_recommendation_cache_never_a
         assert all(r["availableOilMl"] == 100.0 for r in cached["results"].values())  # the lenient path still serves its cache
         with pytest.raises(InventoryNotVerified) as err:
             await require_commerce_inventory(session, recommendation=rec, ratios=RATIOS)
-        assert err.value.state is InventoryState.VERIFIED_INSUFFICIENT
+        assert err.value.state is InventoryState.INSUFFICIENT
 
 
 async def test_recommendation_time_fallback_semantics_are_not_commerce_approval(catalog, odoo):
@@ -505,7 +508,7 @@ async def test_recommendation_time_fallback_semantics_are_not_commerce_approval(
         assert lenient["buildable"] is True and lenient["inventoryValidated"] is False
         with pytest.raises(InventoryNotVerified) as err:
             await require_commerce_inventory(session, recommendation=rec, ratios=RATIOS)
-        assert err.value.state is InventoryState.UNKNOWN
+        assert err.value.state is InventoryState.UNCONFIRMED
 
 
 def test_there_is_no_setting_that_turns_unknown_into_approval():
@@ -518,9 +521,9 @@ def test_there_is_no_setting_that_turns_unknown_into_approval():
 # ===========================================================================
 
 FAILURE_SETUPS = {
-    "insufficient": (lambda c, o: o.stock.update({c.sku(2): 1.0}), InventoryState.VERIFIED_INSUFFICIENT),
-    "missing_entry": (lambda c, o: o.stock.pop(c.sku(2)), InventoryState.UNKNOWN),
-    "invalid_quantity": (lambda c, o: o.stock.update({c.sku(2): float("nan")}), InventoryState.UNKNOWN),
+    "insufficient": (lambda c, o: o.stock.update({c.sku(2): 1.0}), InventoryState.INSUFFICIENT),
+    "missing_entry": (lambda c, o: o.stock.pop(c.sku(2)), InventoryState.UNCONFIRMED),
+    "invalid_quantity": (lambda c, o: o.stock.update({c.sku(2): float("nan")}), InventoryState.UNCONFIRMED),
     "timeout": (lambda c, o: setattr(o, "response", {"ok": False, "status": None, "error": "timeout"}), InventoryState.SERVICE_UNAVAILABLE),
     "malformed": (lambda c, o: setattr(o, "response", {"ok": True, "json": {"success": True}}), InventoryState.SERVICE_UNAVAILABLE),
     "exception": (lambda c, o: setattr(o, "raises", RuntimeError("boom")), InventoryState.SERVICE_UNAVAILABLE),
@@ -558,7 +561,7 @@ async def test_verified_build_reaches_the_shopify_writes_in_order_with_publish_l
     shopify = ShopifyWrites(monkeypatch, recommendation_id=rec.id)
     async with SessionLocal() as session:
         result = await builds.create_shopify_build_product(session, SHOP, recommendation=rec, custom_name="My Blend", ratios=RATIOS, customer_name="Sam", customer_email="sam@example.test")
-    assert shopify.writes == ["create_product", "attach_product_media", "set_variant_price", "publish_to_all_channels"]
+    assert shopify.writes == ["create_product", "attach_product_media", "set_variant_price", "activate_product", "publish_to_all_channels"]
     assert len(odoo.calls) == 1 and result["variantId"] and math.isclose(result["price"], 136.0)  # price unchanged: 34 ml at $20 / 5 ml
 
 
@@ -725,7 +728,7 @@ async def test_failure_logs_carry_codes_only(catalog, odoo, monkeypatch, caplog)
         with caplog.at_level(logging.INFO), pytest.raises(InventoryNotVerified):
             await require_commerce_inventory(session, recommendation=rec, ratios=RATIOS)
     lines = [r.getMessage() for r in caplog.records if "COMMERCE_INVENTORY_DECISION" in r.getMessage()]
-    assert lines and "VERIFIED_INSUFFICIENT" in lines[0]
+    assert lines and "\"state\": \"INSUFFICIENT\"" in lines[0]
     for line in lines:
         for private in ("FAKE-OIL-", catalog.tag, "3.0", "2.0", "on_hand"):
             assert private not in line
@@ -811,7 +814,7 @@ async def test_product_created_but_price_not_set_is_not_published_and_needs_revi
             await execute_build_commerce(session, SHOP, recommendation_id=rec.id, ratios=RATIOS, name="My Blend")
         with pytest.raises(BuildPendingReview):
             await execute_build_commerce(session, SHOP, recommendation_id=rec.id, ratios=RATIOS, name="My Blend")
-    assert "publish_to_all_channels" not in shopify.calls and shopify.calls.count("create_product") == 1
+    assert "publish_to_all_channels" not in shopify.calls and "activate_product" not in shopify.calls and shopify.calls.count("create_product") == 1
     async with SessionLocal() as session:
         stored = await session.scalar(select(FragranceRecommendation).where(FragranceRecommendation.id == rec.id))
         assert stored.buildStatus == "pending_review" and stored.shopifyProductId == shopify.product_id and not stored.shopifyVariantId
@@ -897,7 +900,7 @@ def test_customer_failure_messages_never_claim_success_reservation_or_detail():
         assert status in (409, 503) and code.islower()
         for forbidden in ("reserved", "guarantee", "in your cart", "has been created", "sku", "odoo", "warehouse", " ml", "stock level", "units"):
             assert forbidden not in lowered, (code, forbidden)
-    assert "your design is saved" in COMMERCE_FAILURES["UNKNOWN"][2].lower()
+    assert "your design is saved" in COMMERCE_FAILURES["UNCONFIRMED"][2].lower()
 
 
 async def test_preview_page_data_carries_no_inventory_information(catalog, odoo):

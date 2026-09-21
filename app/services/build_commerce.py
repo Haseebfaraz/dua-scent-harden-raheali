@@ -25,6 +25,18 @@ What this adds around the Shopify write layer (which carries the inventory gate 
     reuses the one that was created.
 
 There is no idempotency key. Nothing a caller sends selects or reuses a previous result.
+
+Phase 5A:
+  * the customer's DRAFT (name, ratios) is shared build state, so it is now written INSIDE the
+    lock, by this module, after the pending-review check. A request that is refused with a
+    conflict has changed nothing. (Before, preview.py saved the draft first and then hit the
+    lock, so a refused request could still overwrite the draft of the operation in progress.)
+  * each operation works on its own immutable snapshot of the authorized inputs: the ratios and
+    name passed in are the ones validated, verified against inventory, priced, sent to Shopify
+    and stored. The stored draft is never read back to choose them.
+  * the advisory lock dies with its connection, so it is NOT what prevents a duplicate creation
+    after a crash. The durable marker is: `creating` is committed BEFORE the creation request can
+    be sent, and the Shopify product id is committed the moment Shopify returns it.
 """
 
 import json
@@ -37,7 +49,7 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.session import engine
-from app.services.recommendation_confirmation import get_recommendation, mark_recommendation_saved
+from app.services.recommendation_confirmation import get_recommendation, mark_recommendation_draft, mark_recommendation_saved
 from app.shopify.builds import BuildProductNotSaved, BuildWriteAmbiguous, create_shopify_build_product, reprice_existing_build
 from app.shopify.products import get_product_handle
 
@@ -85,6 +97,7 @@ async def _set_build_status(session: AsyncSession, recommendation: Any, status: 
 async def execute_build_commerce(
     session: AsyncSession, shop: str, *, recommendation_id: str, ratios: dict[str, int], name: str | None,
     customer_name: str | None = None, customer_email: str | None = None, allow_create: bool = True, want_product_url: bool = True, record_saved: bool = True,
+    save_draft: bool = False,
 ) -> dict[str, Any]:
     """Returns {"productId", "variantId", "productUrl", "price", "created"} only after the
     operation really succeeded. Raises InventoryNotVerified, BuildOperationInProgress,
@@ -101,6 +114,11 @@ async def execute_build_commerce(
             logger.warning("BUILD_COMMERCE_PENDING_REVIEW %s", json.dumps({"recommendationId": recommendation_id, "buildStatus": recommendation.buildStatus}))
             raise BuildPendingReview()
 
+        # The operation's snapshot. Copied so nothing can alter it between verification and write.
+        ratios = dict(ratios)
+        if save_draft:
+            await mark_recommendation_draft(session, recommendation_id, name=name, ratios=dict(ratios))
+
         if recommendation.shopifyProductId:
             reprice = await reprice_existing_build(session, shop, recommendation=recommendation, ratios=ratios, name=name)
             handle = await get_product_handle(session, shop, recommendation.shopifyProductId) if want_product_url else None
@@ -115,12 +133,18 @@ async def execute_build_commerce(
             raise BuildProductNotSaved("This fragrance hasn't been created yet — please save it from the preview first.")
 
         previous_status = recommendation.buildStatus
+        # DURABLE before the creation request can be sent: a process that dies anywhere after this
+        # line leaves `creating`, which every later attempt treats as "needs review".
         await _set_build_status(session, recommendation, BUILD_STATUS_CREATING)
+
+        async def _record_remote_product(product_id: str) -> None:
+            await _set_build_status(session, recommendation, BUILD_STATUS_CREATING, product_id=product_id)
+
         try:
             result = await create_shopify_build_product(
                 session, shop, recommendation=recommendation,
                 custom_name=name or (recommendation.customerFacingJson or {}).get("customerFacingName") or "Custom Blend",
-                ratios=ratios, customer_name=customer_name, customer_email=customer_email,
+                ratios=ratios, customer_name=customer_name, customer_email=customer_email, on_product_created=_record_remote_product,
             )
         except BuildWriteAmbiguous as err:
             await _set_build_status(session, recommendation, BUILD_STATUS_PENDING_REVIEW, product_id=err.product_id)
@@ -135,3 +159,17 @@ async def execute_build_commerce(
             raise
         await mark_recommendation_saved(session, recommendation_id, shopify_product_id=result["productId"], shopify_variant_id=result["variantId"])
         return {"productId": result["productId"], "variantId": result["variantId"], "price": result["price"], "created": True, "productUrl": result["productUrl"]}
+
+
+async def save_recreate_draft(session: AsyncSession, *, recommendation_id: str, name: str | None, ratios: dict[str, int] | None) -> None:
+    """The preview page's "recreate" intent only stores a draft, but the draft is shared build
+    state, so it takes the same lock and respects the same markers as a commerce operation."""
+    async with build_commerce_lock(recommendation_id):
+        recommendation = await get_recommendation(session, recommendation_id)
+        if recommendation is None:
+            raise LookupError("recommendation")
+        if sa_inspect(recommendation, raiseerr=False) is not None:
+            await session.refresh(recommendation)
+        if recommendation.buildStatus in (BUILD_STATUS_CREATING, BUILD_STATUS_PENDING_REVIEW):
+            raise BuildPendingReview()
+        await mark_recommendation_draft(session, recommendation_id, name=name, ratios=dict(ratios) if ratios else None)

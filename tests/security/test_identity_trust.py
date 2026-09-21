@@ -114,6 +114,10 @@ def fake_model(monkeypatch):
         return {"choices": [{"finish_reason": "stop", "message": {"content": "Sure."}}]}
 
     monkeypatch.setattr(conversation_flow, "call_openai_once", _fake)
+    # Phase 5A: the scope gate's classifier uses a SEPARATE client reference. It was never mocked
+    # here, so an uncertain message ("I'm Jane, ...") made a real request attempt to the model
+    # provider with the placeholder key on every run since Phase 4. The network guard exposed it.
+    monkeypatch.setattr("app.ai.openai_client.call_openai_once", _fake)
     conversation_flow._CONVERSATIONS.clear()
     return seen
 

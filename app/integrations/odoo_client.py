@@ -52,8 +52,24 @@ async def _get_json(url: str) -> dict[str, Any]:
         }
 
 
+NOT_CONFIGURED = "odoo integration is not configured"
+
+
+def _configured_url(value: str) -> str | None:
+    """An explicit https URL set by the operator, or nothing. Never a built-in default."""
+    value = (value or "").strip()
+    return value if value.lower().startswith("https://") else None
+
+
+def inventory_integration_configured() -> bool:
+    return _configured_url(settings.odoo_inventory_url) is not None
+
+
 async def ping_odoo() -> dict[str, Any]:
-    return await _get_json(settings.odoo_ping_url)
+    url = _configured_url(settings.odoo_ping_url)
+    if url is None:
+        return {"ok": False, "status": None, "durationMs": 0, "error": NOT_CONFIGURED, "configured": False}
+    return await _get_json(url)
 
 
 async def get_inventory_by_skus(skus: list[str]) -> dict[str, Any]:
@@ -64,5 +80,8 @@ async def get_inventory_by_skus(skus: list[str]) -> dict[str, Any]:
     """
     if not skus:
         return {"ok": False, "status": None, "durationMs": 0, "error": "at least one sku is required."}
-    url = f"{settings.odoo_inventory_url}?skus={quote(','.join(skus))}"
-    return await _get_json(url)
+    base = _configured_url(settings.odoo_inventory_url)
+    if base is None:
+        # Phase 5A: missing configuration makes ZERO requests.
+        return {"ok": False, "status": None, "durationMs": 0, "error": NOT_CONFIGURED, "configured": False}
+    return await _get_json(f"{base}?skus={quote(','.join(skus))}")

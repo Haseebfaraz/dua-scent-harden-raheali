@@ -33,7 +33,10 @@ async def create_product(
         }
         """,
         {"input": {
-            "title": title, "descriptionHtml": description_html, "vendor": vendor, "status": "ACTIVE",
+            # Phase 5A: created as DRAFT. A draft product cannot be bought on any channel, whatever
+            # its publication state, so nothing is purchasable until builds.py has set and verified
+            # the price and calls activate_product.
+            "title": title, "descriptionHtml": description_html, "vendor": vendor, "status": "DRAFT",
             "templateSuffix": template_suffix, "productOptions": product_options, "metafields": metafields,
         }},
     )
@@ -84,6 +87,19 @@ async def set_variant_price(session: AsyncSession, shop: str, product_id: str, v
 async def get_product_handle(session: AsyncSession, shop: str, product_id: str) -> str | None:
     result = await admin_graphql(session, shop, "query getProductHandle($id: ID!) { product(id: $id) { handle } }", {"id": product_id})
     return (result.get("data", {}).get("product") or {}).get("handle")
+
+
+async def activate_product(session: AsyncSession, shop: str, product_id: str) -> None:
+    """DRAFT -> ACTIVE. Unlike rename_product this checks userErrors: a build must never be
+    treated as purchasable-and-complete if Shopify refused to activate it."""
+    result = await admin_graphql(
+        session, shop,
+        "mutation activateBuildProduct($input: ProductInput!) { productUpdate(input: $input) { product { id status } userErrors { field message } } }",
+        {"input": {"id": product_id, "status": "ACTIVE"}},
+    )
+    payload = result.get("data", {}).get("productUpdate") or {}
+    if payload.get("userErrors") or (payload.get("product") or {}).get("status") != "ACTIVE":
+        raise ShopifyGraphqlError("Product activation was not confirmed.")
 
 
 async def rename_product(session: AsyncSession, shop: str, product_id: str, name: str) -> None:

@@ -1004,6 +1004,11 @@ question, get the restate reply).
 
 ## 17. Phase 5 (2026-09-21): inventory verification and commerce transaction safety (F9)
 
+> **Corrected in part by section 18 (Phase 5A).** This section is kept as written, including its
+> disclosure. Three of its claims were unsupported (an on-hand observation treated as verified
+> availability; "never approves a build the lab could not make"; the draft save before the lock
+> described as harmless) and its network disclosure was incomplete. Section 18 records each one.
+
 Branch `security-hardening`, continuing after `8694338`. Nothing deployed or pushed. No staging or
 production data, no Shopify or Odoo mutation, no live OpenAI call. Synthetic fixtures, mocked
 services, disposable local PostgreSQL. The original F9 finding in section 7 is kept as written.
@@ -1097,3 +1102,93 @@ backend, at any quantity; there is no order-time enforcement. Required external 
 
 Unchanged: F4 PARTIAL, F5 PARTIAL (no live validation; not touched in this phase), N3 blocked on the
 theme update, N7, F10, F11, F12, N13, N14 open, credential rotation pending.
+
+
+---
+
+## 18. Phase 5A (2026-09-21): inventory assumption verification, commerce concurrency correction, test network isolation
+
+Branch `security-hardening`, continuing after `c8af7fb`. Nothing deployed or pushed. No production
+or staging access, no live Shopify, Odoo, OpenAI or other external request. Mocks and a disposable
+local PostgreSQL (reached over a unix socket) only.
+
+### Concerns, verified or rejected against the code at `c8af7fb`
+
+| # | Concern | Exact implementation found | Disposition |
+|---|---|---|---|
+| 1 | `VERIFIED_AVAILABLE` despite unknown location, reservation semantics and manufacturing requirement | `commerce_inventory.verify_build_inventory` required only a mapping, a recorded unit and a valid `on_hand_qty`. Location was never checked; `on_hand_qty` includes reserved stock; the bound was a code constant. | **VERIFIED.** Observation, verified facts and policy decision are now separate; nine facts are required; with today's endpoint commerce is blocked. |
+| 2 | "The 14 ml bound never approves a build the lab could not make" | Premise = `formulas.MAX_OIL_ML`, a constant in a ported module with a comment. No loss/overfill, no statement that it holds for customised ratios, alcohol and packaging never checked. Quantity 1..10 was accepted though the product sells one bottle. | **VERIFIED as unsupported.** The method is kept only under an explicitly declared manufacturing contract, validated against the formula; undeclared means UNKNOWN and blocked. The claim is withdrawn. Quantity is exactly 1. |
+| 3 | Draft saved before the lock | `preview.py` called `mark_recommendation_draft` and then `execute_build_commerce`. A second authorized request overwrote `draftName` / `draftRatiosJson` and was then refused. | **VERIFIED (state inconsistency), partly REJECTED (the feared mix-up).** Operation A always used its own validated inputs, never the stored draft, so inventory, price and Shopify arguments could not be mixed. The stored draft could end up describing B while the saved product was A's. Fixed: the draft is written inside the lock for save, add to cart and recreate. |
+| 4 | "Publish last" and partial failures | Product created `ACTIVE`; publication really was the last call, but whether an ACTIVE unpublished product is purchasable depends on Shopify channel behaviour that cannot be verified here; only the default variant's price was set and nothing checked other variants. | **VERIFIED as insufficient.** Products are created `DRAFT`; price set; read-back requires EVERY variant to carry the computed price; inventory freshness re-checked; then activated (with `userErrors` checked); then published. |
+| 4b | Pending-review markers | `creating` was committed before the creation call (durable) and draft saves no longer erased it (Phase 5). The Shopify product id was only stored at the very end. | **Mostly REJECTED, one gap VERIFIED.** Duplicate prevention after a crash already held. The id is now stored the moment Shopify returns it, so a crash leaves something to reconcile against. "Reset the status by hand" was not a recovery procedure; one starting with read-only reconciliation is documented. |
+| 5 | Test network isolation | One `_get_json` symbol was patched. | **VERIFIED as insufficient, and worse than disclosed.** See below. |
+| 6 | Real hostname as a configuration default | `odoo_ping_url` / `odoo_inventory_url` defaulted to a real Odoo sandbox host. | **VERIFIED.** Removed; unset means no request. |
+| 7 | Customer wording after an ambiguous write | The pending-review message already avoided "we haven't created it"; preflight messages say it, correctly. | **REJECTED** (already correct); now pinned by a test. |
+
+### Network disclosure (extends section 17; nothing was repeated to find out more)
+
+Known:
+* Phase 5 development: up to three unauthenticated read-only `GET` attempts with synthetic item codes
+  to the Odoo sandbox hostname that was a configuration default. No credential was configured.
+* **New, found by the Phase 5A guard on its first full run:**
+  `tests/security/test_identity_trust.py::test_victim_email_and_name_do_not_grant_access...` never
+  mocked the scope gate's separate classifier client, so on every suite run since Phase 4 it
+  attempted an HTTPS request to the model provider with the placeholder key `x`, carrying one
+  synthetic message ("I'm Jane, jane@example.test").
+* **New, pre-existing on `main`:**
+  `tests/test_conversation_intelligence.py::test_location_verified_earlier_in_the_same_loop...`
+  called the real geocoding service for "Los Angeles" and passed only while the network was
+  reachable. It ran in every baseline, including the untouched `main` runs.
+
+Unknown: whether any of those requests left the machine, reached the host, or what was answered.
+No real credential, customer data or production identifier was involved in any of them. Both tests
+now mock the service; the full suite reports zero network attempts.
+
+### Remediation
+
+* `commerce_inventory.py`: `StockObservation` / `InventoryDecision`; states `POLICY_SATISFIED`,
+  `INSUFFICIENT`, `UNCONFIRMED`, `SERVICE_UNAVAILABLE`; declared source contract
+  (`ODOO_INVENTORY_LOCATION_SCOPE`, `ODOO_INVENTORY_QUANTITY_SEMANTICS`,
+  `MANUFACTURING_MAX_OIL_ML_PER_BOTTLE`) that must be backed by evidence in the response
+  (`location`, `available_qty`, `uom`); no lookup when a declared fact is missing; operation
+  fingerprint extended to mapping, location, semantics and bound; sealed decisions; controllable
+  clock; `ensure_still_satisfied` for multi-step operations; quantity exactly 1. No bypass setting.
+* `builds.py` / `products.py`: DRAFT creation, immediate id callback, read-back of every variant,
+  freshness re-check, checked activation, publish last.
+* `build_commerce.py` / `preview.py`: draft inside the lock; operation snapshot; recreate locked.
+* `odoo_client.py` / `config.py`: no default destination; https only; zero requests when unset.
+* `tests/conftest.py`: socket-level default-deny guard (connect, connect_ex, sendto, getaddrinfo),
+  single allowed destination derived from `DATABASE_URL`, teardown failure on any swallowed
+  attempt, live opt-in requires the `live_ai` marker AND `ALLOW_LIVE_NETWORK=1`.
+
+### Tests (Python 3.11, disposable local Postgres 16, migrations 0001 to 0003, no catalog data)
+
+| Suite | Result |
+|---|---|
+| New Phase 5A tests (`tests/security/test_commerce_policy_5a.py`) | 74 passed |
+| Phase 5 tests, updated to the stricter contract | 130 passed (one quantity test removed with the unsupported feature) |
+| `tests/security/` | 740 passed, 0 failed |
+| Full suite | 1259 passed, 57 failed, 30 deselected (`live_ai`), 0 skipped, 0 errors |
+| Same environment, `c8af7fb` | 1186 passed, 57 failed, 30 deselected |
+| Failing now but passing at `c8af7fb` | **none**; the 57 are the identical production-catalog set, not run against real data |
+| Network attempts flagged by the guard in the final run | 0 |
+| Phase 0 harness | unchanged |
+| Live suites | NOT RUN (by instruction) |
+
+Existing tests changed: Phase 5 tests moved to the new state names, response contract and single
+bottle; two builds tests gained the read-back and activation steps; the opt-in positive-gate
+fixture also answers the freshness re-check; two tests that reached real services were mocked.
+
+### Finding status
+
+**F9: PARTIAL, unchanged.** What improved: the backend no longer treats an observation as
+approval, and it blocks rather than assumes. What is still true: stock is never reserved; the
+endpoint as integrated cannot satisfy the policy, so controlled commerce is blocked until it is
+extended; builds already active remain purchasable through every cart, checkout, product-page and
+other-channel path outside this backend, at any quantity; there is no order-time enforcement.
+Pre-purchase validation, reservation and a post-order webhook are different guarantees
+(`docs/INVENTORY_COMMERCE_SECURITY.md` section 10) and none exists.
+
+Unchanged: F4 PARTIAL, F5 PARTIAL (no live validation; untouched), N3 blocked on the theme update,
+N7, F10, F11, F12, N14 open, credential rotation pending. N13 (real hostname default) is CLOSED by
+this phase. F1, F2, N1, F6, F7, F8, N2, F3, N5, N8: regression suites passing unchanged.

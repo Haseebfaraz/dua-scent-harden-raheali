@@ -37,6 +37,15 @@ services:
         sync: false
       - key: ODOO_INVENTORY_CACHE_TTL_SECONDS
         value: "60"
+      # Phase 5A: the inventory source contract. No defaults. Commerce stays blocked until every
+      # one is set truthfully AND the endpoint returns matching evidence
+      # (docs/INVENTORY_COMMERCE_SECURITY.md section 2a). None of them is a bypass.
+      - key: ODOO_INVENTORY_LOCATION_SCOPE
+        sync: false
+      - key: ODOO_INVENTORY_QUANTITY_SEMANTICS
+        sync: false
+      - key: MANUFACTURING_MAX_OIL_ML_PER_BOTTLE
+        sync: false
       - key: CUSTOMER_KEY_HASH_SALT
         sync: false
       - key: INTERNAL_API_KEY

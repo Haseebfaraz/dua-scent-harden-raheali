@@ -862,6 +862,21 @@ async def test_location_verified_earlier_in_the_same_loop_is_used_by_generation(
                 }}]}
             return {"choices": [{"finish_reason": "stop", "message": {"content": "Here's what I put together for you."}}]}
 
+        # Phase 5A: this test used to reach the REAL geocoding and weather services (it passed only
+        # while the network was reachable). The default-deny network guard exposed that. The
+        # location service is now mocked with a synthetic verified result; the subject of the
+        # test (a profile written earlier in the loop is re-read by generation) is unchanged.
+        from app.ai import tool_executor as _tool_executor
+
+        async def _verified_city(session, city_text):
+            return {"verified": True, "city": "Los Angeles", "stateRegion": "California", "country": "United States", "latitude": 34.05, "longitude": -118.24,
+                    "source": "synthetic", "needsClarification": False, "candidates": []}
+
+        async def _no_weather(*a, **kw):
+            return None
+
+        monkeypatch.setattr(_tool_executor, "verify_city", _verified_city)
+        monkeypatch.setattr(_tool_executor, "fetch_current_weather", _no_weather)
         monkeypatch.setattr(conversation_flow, "call_openai_once", _fake_call_openai_once)
         history = [{"role": "assistant", "content": "Which city are you in?"}, {"role": "user", "content": "Los Angeles"}]
         result = await call_ai(db_session, history, conversation_id, "haseeb@example.test", "Haseeb", SHOP_DOMAIN)

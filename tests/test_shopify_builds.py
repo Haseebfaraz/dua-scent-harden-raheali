@@ -60,16 +60,28 @@ async def test_create_shopify_build_product_happy_path(monkeypatch):
     monkeypatch.setattr(builds, "get_default_variant_id", lambda *a, **kw: _async("gid://shopify/ProductVariant/1"))
 
     captured = {}
+    order = []
 
     async def _fake_set_price(session, shop, product_id, variant_id, price):
         captured["price"] = price
+        order.append("price")
+
+    async def _readback(session, shop, product_id):
+        order.append("readback")
+        return {"id": product_id, "variants": {"edges": [{"node": {"id": "gid://shopify/ProductVariant/1", "price": captured["price"]}}]}}
+
+    async def _activate(session, shop, product_id):
+        order.append("activate")
 
     monkeypatch.setattr(builds, "set_variant_price", _fake_set_price)
+    monkeypatch.setattr(builds, "get_product_for_pricing", _readback)  # Phase 5A: every variant must carry the price
+    monkeypatch.setattr(builds, "activate_product", _activate)         # Phase 5A: DRAFT until then
 
     result = await create_shopify_build_product(
         None, SHOP, recommendation=_recommendation(), custom_name="My Blend",
         ratios={"top": 40, "middle": 30, "base": 30}, customer_name="Jane", customer_email="jane@example.com",
     )
+    assert order == ["price", "readback", "activate"]
 
     assert result["productId"] == "gid://shopify/Product/1"
     assert result["variantId"] == "gid://shopify/ProductVariant/1"
@@ -88,6 +100,8 @@ async def test_create_shopify_build_product_tolerates_media_and_publish_failures
     monkeypatch.setattr(builds, "publish_to_all_channels", _boom)
     monkeypatch.setattr(builds, "get_default_variant_id", lambda *a, **kw: _async("gid://shopify/ProductVariant/9"))
     monkeypatch.setattr(builds, "set_variant_price", lambda *a, **kw: _async(None))
+    monkeypatch.setattr(builds, "get_product_for_pricing", lambda *a, **kw: _async({"variants": {"edges": [{"node": {"price": "136.00"}}]}}))
+    monkeypatch.setattr(builds, "activate_product", lambda *a, **kw: _async(None))
 
     result = await create_shopify_build_product(
         None, SHOP, recommendation=_recommendation(), custom_name="My Blend",

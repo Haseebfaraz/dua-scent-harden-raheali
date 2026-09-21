@@ -26,8 +26,10 @@ Phase 5 (F9): both entry points call the single commerce inventory gate
 (app/services/commerce_inventory.require_commerce_inventory) immediately before their first write
 or commerce handoff, INSIDE this module, so no route and no future service caller can reach a
 Shopify write without a fresh positive verification for exactly this build. The gate is a lookup,
-never a reservation. First-time creation also publishes LAST (after the price is set) and reports
-an outcome it cannot confirm as BuildWriteAmbiguous instead of pretending success or retrying.
+never a reservation. First-time creation (Phase 5A) creates the product as a DRAFT, sets the
+price, reads back that every variant carries it, re-checks inventory freshness, and only then
+activates and publishes. An outcome it cannot confirm is BuildWriteAmbiguous, never success and
+never an automatic retry.
 """
 
 import json
@@ -38,12 +40,13 @@ from typing import Any
 import httpx
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.services.commerce_inventory import require_commerce_inventory
+from app.services.commerce_inventory import ensure_still_satisfied, require_commerce_inventory
 from app.services.fragrance_build import compute_note_position_buckets, compute_price_per_5ml_by_position
 from app.shopify.build_input import InvalidCustomName, InvalidRatios, POSITIONS, validate_custom_name, validate_ratios
 from app.shopify.metafields import build_customer_identity_metafields, build_internal_components_metafield, build_note_composition_metafield
 from app.shopify.products import (
     BOTTLE_IMAGE_URL,
+    activate_product,
     attach_product_media,
     create_product,
     create_variant,
@@ -136,7 +139,7 @@ def _is_definitive_rejection(err: Exception) -> bool:
 
 async def create_shopify_build_product(
     session: AsyncSession, shop: str, *, recommendation, custom_name: str, ratios: dict[str, Any],
-    customer_name: str | None, customer_email: str | None,
+    customer_name: str | None, customer_email: str | None, on_product_created=None,
 ) -> dict[str, Any]:
     """First-time Shopify product creation for a confirmed recommendation. Never called if
     recommendation.shopifyProductId is already set. The caller must already have authorized the
@@ -181,11 +184,12 @@ async def create_shopify_build_product(
         *build_customer_identity_metafields(customer_name, customer_email),
     ]
 
-    # ---- VERIFY INVENTORY (Phase 5): fresh, for exactly this build, the last step before writing.
-    # Raises InventoryNotVerified for anything other than a complete positive answer.
-    await require_commerce_inventory(session, recommendation=recommendation, ratios=ratios, quantity=1)
+    # ---- VERIFY INVENTORY (Phase 5 / 5A): the policy decision for exactly this operation, taken
+    # as the last step before writing. Raises InventoryNotVerified unless POLICY_SATISFIED.
+    # PREFLIGHT ends here: up to this line no Shopify write has been attempted.
+    decision = await require_commerce_inventory(session, recommendation=recommendation, ratios=ratios, quantity=1)
 
-    # Every check above passed -- only now does the first write happen.
+    # ---- WRITE. From here on a remote object may exist; nothing below may claim otherwise.
     try:
         product = await create_product(
             session, shop, title=custom_name, description_html=full_description, vendor=BUILD_PRODUCT_VENDOR,
@@ -196,19 +200,30 @@ async def create_shopify_build_product(
             raise
         raise BuildWriteAmbiguous() from err  # sent, outcome unknown: never blindly repeat a creation
     product_id = product["id"]
+    if on_product_created is not None:
+        # Durable record of the remote object BEFORE any further step, so an interruption after
+        # this point leaves something an operator can reconcile against.
+        await on_product_created(product_id)
 
     try:
         await attach_product_media(session, shop, product_id, BOTTLE_IMAGE_URL, custom_name)
     except Exception:
         pass  # best-effort, matches the JS original's caught-and-logged failure
 
-    # The price is set BEFORE the product is published to any sales channel, so a failure here
-    # can never leave a purchasable product without its computed price.
+    # The product was created as a DRAFT (not purchasable anywhere). It becomes ACTIVE only after:
+    #   1. the computed price is set on the default variant,
+    #   2. a read-back shows EVERY variant of the product carries exactly that price (a priced
+    #      variant must never conceal another one left at Shopify's default price),
+    #   3. the inventory evidence is still fresh, or has been re-verified.
+    # Any failure in between leaves a draft and is reported as an unconfirmed outcome.
     try:
         default_variant_id = await get_default_variant_id(session, shop, product_id)
         if not default_variant_id:
             raise BuildWriteAmbiguous(product_id)
         await set_variant_price(session, shop, product_id, default_variant_id, price_string)
+        _require_every_variant_priced(await get_product_for_pricing(session, shop, product_id), price_string)
+        await ensure_still_satisfied(session, decision, recommendation=recommendation, ratios=ratios, quantity=1)
+        await activate_product(session, shop, product_id)
     except BuildWriteAmbiguous:
         raise
     except Exception as err:
@@ -222,6 +237,21 @@ async def create_shopify_build_product(
     product_url = f"https://{shop}/products/{product['handle']}"
 
     return {"productId": product_id, "variantId": default_variant_id, "price": float(price_string), "productUrl": product_url}
+
+
+def _require_every_variant_priced(product: dict[str, Any] | None, price_string: str) -> None:
+    """Read-back check before activation: the product has at least one variant and EVERY variant
+    carries exactly the computed price."""
+    edges = ((product or {}).get("variants") or {}).get("edges") or []
+    if not edges:
+        raise InvalidComputedPrice("Created product has no variants.")
+    for edge in edges:
+        try:
+            price = float((edge.get("node") or {}).get("price"))
+        except (TypeError, ValueError):
+            raise InvalidComputedPrice("A variant has no valid price.") from None
+        if not math.isfinite(price) or price <= 0 or f"{price:.2f}" != price_string:
+            raise InvalidComputedPrice("A variant does not carry the computed price.")
 
 
 def _price_string(total_price: float) -> str:

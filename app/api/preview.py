@@ -33,9 +33,9 @@ from app.services.build_capability import BUILD_TOKEN_QUERY_PARAM, BuildNotAutho
 from app.services.customer_identity import VerifiedShopifyCustomer, verified_shopify_customer_from_signed_params
 from app.services.customer_profile import get_customer_profile, save_customer_profile_field
 from app.services.fragrance_build import compute_default_ratios, compute_note_position_buckets, compute_price_per_5ml_by_position
-from app.services.build_commerce import BuildOperationInProgress, BuildPendingReview, execute_build_commerce
+from app.services.build_commerce import BuildOperationInProgress, BuildPendingReview, execute_build_commerce, save_recreate_draft
 from app.services.commerce_inventory import InventoryNotVerified, commerce_failure
-from app.services.recommendation_confirmation import get_recommendation, mark_recommendation_draft
+from app.services.recommendation_confirmation import get_recommendation
 from app.shopify.admin_auth import get_admin_access_token
 from app.shopify.admin_client import ShopNotAuthenticated
 from app.shopify.app_proxy import verified_signed_params
@@ -169,14 +169,20 @@ async def preview_action(body: PreviewAction, signed: dict = Depends(verified_si
         return _json({"error": str(err), "code": "invalid_input"})
 
     if body.intent == "recreate":
-        await mark_recommendation_draft(session, body.recommendationId, name=name, ratios=ratios)
+        try:
+            await save_recreate_draft(session, recommendation_id=body.recommendationId, name=name, ratios=ratios)
+        except BuildOperationInProgress:
+            return _json(commerce_failure("build_in_progress")[1])
+        except BuildPendingReview:
+            return _json(commerce_failure("build_pending_review")[1])
         await save_customer_profile_field(session, recommendation.conversationId, "pendingRecreateRecommendationId", body.recommendationId)
         return _json({"status": "recreate", "redirectUrl": f"https://{shop}/"})
 
     log_prefix = "SAVE_BUILD" if body.intent == "save_build" else "ADD_TO_CART"
     logger.info("%s_STARTED %s", log_prefix, json.dumps({"shop": shop, "recommendationId": body.recommendationId}))
 
-    await mark_recommendation_draft(session, body.recommendationId, name=name, ratios=ratios)
+    # Phase 5A: the draft is shared build state; it is saved INSIDE the per-recommendation lock by
+    # execute_build_commerce(save_draft=True), never before it.
 
 
     # Fail fast with a clear, customer-safe reason instead of letting every downstream GraphQL
@@ -200,7 +206,7 @@ async def preview_action(body: PreviewAction, signed: dict = Depends(verified_si
         identity_profile = await get_customer_profile(session, recommendation.conversationId)
         outcome = await execute_build_commerce(
             session, shop, recommendation_id=body.recommendationId, ratios=ratios, name=name,
-            customer_name=identity_profile.get("name"), customer_email=identity_profile.get("email"),
+            customer_name=identity_profile.get("name"), customer_email=identity_profile.get("email"), save_draft=True,
         )
         shopify_product_id, shopify_variant_id, product_url = outcome["productId"], outcome["variantId"], outcome["productUrl"]
         logger.info("SHOPIFY_VARIANT_RESOLVED %s", json.dumps({"shop": shop, "recommendationId": body.recommendationId, "created": outcome["created"]}))

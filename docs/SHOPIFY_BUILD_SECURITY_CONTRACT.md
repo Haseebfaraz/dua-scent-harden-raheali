@@ -145,3 +145,16 @@ it already does for every other failure. On success nothing changed. A success r
 ever sent after the Shopify operation completed. The cart link is always for one bottle; the
 server does not verify any other quantity, and it cannot stop a variant being added to a cart by
 any route that does not call these endpoints.
+
+
+### Phase 5A notes for integrators
+
+* Response codes and request shapes are unchanged.
+* `inventory_unconfirmed` is now the EXPECTED answer to every save, re-price and add-to-cart until
+  the inventory integration supplies the facts in `docs/INVENTORY_COMMERCE_SECURITY.md` section 2a.
+  The theme must present it as a normal, non-error state ("availability still needs confirmation"),
+  not as a crash, and must not retry in a loop.
+* A request refused with `build_in_progress` or `build_pending_review` changes nothing on the
+  server, including the saved draft name and ratios. "recreate" can now return those two codes too.
+* A new build is created as a Shopify DRAFT and only becomes active after its price has been set
+  and verified, so a product URL is only ever returned for an active, priced product.

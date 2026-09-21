@@ -20,20 +20,42 @@ class Settings(BaseSettings):
     openai_copy_model: str = "gpt-5.6-terra"
     openai_copy_temperature: float = 0.5
 
-    # These fallbacks are only ever used if the env var itself is unset -- matches the JS
-    # reference's odooClient.server.js own hardcoded fallback exactly; always prefer setting
-    # ODOO_PING_URL/ODOO_INVENTORY_URL in the real environment over relying on this. Named after
-    # the actual REST endpoints this integration calls (bearer-token auth against one specific
-    # URL) -- not the generic odoo_url/database/username/password shape of a direct XML-RPC Odoo
-    # connection, which this app does not use.
-    odoo_ping_url: str = "https://the-dua-brand-sandbox-12aug-36292701.dev.odoo.com/api/v1/dua-ai/ping"
-    odoo_inventory_url: str = "https://the-dua-brand-sandbox-12aug-36292701.dev.odoo.com/api/get-inventory"
+    # Phase 5A: NO implicit destination. These used to default to a real Odoo sandbox hostname,
+    # so an unset variable silently pointed development and tests at a live external service.
+    # Empty means "integration not configured": the client makes no request at all, discovery
+    # treats availability as unconfirmed, and commerce is blocked. Server-side configuration only;
+    # no request or browser value can ever select an inventory destination.
+    odoo_ping_url: str = ""
+    odoo_inventory_url: str = ""
     odoo_inventory_api_key: str = ""
     odoo_inventory_cache_ttl_seconds: int = 60
     # Phase 5 (F9): a positive commerce inventory verification authorizes a write only for this
     # long. Commerce never uses the recommendation cache above. There is deliberately NO setting
     # that lets unknown or unavailable inventory authorize a commerce write.
     commerce_inventory_max_age_seconds: int = 30
+
+    # ---- Phase 5A: the inventory SOURCE CONTRACT (docs/INVENTORY_COMMERCE_SECURITY.md section 2a) ----
+    # Facts about the inventory source that this backend cannot discover by itself. Each one is an
+    # explicit operator declaration with a documented meaning, none has a default, and none of
+    # them can approve anything alone: the live response must ALSO carry matching evidence. While
+    # any is missing, commerce stays blocked (recommendations are unaffected). None of these is a
+    # bypass: there is no value that skips the stock comparison.
+    #
+    # The stock location/warehouse the endpoint reports for, exactly as the endpoint echoes it in
+    # its top-level "location" field. Undeclared, or not echoed identically -> unconfirmed.
+    odoo_inventory_location_scope: str = ""
+    # What the quantity means. Only UNRESERVED_AVAILABLE satisfies the commerce policy, and then
+    # the per-item field read is "available_qty" (on hand minus existing reservations). The
+    # endpoint as integrated today reports only "on_hand_qty"; the truthful value for that is
+    # ON_HAND_INCLUDES_RESERVED, which does NOT satisfy the policy.
+    odoo_inventory_quantity_semantics: str = ""
+    # The manufacturing contract behind the conservative requirement bound: the most fragrance
+    # oil, in millilitres, that producing ONE finished bottle can draw from inventory IN TOTAL
+    # across all of its oils, including any loss or overfill, for every build this product offers
+    # (any Top/Middle/Base ratio). Setting it also declares that fragrance oils are the only
+    # inventory-constrained inputs this gate is responsible for (alcohol and packaging are managed
+    # elsewhere). Must be between the formula's own maximum oil volume and the bottle size.
+    manufacturing_max_oil_ml_per_bottle: float | None = None
 
     customer_key_hash_salt: str = ""
 
