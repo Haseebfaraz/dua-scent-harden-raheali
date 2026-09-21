@@ -38,10 +38,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.config import settings
 from app.db.session import get_session
 from app.services.build_capability import BuildNotAuthorized, authorize_build_token
+from app.services.build_commerce import BuildOperationInProgress, BuildPendingReview, execute_build_commerce
+from app.services.commerce_inventory import InventoryNotVerified, commerce_failure
 from app.services.recommendation_confirmation import get_recommendation
 from app.shopify.admin_client import ShopNotAuthenticated
 from app.shopify.build_input import InvalidCustomName, InvalidRatios, validate_custom_name, validate_ratios
-from app.shopify.builds import BuildProductNotSaved, InvalidComputedPrice, ProductPricingNotFound, reprice_existing_build
+from app.shopify.builds import BuildProductNotSaved, BuildWriteAmbiguous, InvalidComputedPrice, ProductPricingNotFound
 from app.shopify.trusted_shop import TrustedShopNotConfigured, UntrustedShopError, trusted_shop
 
 logger = logging.getLogger(__name__)
@@ -151,9 +153,22 @@ async def save_build(request: Request, session: AsyncSession = Depends(get_sessi
         return _json({"error": _NOT_AUTHORIZED_MESSAGE, "code": "build_not_authorized"}, 403, cors)
 
     # ---- VALIDATE PRODUCT, COMPUTE, WRITE (all inside reprice_existing_build, in that order) ----
+    # Phase 5 (F9): same orchestration as the preview actions. This endpoint never creates a
+    # product (allow_create=False); inventory is verified inside the write layer before any write
+    # and before a variant id is handed back.
     try:
-        result = await reprice_existing_build(session, shop, recommendation=recommendation, ratios=ratios, name=name)
-        return _json(result, 200, cors)
+        outcome = await execute_build_commerce(session, shop, recommendation_id=body.recommendationId, ratios=ratios, name=name, allow_create=False, want_product_url=False, record_saved=False)
+        return _json({"price": outcome["price"], "variantId": outcome["variantId"], "created": outcome["created"]}, 200, cors)
+    except InventoryNotVerified as err:
+        logger.info("SAVE_BUILD_REJECTED %s", json.dumps({"recommendationId": body.recommendationId, "reason": "inventory", "state": err.state.value}))
+        status, payload = commerce_failure(err.state)
+        return _json(payload, status, cors)
+    except BuildOperationInProgress:
+        status, payload = commerce_failure("build_in_progress")
+        return _json(payload, status, cors)
+    except (BuildPendingReview, BuildWriteAmbiguous):
+        status, payload = commerce_failure("build_pending_review")
+        return _json(payload, status, cors)
     except BuildProductNotSaved as err:
         return _json({"error": str(err), "code": "build_not_saved"}, 409, cors)
     except UntrustedShopError:

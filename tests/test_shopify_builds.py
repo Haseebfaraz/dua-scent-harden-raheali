@@ -14,6 +14,9 @@ from app.shopify.builds import (
 from app.shopify.trusted_shop import UntrustedShopError
 
 # The suite-wide trusted shop (tests/conftest.py).
+# Phase 5: these tests are about other invariants; the inventory gate has its own suite.
+pytestmark = pytest.mark.usefixtures("inventory_verified")
+
 SHOP = "test-shop.myshopify.com"
 PRODUCT_ID = "gid://shopify/Product/1"
 
@@ -83,14 +86,37 @@ async def test_create_shopify_build_product_tolerates_media_and_publish_failures
 
     monkeypatch.setattr(builds, "attach_product_media", _boom)
     monkeypatch.setattr(builds, "publish_to_all_channels", _boom)
-    monkeypatch.setattr(builds, "get_default_variant_id", lambda *a, **kw: _async(None))
+    monkeypatch.setattr(builds, "get_default_variant_id", lambda *a, **kw: _async("gid://shopify/ProductVariant/9"))
+    monkeypatch.setattr(builds, "set_variant_price", lambda *a, **kw: _async(None))
 
     result = await create_shopify_build_product(
         None, SHOP, recommendation=_recommendation(), custom_name="My Blend",
         ratios={"top": 34, "middle": 33, "base": 33}, customer_name=None, customer_email=None,
     )
     assert result["productId"] == "gid://shopify/Product/1"
-    assert result["variantId"] is None
+    assert result["variantId"] == "gid://shopify/ProductVariant/9"
+
+
+async def test_create_shopify_build_product_never_publishes_or_reports_success_without_a_priced_variant(monkeypatch):
+    """Phase 5: before, a product whose default variant could not be resolved was still published
+    and reported as saved with no price set. Now the price is set before publishing, and a
+    created-but-unpriced product is reported as an unconfirmed outcome, never as success."""
+    published = []
+    monkeypatch.setattr(builds, "compute_price_per_5ml_by_position", lambda *a, **kw: _async({"top": 20, "middle": 20, "base": 20}))
+    monkeypatch.setattr(builds, "create_product", lambda *a, **kw: _async({"id": "gid://shopify/Product/1", "handle": "custom-blend"}))
+    monkeypatch.setattr(builds, "attach_product_media", lambda *a, **kw: _async(None))
+    monkeypatch.setattr(builds, "get_default_variant_id", lambda *a, **kw: _async(None))
+
+    async def _publish(*a, **kw):
+        published.append(1)
+
+    monkeypatch.setattr(builds, "publish_to_all_channels", _publish)
+    with pytest.raises(builds.BuildWriteAmbiguous) as err:
+        await create_shopify_build_product(
+            None, SHOP, recommendation=_recommendation(), custom_name="My Blend",
+            ratios={"top": 34, "middle": 33, "base": 33}, customer_name=None, customer_email=None,
+        )
+    assert err.value.product_id == "gid://shopify/Product/1" and published == []
 
 
 def _product_pricing_payload(variants, recommendation_id="rec_1"):

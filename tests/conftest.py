@@ -32,3 +32,32 @@ def _trusted_shop_for_tests(monkeypatch):
 async def db_session():
     async with SessionLocal() as session:
         yield session
+
+
+@pytest.fixture
+def inventory_verified(monkeypatch):
+    """Phase 5: for tests whose subject is ANOTHER invariant of the Shopify write layer (pricing,
+    product identity, authorization ordering). It answers the commerce inventory gate positively
+    and records each call. It is opt-in per module, never autouse; the gate itself is tested
+    without any bypass in tests/security/test_commerce_inventory.py."""
+    calls = []
+
+    async def _verified(session, *, recommendation, ratios, quantity=1):
+        calls.append({"recommendationId": getattr(recommendation, "id", None), "ratios": dict(ratios), "quantity": quantity})
+
+    monkeypatch.setattr("app.shopify.builds.require_commerce_inventory", _verified)
+    return calls
+
+
+@pytest.fixture(autouse=True)
+def _no_live_odoo(monkeypatch, request):
+    """Phase 5: no test may reach the real Odoo endpoint (the default URL is a real host). Tests
+    that exercise the HTTP client itself mock httpx and opt out with @pytest.mark.odoo_http."""
+    if request.node.get_closest_marker("odoo_http"):
+        return
+    from app.integrations import odoo_client
+
+    async def _blocked(url):
+        raise AssertionError("a test tried to reach the real Odoo endpoint; mock get_inventory_by_skus")
+
+    monkeypatch.setattr(odoo_client, "_get_json", _blocked)

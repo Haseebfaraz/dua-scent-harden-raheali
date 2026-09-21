@@ -998,3 +998,102 @@ message that pairs one with a strong fragrance term is served as a fragrance tur
 which has been validated against a live model. Failing closed costs availability when the
 classifier is down (8 of 76 benign corpus messages with no context, 2 of 76 with a pending
 question, get the restate reply).
+
+
+---
+
+## 17. Phase 5 (2026-09-21): inventory verification and commerce transaction safety (F9)
+
+Branch `security-hardening`, continuing after `8694338`. Nothing deployed or pushed. No staging or
+production data, no Shopify or Odoo mutation, no live OpenAI call. Synthetic fixtures, mocked
+services, disposable local PostgreSQL. The original F9 finding in section 7 is kept as written.
+
+**Disclosure.** While the new test file was being developed, three tests exercised the lenient
+discovery lookup before its client reference was mocked, so up to three unauthenticated, read-only
+`GET` requests carrying synthetic item codes may have been attempted against the default Odoo
+hostname in `config.py` (N13: a real sandbox host is the built-in default). No credential exists in
+this environment, nothing was written, and no response was used. The tests were fixed and
+`tests/conftest.py` now blocks the real Odoo client for the whole suite; the full suite confirms no
+test reaches it.
+
+### Verified original data and control flow
+
+Inventory was consulted only while ranking candidates in the chat pipeline, with deliberately
+lenient semantics (`buildable=True, inventoryValidated=False` on a missing mapping, an item not
+found, a lookup failure or any exception) and a 60 s cache. No commerce path consulted inventory:
+`preview.py` save_build / add_to_cart, `save_build.py`, `builds.create_shopify_build_product` and
+`builds.reprice_existing_build` had no inventory call; the helper documented as "for Save Build /
+Add to Cart" had no caller. Products were created ACTIVE, published to every channel before the
+price was set, with untracked inventory, and handed to the customer as a product URL or a cart
+link. Overlapping or retried first-time saves could create duplicate products.
+
+### Remediation
+
+* `app/services/commerce_inventory.py`: typed states (VERIFIED_AVAILABLE, VERIFIED_INSUFFICIENT,
+  UNKNOWN, SERVICE_UNAVAILABLE), server-side requirements with a fingerprint, one fresh uncached
+  strictly validated lookup, per-item aggregation, a worst-case requirement bound (the
+  slider-to-oil manufacturing rule is unknown and was not invented), unit confirmation per
+  mapping, a 30 s authorization window, customer-safe failures. No override setting.
+* `app/shopify/builds.py`: both write entry points call the gate immediately before their first
+  write or variant handoff; publish is now the last step; unknown outcomes raise
+  `BuildWriteAmbiguous`.
+* `app/services/build_commerce.py`: one orchestration for both browser entry points; advisory lock
+  per recommendation; re-read inside the lock; `creating` / `pending_review` markers in the
+  existing `buildStatus` column; no blind retry of a creation.
+* `recommendation_confirmation.mark_recommendation_draft` no longer erases those markers (a defect
+  found by the new regression test: the draft save reset the marker and allowed a second creation).
+* `safe_views`: server-authored availability wording for the conversational model.
+
+### Affected files
+
+`app/services/commerce_inventory.py` (new), `app/services/build_commerce.py` (new),
+`app/shopify/builds.py`, `app/api/preview.py`, `app/api/save_build.py`,
+`app/services/recommendation_confirmation.py`, `app/ai/safe_views.py`, `app/config.py`,
+`tests/security/test_commerce_inventory.py` (new), `tests/conftest.py`, five existing test files
+(patch targets moved; pricing and identity suites opt into a recorded positive gate), one existing
+test changed because it asserted the unsafe behaviour (success with no priced variant),
+`docs/INVENTORY_COMMERCE_SECURITY.md` (new), `docs/SHOPIFY_BUILD_SECURITY_CONTRACT.md`,
+`.env.example`, `pyproject.toml`.
+
+### Regression tests
+
+`tests/security/test_commerce_inventory.py`, 131 tests: inventory states (available, exact boundary,
+one or all short, missing / inactive mapping, unit not confirmed, missing catalog row, missing
+response entry, duplicate rows, malformed bodies, timeout / auth / 5xx / exception, ten invalid
+quantity shapes); requirements (bound and rounding, valid ratio examples, Phase 1 ratio rules,
+fingerprint changes, quantity bounds, sixteen incoherent recommendation shapes, shared-item
+aggregation, multiple bottles); freshness (stale, future-dated, mismatched and forged evidence,
+failed refresh after success, recommendation snapshot and warm cache ignored, lenient discovery
+pair is not approval, no override setting); mutation ordering (six failure modes x creation and x
+both reprice branches, zero Shopify writes; success order with publish last; invalid input and
+product mismatch never reach inventory); routes (safe messages, design kept, stable codes,
+authorization before inventory for id-only / wrong / foreign / conversation tokens and the retired
+contract, expired capability, browser inventory claims ignored, codes-only logs); concurrency and
+retries (lock exclusivity and release, one product under overlap, ambiguous creation never success
+and never repeated, created-but-unpriced never published, refusal leaves the build retryable,
+crashed creation, reprice reconciliation by read, no idempotency key); discovery during an outage,
+model wording, failure wording, preview page data, chat pipeline cannot reach a commerce write.
+
+| Suite | Result |
+|---|---|
+| New Phase 5 tests | 131 passed |
+| `tests/security/` (Phases 1 to 5) | 667 passed, 0 failed |
+| Full suite | 1186 passed, 57 failed, 30 deselected (`live_ai`), 0 skipped |
+| Same environment, `8694338` | 1054 passed, 57 failed, 30 deselected |
+| Failing now but passing at `8694338` | **none** (identical set of 57, production catalog data, not run against real data) |
+| Phase 0 harness | unchanged |
+
+### Remaining risk and closure status
+
+**F9: PARTIAL.** Closed for every commerce write this backend controls: unknown, missing mapping,
+service failure, stale or recommendation-time evidence, and changed inputs cannot authorize a
+write; nothing is written before all checks pass. NOT closed, and not closable inside this
+repository: stock is never reserved; `on_hand_qty` ignores existing reservations; the queried
+location is unknown; the unit is an operator-recorded assumption; the exact per-oil requirement for
+a customised ratio is unknown (a conservative bound is used); build variants are untracked,
+published and purchasable indefinitely through any cart or checkout path that does not call this
+backend, at any quantity; there is no order-time enforcement. Required external steps are listed in
+`docs/INVENTORY_COMMERCE_SECURITY.md` section 10.
+
+Unchanged: F4 PARTIAL, F5 PARTIAL (no live validation; not touched in this phase), N3 blocked on the
+theme update, N7, F10, F11, F12, N13, N14 open, credential rotation pending.

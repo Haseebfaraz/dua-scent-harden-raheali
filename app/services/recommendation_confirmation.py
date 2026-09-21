@@ -227,7 +227,11 @@ async def mark_recommendation_draft(session: AsyncSession, recommendation_id: st
     record = await get_recommendation(session, recommendation_id)
     if not record:
         return None
-    record.buildStatus = "draft"
+    # Phase 5: `creating` / `pending_review` mean a Shopify creation may already exist or be in
+    # flight (app/services/build_commerce.py). A draft save must never erase that marker, or the
+    # next commerce action would blindly create a second product.
+    if record.buildStatus not in ("creating", "pending_review"):
+        record.buildStatus = "draft"
     if name is not None:
         record.draftName = name
     if ratios is not None:

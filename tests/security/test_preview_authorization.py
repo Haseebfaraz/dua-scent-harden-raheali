@@ -11,6 +11,7 @@ import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import delete, select
 
+from app.services import build_commerce
 from app.api import preview as preview_module
 from app.config import settings
 from app.db.models import Conversation, CustomerProfileState, FragranceRecommendation
@@ -60,9 +61,9 @@ def shopify_writes(monkeypatch):
     async def _handle(*a, **kw):
         return "x"
 
-    monkeypatch.setattr(preview_module, "create_shopify_build_product", _create)
-    monkeypatch.setattr(preview_module, "reprice_existing_build", _reprice)
-    monkeypatch.setattr(preview_module, "get_product_handle", _handle)
+    monkeypatch.setattr(build_commerce, "create_shopify_build_product", _create)
+    monkeypatch.setattr(build_commerce, "reprice_existing_build", _reprice)
+    monkeypatch.setattr(build_commerce, "get_product_handle", _handle)
     return calls
 
 

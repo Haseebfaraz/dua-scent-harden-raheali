@@ -33,13 +33,14 @@ from app.services.build_capability import BUILD_TOKEN_QUERY_PARAM, BuildNotAutho
 from app.services.customer_identity import VerifiedShopifyCustomer, verified_shopify_customer_from_signed_params
 from app.services.customer_profile import get_customer_profile, save_customer_profile_field
 from app.services.fragrance_build import compute_default_ratios, compute_note_position_buckets, compute_price_per_5ml_by_position
-from app.services.recommendation_confirmation import get_recommendation, mark_recommendation_draft, mark_recommendation_saved
+from app.services.build_commerce import BuildOperationInProgress, BuildPendingReview, execute_build_commerce
+from app.services.commerce_inventory import InventoryNotVerified, commerce_failure
+from app.services.recommendation_confirmation import get_recommendation, mark_recommendation_draft
 from app.shopify.admin_auth import get_admin_access_token
 from app.shopify.admin_client import ShopNotAuthenticated
 from app.shopify.app_proxy import verified_signed_params
 from app.shopify.build_input import InvalidCustomName, InvalidRatios, validate_custom_name, validate_ratios
-from app.shopify.builds import BuildProductNotSaved, InvalidComputedPrice, ProductPricingNotFound, create_shopify_build_product, reprice_existing_build
-from app.shopify.products import get_product_handle
+from app.shopify.builds import BuildProductNotSaved, BuildWriteAmbiguous, InvalidComputedPrice, ProductPricingNotFound
 from app.shopify.trusted_shop import UntrustedShopError
 
 logger = logging.getLogger(__name__)
@@ -177,9 +178,6 @@ async def preview_action(body: PreviewAction, signed: dict = Depends(verified_si
 
     await mark_recommendation_draft(session, body.recommendationId, name=name, ratios=ratios)
 
-    shopify_product_id = recommendation.shopifyProductId
-    shopify_variant_id = recommendation.shopifyVariantId
-    product_url = None
 
     # Fail fast with a clear, customer-safe reason instead of letting every downstream GraphQL
     # call fail one by one. get_admin_access_token only ever operates on the trusted shop and
@@ -194,25 +192,25 @@ async def preview_action(body: PreviewAction, signed: dict = Depends(verified_si
         logger.error("SHOPIFY_SESSION_MISSING %s", json.dumps({"shop": shop, "recommendationId": body.recommendationId}))
         return _json({"error": _NOT_CONNECTED_MESSAGE})
 
+    # Phase 5 (F9): one orchestration for every controlled commerce action. It serializes
+    # operations per recommendation, re-reads the build inside the lock, and the Shopify write
+    # layer it calls verifies inventory immediately before its first write. Nothing below reports
+    # success unless the operation really completed.
     try:
-        if not shopify_product_id:
-            identity_profile = await get_customer_profile(session, recommendation.conversationId)
-            logger.info("SHOPIFY_PRODUCT_CREATE_STARTED %s", json.dumps({"shop": shop, "recommendationId": body.recommendationId}))
-            result = await create_shopify_build_product(
-                session, shop, recommendation=recommendation,
-                custom_name=name or (recommendation.customerFacingJson or {}).get("customerFacingName") or "Custom Blend",
-                ratios=ratios, customer_name=identity_profile.get("name"), customer_email=identity_profile.get("email"),
-            )
-            shopify_product_id = result["productId"]
-            shopify_variant_id = result["variantId"]
-            product_url = result["productUrl"]
-            logger.info("SHOPIFY_VARIANT_RESOLVED %s", json.dumps({"shop": shop, "recommendationId": body.recommendationId, "created": True}))
-        else:
-            reprice = await reprice_existing_build(session, shop, recommendation=recommendation, ratios=ratios, name=name)
-            shopify_variant_id = reprice["variantId"]
-            handle = await get_product_handle(session, shop, shopify_product_id)
-            product_url = f"https://{shop}/products/{handle}" if handle else None
-            logger.info("SHOPIFY_VARIANT_RESOLVED %s", json.dumps({"shop": shop, "recommendationId": body.recommendationId, "created": reprice.get("created")}))
+        identity_profile = await get_customer_profile(session, recommendation.conversationId)
+        outcome = await execute_build_commerce(
+            session, shop, recommendation_id=body.recommendationId, ratios=ratios, name=name,
+            customer_name=identity_profile.get("name"), customer_email=identity_profile.get("email"),
+        )
+        shopify_product_id, shopify_variant_id, product_url = outcome["productId"], outcome["variantId"], outcome["productUrl"]
+        logger.info("SHOPIFY_VARIANT_RESOLVED %s", json.dumps({"shop": shop, "recommendationId": body.recommendationId, "created": outcome["created"]}))
+    except InventoryNotVerified as err:
+        logger.info("COMMERCE_BLOCKED %s", json.dumps({"shop": shop, "recommendationId": body.recommendationId, "intent": body.intent, "state": err.state.value}))
+        return _json(commerce_failure(err.state)[1])
+    except BuildOperationInProgress:
+        return _json(commerce_failure("build_in_progress")[1])
+    except (BuildPendingReview, BuildWriteAmbiguous):
+        return _json(commerce_failure("build_pending_review")[1])
     except ShopNotAuthenticated:
         # Session row disappeared between the pre-check above and the actual call (e.g.
         # APP_UNINSTALLED fired mid-request) -- same customer-safe framing either way.
@@ -237,8 +235,6 @@ async def preview_action(body: PreviewAction, signed: dict = Depends(verified_si
     except Exception as err:
         logger.error("SHOPIFY_PRODUCT_CREATE_FAILED %s", json.dumps({"shop": shop, "recommendationId": body.recommendationId, "reason": "unexpected", "errorType": type(err).__name__}))
         return _json({"error": "Failed to save the build."})
-
-    await mark_recommendation_saved(session, body.recommendationId, shopify_product_id=shopify_product_id, shopify_variant_id=shopify_variant_id)
 
     if body.intent == "save_build":
         logger.info("SAVE_BUILD_COMPLETED %s", json.dumps({"shop": shop, "recommendationId": body.recommendationId, "shopifyProductId": shopify_product_id}))

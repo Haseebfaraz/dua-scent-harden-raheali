@@ -6,6 +6,7 @@ import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import delete
 
+from app.services import build_commerce
 from app.api import preview as preview_module
 from app.config import settings
 from app.db.models import Conversation, CustomerProfileState, FragranceRecommendation
@@ -203,7 +204,7 @@ async def test_preview_save_build_first_time_creation(monkeypatch):
         async def _fake_create(*a, **kw):
             return {"productId": "gid://shopify/Product/1", "variantId": "gid://shopify/ProductVariant/1", "price": 60.0, "productUrl": f"https://{SHOP}/products/rose-dream"}
 
-        monkeypatch.setattr(preview_module, "create_shopify_build_product", _fake_create)
+        monkeypatch.setattr(build_commerce, "create_shopify_build_product", _fake_create)
 
         with TestClient(app) as client:
             response = client.post(
@@ -228,8 +229,8 @@ async def test_preview_add_to_cart_uses_existing_product(monkeypatch):
         async def _fake_handle(*a, **kw):
             return "rose-dream"
 
-        monkeypatch.setattr(preview_module, "reprice_existing_build", _fake_reprice)
-        monkeypatch.setattr(preview_module, "get_product_handle", _fake_handle)
+        monkeypatch.setattr(build_commerce, "reprice_existing_build", _fake_reprice)
+        monkeypatch.setattr(build_commerce, "get_product_handle", _fake_handle)
 
         with TestClient(app) as client:
             response = client.post(
@@ -250,7 +251,7 @@ async def test_preview_save_build_reports_shopify_failure_as_json_error(monkeypa
         async def _boom(*a, **kw):
             raise RuntimeError("Shopify is down")
 
-        monkeypatch.setattr(preview_module, "create_shopify_build_product", _boom)
+        monkeypatch.setattr(build_commerce, "create_shopify_build_product", _boom)
 
         with TestClient(app) as client:
             response = client.post(
@@ -305,7 +306,7 @@ async def test_save_build_reports_shopify_401_as_a_connection_problem(monkeypatc
             response = httpx.Response(401, request=request, text='{"errors":"[API] Invalid API key or access token"}')
             raise httpx.HTTPStatusError("401", request=request, response=response)
 
-        monkeypatch.setattr(preview_module, "create_shopify_build_product", _unauthorized)
+        monkeypatch.setattr(build_commerce, "create_shopify_build_product", _unauthorized)
 
         with TestClient(app) as client, caplog.at_level(logging.INFO, logger="app.api.preview"):
             response = client.post(
@@ -334,7 +335,7 @@ async def test_save_build_non_auth_shopify_error_gets_a_distinct_message(monkeyp
             response = httpx.Response(500, request=request, text="internal error")
             raise httpx.HTTPStatusError("500", request=request, response=response)
 
-        monkeypatch.setattr(preview_module, "create_shopify_build_product", _server_error)
+        monkeypatch.setattr(build_commerce, "create_shopify_build_product", _server_error)
 
         with TestClient(app) as client:
             response = client.post(

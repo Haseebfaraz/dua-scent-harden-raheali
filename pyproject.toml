@@ -25,6 +25,7 @@ asyncio_mode = "auto"
 addopts = "-m 'not live_ai'"
 markers = [
     "live_ai: makes real, paid OpenAI API calls -- excluded from the default run, opt in with -m live_ai",
+    "odoo_http: exercises the Odoo HTTP client itself with a mocked transport (opts out of the no-live-Odoo guard)",
 ]
 
 [build-system]

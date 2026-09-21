@@ -19,7 +19,15 @@ Phase 1 (security, F1 / F2 / N1 / N3) changed the trust model of BOTH entry poin
     (app/shopify/build_input.py);
   * the price is a server-side computation from the product's own stored layer data plus the
     validated 100% composition, checked finite and positive;
-  * order is READ -> AUTHORIZE -> VALIDATE -> COMPUTE -> WRITE. The rename is the LAST write.
+  * order is READ -> AUTHORIZE -> VALIDATE -> COMPUTE -> VERIFY INVENTORY -> WRITE. The rename is
+    the LAST write.
+
+Phase 5 (F9): both entry points call the single commerce inventory gate
+(app/services/commerce_inventory.require_commerce_inventory) immediately before their first write
+or commerce handoff, INSIDE this module, so no route and no future service caller can reach a
+Shopify write without a fresh positive verification for exactly this build. The gate is a lookup,
+never a reservation. First-time creation also publishes LAST (after the price is set) and reports
+an outcome it cannot confirm as BuildWriteAmbiguous instead of pretending success or retrying.
 """
 
 import json
@@ -27,8 +35,10 @@ import math
 import re
 from typing import Any
 
+import httpx
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.services.commerce_inventory import require_commerce_inventory
 from app.services.fragrance_build import compute_note_position_buckets, compute_price_per_5ml_by_position
 from app.shopify.build_input import InvalidCustomName, InvalidRatios, POSITIONS, validate_custom_name, validate_ratios
 from app.shopify.metafields import build_customer_identity_metafields, build_internal_components_metafield, build_note_composition_metafield
@@ -66,6 +76,7 @@ _RATIO_EXTRACT_PATTERN = re.compile(r"\((\d+)%\)$")
 __all__ = [
     "BuildProductMismatch",
     "BuildProductNotSaved",
+    "BuildWriteAmbiguous",
     "InvalidComputedPrice",
     "InvalidCustomName",
     "InvalidRatios",
@@ -103,6 +114,24 @@ class BuildProductNotSaved(Exception):
 
 class InvalidComputedPrice(Exception):
     pass
+
+
+class BuildWriteAmbiguous(Exception):
+    """A Shopify write was sent and its outcome is not known (timeout, transport error, 5xx), or a
+    product was created but a later required step failed. Nothing is rolled back (there is no
+    transaction across Shopify and PostgreSQL) and nothing is retried automatically."""
+
+    def __init__(self, product_id: str | None = None):
+        super().__init__("build write outcome unknown")
+        self.product_id = product_id
+
+
+def _is_definitive_rejection(err: Exception) -> bool:
+    """Shopify answered and said no: nothing was created. Everything else after a write was sent
+    is ambiguous."""
+    if isinstance(err, httpx.HTTPStatusError):
+        return 400 <= err.response.status_code < 500
+    return type(err).__name__ in ("ShopifyGraphqlError", "ShopNotAuthenticated", "UntrustedShopError")
 
 
 async def create_shopify_build_product(
@@ -152,11 +181,20 @@ async def create_shopify_build_product(
         *build_customer_identity_metafields(customer_name, customer_email),
     ]
 
+    # ---- VERIFY INVENTORY (Phase 5): fresh, for exactly this build, the last step before writing.
+    # Raises InventoryNotVerified for anything other than a complete positive answer.
+    await require_commerce_inventory(session, recommendation=recommendation, ratios=ratios, quantity=1)
+
     # Every check above passed -- only now does the first write happen.
-    product = await create_product(
-        session, shop, title=custom_name, description_html=full_description, vendor=BUILD_PRODUCT_VENDOR,
-        template_suffix=BUILD_PRODUCT_TEMPLATE_SUFFIX, product_options=product_options, metafields=metafields,
-    )
+    try:
+        product = await create_product(
+            session, shop, title=custom_name, description_html=full_description, vendor=BUILD_PRODUCT_VENDOR,
+            template_suffix=BUILD_PRODUCT_TEMPLATE_SUFFIX, product_options=product_options, metafields=metafields,
+        )
+    except Exception as err:
+        if _is_definitive_rejection(err):
+            raise
+        raise BuildWriteAmbiguous() from err  # sent, outcome unknown: never blindly repeat a creation
     product_id = product["id"]
 
     try:
@@ -164,14 +202,22 @@ async def create_shopify_build_product(
     except Exception:
         pass  # best-effort, matches the JS original's caught-and-logged failure
 
+    # The price is set BEFORE the product is published to any sales channel, so a failure here
+    # can never leave a purchasable product without its computed price.
+    try:
+        default_variant_id = await get_default_variant_id(session, shop, product_id)
+        if not default_variant_id:
+            raise BuildWriteAmbiguous(product_id)
+        await set_variant_price(session, shop, product_id, default_variant_id, price_string)
+    except BuildWriteAmbiguous:
+        raise
+    except Exception as err:
+        raise BuildWriteAmbiguous(product_id) from err
+
     try:
         await publish_to_all_channels(session, shop, product_id)
     except Exception:
         pass  # best-effort, matches the JS original's caught-and-logged failure
-
-    default_variant_id = await get_default_variant_id(session, shop, product_id)
-    if default_variant_id:
-        await set_variant_price(session, shop, product_id, default_variant_id, price_string)
 
     product_url = f"https://{shop}/products/{product['handle']}"
 
@@ -293,6 +339,10 @@ async def reprice_existing_build(
         if distance < closest_distance:
             closest_distance = distance
             closest_edge = edge
+
+    # ---- VERIFY INVENTORY (Phase 5): fresh, for exactly these ratios. Before ANY write and
+    # before a variant id is handed back for the cart, including the reuse branch below.
+    await require_commerce_inventory(session, recommendation=recommendation, ratios=ratios, quantity=1)
 
     # ---- WRITE (only now) ----
     if closest_edge is not None and closest_distance <= MATCH_TOLERANCE_PCT:

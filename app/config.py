@@ -30,6 +30,10 @@ class Settings(BaseSettings):
     odoo_inventory_url: str = "https://the-dua-brand-sandbox-12aug-36292701.dev.odoo.com/api/get-inventory"
     odoo_inventory_api_key: str = ""
     odoo_inventory_cache_ttl_seconds: int = 60
+    # Phase 5 (F9): a positive commerce inventory verification authorizes a write only for this
+    # long. Commerce never uses the recommendation cache above. There is deliberately NO setting
+    # that lets unknown or unavailable inventory authorize a commerce write.
+    commerce_inventory_max_age_seconds: int = 30
 
     customer_key_hash_salt: str = ""
 

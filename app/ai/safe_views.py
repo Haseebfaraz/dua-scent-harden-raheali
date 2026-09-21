@@ -264,12 +264,22 @@ def build_customer_safe_recommendation_from_candidate(candidate: dict[str, Any],
     )
 
 
+# Phase 5 (F9): server-authored wording rules per availability state. The recommendation-time
+# check is an on-hand lookup, never a reservation, and the real check happens again when the
+# customer saves or adds to cart. No quantities, items or systems are ever named.
+AVAILABILITY_GUIDANCE: dict[str, str] = {
+    "AVAILABLE": "The ingredients looked available when this was checked. Do not promise stock, do not say anything is reserved or guaranteed, and do not say the blend is already made. Availability is confirmed again when the customer saves it or adds it to the cart.",
+    "AVAILABILITY_UNCONFIRMED": "This scent direction matches the customer's preferences, but ingredient availability still needs confirmation. Say so plainly if availability comes up. Do not promise it can be made, and do not say it cannot.",
+    "UNAVAILABLE": "This blend cannot be completed right now. Do not promise it and do not invent a date.",
+}
+
+
 def recommendation_presentation_messages(safe: CustomerSafeRecommendation) -> list[dict[str, Any]]:
     """The safe recommendation as a synthetic tool result for the bridge completion. No ids."""
     call_id = f"rec_{uuid.uuid4().hex[:12]}"
     return [
         {"role": "assistant", "content": None, "tool_calls": [{"id": call_id, "type": "function", "function": {"name": RECOMMENDATION_TOOL_NAME, "arguments": "{}"}}]},
-        {"role": "tool", "tool_call_id": call_id, "content": json.dumps({"recommendation": safe.model_dump()}, ensure_ascii=False)},
+        {"role": "tool", "tool_call_id": call_id, "content": json.dumps({"recommendation": safe.model_dump(), "availabilityGuidance": AVAILABILITY_GUIDANCE[safe.availability]}, ensure_ascii=False)},
     ]
 
 

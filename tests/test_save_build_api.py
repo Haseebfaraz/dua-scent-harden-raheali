@@ -16,6 +16,7 @@ import httpx
 import pytest
 from fastapi.testclient import TestClient
 
+from app.services import build_commerce
 from app.api import save_build as save_build_module
 from app.config import settings
 from app.db.session import get_session
@@ -52,6 +53,7 @@ def _authorized_build(monkeypatch):
     app.dependency_overrides[get_session] = _fake_get_session
     monkeypatch.setattr(save_build_module, "authorize_build_token", _authorize)
     monkeypatch.setattr(save_build_module, "get_recommendation", _get_recommendation)
+    monkeypatch.setattr(build_commerce, "get_recommendation", _get_recommendation)
     yield
     app.dependency_overrides.pop(get_session, None)
 
@@ -69,7 +71,7 @@ def test_save_build_resolves_existing_variant(monkeypatch):
         assert ratios == {"top": 40, "middle": 30, "base": 30}
         return {"price": "60.00", "variantId": "gid://shopify/ProductVariant/42", "created": False}
 
-    monkeypatch.setattr(save_build_module, "reprice_existing_build", _fake_reprice)
+    monkeypatch.setattr(build_commerce, "reprice_existing_build", _fake_reprice)
 
     with TestClient(app) as client:
         response = _post(client)
@@ -84,7 +86,7 @@ def test_save_build_maps_invalid_build_product_to_404(monkeypatch):
     async def _fake_reprice(*a, **kw):
         raise ProductPricingNotFound("Could not find product or its note composition.")
 
-    monkeypatch.setattr(save_build_module, "reprice_existing_build", _fake_reprice)
+    monkeypatch.setattr(build_commerce, "reprice_existing_build", _fake_reprice)
 
     with TestClient(app) as client:
         response = _post(client)
@@ -100,7 +102,7 @@ def test_save_build_maps_stale_shopify_token_to_customer_safe_401(monkeypatch):
         response = httpx.Response(401, request=request, json={"errors": "Unauthorized"})
         raise httpx.HTTPStatusError("401", request=request, response=response)
 
-    monkeypatch.setattr(save_build_module, "reprice_existing_build", _fake_reprice)
+    monkeypatch.setattr(build_commerce, "reprice_existing_build", _fake_reprice)
 
     with TestClient(app) as client:
         response = _post(client)
@@ -112,7 +114,7 @@ def test_save_build_reports_no_admin_credential_as_customer_safe_401(monkeypatch
     async def _fake_reprice(*a, **kw):
         raise ShopNotAuthenticated("no usable Admin API credential")
 
-    monkeypatch.setattr(save_build_module, "reprice_existing_build", _fake_reprice)
+    monkeypatch.setattr(build_commerce, "reprice_existing_build", _fake_reprice)
 
     with TestClient(app) as client:
         response = _post(client)
@@ -124,7 +126,7 @@ def test_save_build_maps_invalid_price_to_400(monkeypatch):
     async def _fake_reprice(*a, **kw):
         raise InvalidComputedPrice("Computed price was invalid.")
 
-    monkeypatch.setattr(save_build_module, "reprice_existing_build", _fake_reprice)
+    monkeypatch.setattr(build_commerce, "reprice_existing_build", _fake_reprice)
 
     with TestClient(app) as client:
         response = _post(client)
@@ -148,7 +150,7 @@ def test_save_build_refuses_to_run_without_a_configured_trusted_shop(monkeypatch
         nonlocal called
         called = True
 
-    monkeypatch.setattr(save_build_module, "reprice_existing_build", _fake_reprice)
+    monkeypatch.setattr(build_commerce, "reprice_existing_build", _fake_reprice)
     with TestClient(app) as client:
         response = client.post("/api/save-build", json=BODY)
     assert response.status_code == 503

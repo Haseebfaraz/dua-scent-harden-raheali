@@ -13,6 +13,7 @@ from types import SimpleNamespace
 import pytest
 from fastapi.testclient import TestClient
 
+from app.services import build_commerce
 from app.api import save_build as save_build_module
 from app.config import settings
 from app.db.session import get_session
@@ -20,6 +21,9 @@ from app.main import app
 from app.services.build_capability import BuildNotAuthorized
 from app.shopify import builds, products
 from app.shopify.builds import InvalidComputedPrice, reprice_existing_build
+
+# Phase 5: these tests are about other invariants; the inventory gate has its own suite.
+pytestmark = pytest.mark.usefixtures("inventory_verified")
 
 TRUSTED = "test-shop.myshopify.com"
 TRUSTED_ORIGIN = f"https://{TRUSTED}"
@@ -118,6 +122,7 @@ def recommendations(monkeypatch):
         return store.get(recommendation_id)
 
     monkeypatch.setattr(save_build_module, "get_recommendation", _get)
+    monkeypatch.setattr(build_commerce, "get_recommendation", _get)
     return store
 
 
