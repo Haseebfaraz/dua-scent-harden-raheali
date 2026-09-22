@@ -96,3 +96,29 @@ Record the printed per-message classifications and replies here afterwards.
 | Canary tests with an echoing mock model (run) | The output validator intercepts that fixture: a verbatim prompt run, a canary token, a tool name | That a real model resists extraction, or that a paraphrased or translated leak would be caught |
 | Live model suite (NOT run) | nothing yet | Everything about real-model adherence to the narrowed prompt and real classifier accuracy |
 | 57 failing tests in the full suite | Nothing about security. They need production catalog reference data and fail identically on `main`, `4461c2c` and this commit | They were not resolved with production data and were not run against it |
+
+## 4. Phase 8 re-measurement (2026-09-22, commit after `9965923`, no live model)
+
+Environment: Python 3.12.14, PostgreSQL 16.2 (disposable), gate `phase4a-gate-2`, OpenAI mocked
+or unavailable in every test, the default-deny network guard in force. Deterministic selection
+(`-m 'not live_ai and not reference_data'`): 1413 passed, 43 deselected; `tests/security`: 849
+passed.
+
+Layer 1 on the Phase 4A corpora, re-run at this commit: attacks 51/51 blocked; paraphrases 15/15
+kept from the model (12 as attacks, 3 as off-topic redirects); off-topic 10/10 redirected; benign
+without context 68/76 correct (60 routed to the model, 8 service questions answered by the
+server), 0 rejected, 8 unresolved; benign with a pending question 74/76, 0 rejected, 2 unresolved.
+The unresolved lists are unchanged from section 1a. Identical to Phase 4A: no regression, no
+improvement (the detectors did not change).
+
+Through the real route (`tests/security/test_final_validation_8.py`, gate not bypassed): two
+attack messages after a recommendation produced zero model requests, zero stock lookups and no
+profile or recommendation change; the raw text was stored with its classification and never
+replayed. One layer-1-uncertain message with the classifier unavailable produced exactly one
+classifier attempt (message + boolean, no token, no history) and the restate reply, and nothing
+else. A new benign-unresolved example was observed: "My name is Sam and you can reach me at
+sam@example.com." (an email address in a bare sentence). It is handled by the semantic classifier
+when that is available and by the restate reply when it is not; it is not counted as a pass.
+
+Live-model suite: NOT RUN (still not authorized). Nothing here claims resistance to an independent
+adversary or a real model's adherence; F4 and F5 remain PARTIAL.

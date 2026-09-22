@@ -1455,3 +1455,164 @@ F10 PARTIAL, F12 PARTIAL, F4 / F5 PARTIAL (no live validation; `live-eval.yml` e
 run), F9 PARTIAL (commerce still fails closed), F11 PARTIAL (review pending; both destructive
 paths now gated at one boundary), N3 blocked on the theme, N7 open, credential rotation pending.
 F1, F2, N1, F6, F7, F8, N2, F3, N5, N8, N13, N14: regression suites passing unchanged on 3.12.
+
+## 22. Phase 8 (2026-09-22): final repository security validation and release readiness
+
+Independent re-verification of every finding at commit `9965923` (start) on Python 3.12.14 and
+PostgreSQL 16.2 (disposable `pgserver` instance, data directory removed at the end). No push, no
+deployment, no live Shopify / Odoo / OpenAI / geocoding call, no credential rotation, no
+production or staging data. The companion documents written in this phase are
+`docs/SECURITY_ARCHITECTURE.md` (trust boundaries as implemented) and `docs/RELEASE_READINESS.md`
+(blockers, owners, closure evidence).
+
+### 22.1 Authoritative state
+
+| | |
+|---|---|
+| Repository / branch | `~/dua-scent-ai`, `security-hardening`, worktree clean at start |
+| Starting commit | `9965923` (Phase 7) |
+| Python / PostgreSQL | 3.12.14 (uv-managed standalone) / 16.2 (`pgserver`) |
+| Locks | `requirements.txt` (28) and `requirements-dev.txt` (58) re-resolved with `pip-compile`; pins and hashes identical to the committed files |
+| Migrations | 0001 to 0004; `python -m scripts.verify_migrations` = `migrations verified` on the Phase 8 database AND on a freshly created empty database (`p8_clean`) |
+| Baseline (before any Phase 8 change) | `1409 passed, 43 deselected` (30 `live_ai` + 13 `reference_data`), identical to Phase 7 |
+| Config defaults re-read from `app.config.settings` | `allowed_origins=''`, `internal_api_key=''` (fail closed), `odoo_inventory_url=''`, `odoo_inventory_location_scope=''`, `odoo_inventory_quantity_semantics=''`, `manufacturing_max_oil_ml_per_bottle=None`, `shared_data_deletion_reviewed=False`, `retention_execution_enabled=False`, `security_gate_semantic_enabled=True`, `shopify_api_version='2026-07'`, chat limits as in `docs/SECURITY_ARCHITECTURE.md` section 2 |
+| CI / build files | `.github/workflows/ci.yml` (push + pull_request, `permissions: contents: read`, three SHA-pinned actions, no `pull_request_target`, no `continue-on-error`, no secrets, security suite unconditional, lock-drift and audit steps fail the job, deselections printed to the step summary), `live-eval.yml` (`workflow_dispatch` only, uses a dev key secret, never triggered), `Makefile`, two-stage `Dockerfile`, `.dockerignore` |
+| Container runtime | none on the machine: **IMAGE BUILD NOT RUN** |
+| Hosted CI | never run (branch never pushed) |
+
+### 22.2 Finding-to-evidence matrix
+
+"Executed" means the named tests ran in this phase on the final commit (`tests/security`: 849
+passed; full deterministic suite: 1413 passed, 43 deselected).
+
+| ID | Severity | Original behaviour (Phase 0) | Current control | Location | Regression tests | Limitation / external dependency | Status |
+|---|---|---|---|---|---|---|---|
+| F1 | CRITICAL | caller-controlled `shop` selected the credential destination (SSRF / exfiltration) | one trusted shop; `shop` compared, never used as a destination; redirects disabled; build capability per recommendation | `app/shopify/trusted_shop.py`, `admin_client.py`, `services/build_capability.py` | `test_trusted_shop.py` (109), `test_build_capability.py` (5), `test_preview_authorization.py` (14), `test_final_validation_8.py` | none | CLOSED |
+| F2 | CRITICAL | unauthenticated mutation of arbitrary products before validation | product ids come from server state; identity and capability checked before any write; ratios/name/price validated first; legacy body refused | `app/api/save_build.py`, `api/preview.py`, `shopify/build_input.py`, `shopify/builds.py` | `test_save_build_authorization.py` (57), `test_build_input.py` (70), `test_commerce_inventory.py` route section | none | CLOSED |
+| F3 | HIGH | internal catalog data in the conversational model's context | private engine behind a boundary; allow-list DTO; safe context as data; canaries on every model call | `app/ai/safe_views.py`, `conversation_flow.py`, `tool_executor.py`, `services/copy_generation.py` | `test_model_boundary.py` (37), `test_context_and_cost_bounds.py` (9), `test_final_validation_8.py` (42 captured requests, real pipeline) | none for the deterministic guarantee | CLOSED |
+| F4 | HIGH | general-purpose chat enabled | narrowed prompt; deterministic scope gate; off-topic and service-meta answered by the server; UNRESOLVED fails closed | `app/ai/security_gate.py`, `scope_responses.py`, `prompt.py` | `test_security_gate.py` (64), `test_prompt_scope.py` (19), `test_security_routing.py` (22), `test_gate_fail_closed.py` (37) | the semantic classifier and the model's own adherence were never run live | PARTIAL |
+| F5 | HIGH | no prompt-injection / extraction defence | layer 1 detectors, layer 2 fail-closed classifier, per-turn permissions enforced at extraction, dispatch, generation, refinement, legacy recovery; attack text never replayed; output validation | same + `conversation_flow.py` | same + `test_final_validation_8.py::test_attack_turn_after_a_recommendation_triggers_nothing` (2), `::test_unresolved_turn_with_an_unavailable_classifier_triggers_nothing` | attack corpus authored by the same author as the detectors; no live run; known bypass class documented (`docs/AI_SECURITY_GATE.md` section 14) | PARTIAL |
+| F6 | HIGH | no abuse or cost controls | body/message/name/email limits; per-IP and per-conversation rate limits; security-denied throttle; turn lock; concurrency cap; bounded context, tool turns, tool calls, output tokens, deadlines | `app/api/request_limits.py`, `services/rate_limit.py`, `turn_lock.py`, `config.py` | `test_chat_input_limits.py` (38), `test_rate_limiting.py` (16), `test_context_and_cost_bounds.py` | copy-model calls per generation are not bounded (observation B15) | CLOSED |
+| F7 | HIGH | history readable/writable with the id alone | server-minted id + hashed capability token in a header; expiry and revocation; same 401 for every refusal; read routes never write | `app/services/conversation_capability.py`, `api/chat.py` | `test_conversation_ownership.py` (10), `test_final_validation_8.py` (401 on wrong/absent token, after deletion) | none | CLOSED |
+| F8 | HIGH | caller-supplied identity trusted as Shopify identity | self-reported names/emails only fill gaps and authorize nothing; verified id only from the App Proxy signature; caller `shop_domain` ignored | `app/services/customer_identity.py`, `api/client_identity.py` | `test_identity_trust.py` (26) | none | CLOSED |
+| F9 | MEDIUM/HIGH | inventory failed open into irreversible commerce | typed inventory decision, quantity 1, declared source contract with no defaults, manufacturing bound, freshness, re-verification before activation, build lock, ambiguous outcomes to review | `app/services/commerce_inventory.py`, `build_commerce.py`, `shopify/builds.py` | `test_commerce_inventory.py` (130), `test_commerce_policy_5a.py` (74), `test_final_validation_8.py` (blocked insufficient / wrong semantics / invalid ratios / wrong capability, then a controlled save with the write order asserted) | no Odoo contract exists; no reservation; checkout is not enforced; manufacturing acceptance undefined (B2 to B4) | PARTIAL (commerce blocked by default) |
+| F10 | MEDIUM | unsupported Admin API version | `2026-07`; served-version check; `ProductCreateInput`/`ProductUpdateInput`; every mutation checks `userErrors` and results | `app/shopify/admin_client.py`, `products.py`, `publishing.py` | `test_shopify_contract_7.py` (29), `test_shopify_*.py` | this phase fetched the `2026-07` reference pages for `productCreate`, `productVariantsBulkUpdate`, `productUpdate`, `inventoryItemUpdate` (all confirm the shapes used; `input: ProductInput` is deprecated on `productCreate`/`productUpdate`); `publishablePublish`, `productVariantsBulkCreate`, `productCreateMedia`, `metafieldDefinitionCreate` rely on the release notes; no store contacted | PARTIAL (dev-store validation B6) |
+| F11 | MEDIUM | no retention, expiry, deletion | atomic owner deletion (200 / 409 / 401), tombstone, write guard, cache eviction, minimized commerce records, retention dry run, shared-data gate | `app/services/data_lifecycle.py`, `api/chat.py`, `scripts/data_retention.py` | `test_data_lifecycle.py` (47), `test_deletion_6a.py` (29), `test_final_validation_8.py` (503 by default; 401 / 409 / 200 with the review flag; reads and continuations refuse afterwards; tombstone 1; commerce record minimized) | shared-database review, retention approval, external copies (B9 to B11) | PARTIAL |
+| F12 | MEDIUM | no CI | deterministic workflow, hash-locked dependencies, audit, migrations script, startup check, Dockerfile | `.github/workflows/ci.yml`, `Makefile`, `requirements*.txt`, `scripts/` | local equivalents executed in this phase (22.6) | never run hosted; image never built (B7, B8) | PARTIAL |
+| N1 | HIGH | price manipulation via ratios | shared integer ratio validator; computed price read back on every variant | `shopify/build_input.py`, `builds.py` | `test_build_input.py`, `test_commerce_policy_5a.py` price section | none | CLOSED |
+| N2 | MEDIUM | browser `greeting` persisted as an assistant turn | field ignored; server-owned welcome (`with_welcome`) | `api/chat.py` | `test_chat_input_limits.py` | none | CLOSED |
+| N3 | HIGH | no binding between recommendation and caller | build capability required on every preview read/write; conversation-bound | `services/build_capability.py` | `test_preview_authorization.py`, `test_preview_ready_capability.py` | the deployed theme still uses the old widget contract | PARTIAL (blocked on theme, B1) |
+| N4 | LOW | App Proxy `timestamp` never checked (signed URL replay) | unchanged; a replayed signed URL still needs the build capability, so replay alone reveals nothing | `shopify/hmac.py` | -- | Shopify's own libraries do not enforce it either | OPEN (low, accepted) |
+| N5 | MEDIUM | customer strings interpolated into the system prompt | customer context delivered as data messages; static system prompt | `ai/prompt.py`, `conversation_flow.py` | `test_model_boundary.py::test_injected_profile_text_never_enters_the_system_prompt_or_changes_tools` | none | CLOSED |
+| N6 | MEDIUM | product title unvalidated | `validate_custom_name` (length, charset, required) | `shopify/build_input.py` | `test_build_input.py` | none | CLOSED |
+| N7 | MEDIUM | source titles and customer name/email written to product metafields | **unchanged by design**: `custom.internal_components` (source titles + contribution), `custom.customer_name`, `custom.customer_email` and `custom.note_composition` are still written on every created build product (`builds.py:183-187`) because the manufacturing hand-off reads them; the product starts DRAFT and is activated only after the price read-back | `shopify/metafields.py`, `builds.py` | `test_shopify_metafields.py` (shape only) | what reaches Shopify is therefore: the internal component titles of the customer's own blend and the customer's self-reported name/email, on a product that becomes ACTIVE and published; Liquid on the storefront can read `custom.*` if the theme exposes it (theme not reviewed: UNKNOWN); the backend cannot erase them (B11). Removing the titles requires the manufacturing contract (B3) to define what the hand-off needs instead | OPEN |
+| N8 | MEDIUM | "customer safe" DTO carried product names and scores | allow-list DTO | `ai/safe_views.py` | `test_model_boundary.py` DTO tests | none | CLOSED |
+| N9 | MEDIUM | internal key check skipped when unset | mandatory key, constant-time compare | `api/chat.py::require_internal_api_key` | `test_chat_api.py`, `test_admin_auth.py` | none | CLOSED |
+| N10 | MEDIUM | caller `shop_domain` chose the preview host | ignored; trusted shop only | `api/chat.py` | `test_identity_trust.py` | none | CLOSED |
+| N11 | LOW | leaked-id regex misses uuid-hex ids | regex unchanged, but ids are now control data emitted by the server and never present in model context, so there is nothing for the model to leak | `conversation_flow.py` | `test_model_boundary.py::test_recommendation_identifiers_are_server_emitted_control_data` | defense in depth only | OPEN (low, mitigated by F3) |
+| N12 | LOW | no per-item length on string arrays | 20 items, 100 chars each | `ai/tools.py` | `test_tool_executor_profile.py` | none | CLOSED |
+| N13 | LOW | real Odoo hostname as a default | no default; https required | `config.py` | `test_commerce_policy_5a.py::test_missing_integration_configuration_makes_zero_requests` | none | CLOSED |
+| N14 | LOW | state change on history GET | reads are read only; recreate is an authorized POST | `api/chat.py`, `api/preview.py` | `test_data_lifecycle.py`, `test_final_validation_8.py` (re-entry message appears only after the POST; marker consumed in the turn) | none | CLOSED |
+| N15 | LOW | `NullPool` in production | unchanged; bounded by F6 limits and the per-process concurrency cap | `db/session.py` | -- | capacity, not security | OPEN (low, accepted) |
+| N16 | LOW | tracebacks and provider bodies logged | `safe_exception_summary`, status-only provider errors, route templates, WARNING for HTTP client loggers | `logging_config.py`, `ai/openai_client.py` | `test_data_lifecycle.py` logging section (synthetic markers) | none | CLOSED |
+| N17 | INFO | `userErrors` ignored on several mutations | every mutation checks `userErrors` and results | `shopify/products.py` | `test_shopify_contract_7.py` | none | CLOSED |
+| Phase 5 defect | -- | draft save reset the pending-review marker | `mark_recommendation_draft` preserves markers | `services/recommendation_confirmation.py` | `test_commerce_policy_5a.py::test_status_markers_survive_every_refused_request_and_ordinary_draft_saving` | none | CLOSED |
+| Phase 6A defects | -- | stale history served after tombstone expiry; write-guard race; deletion "accepted" without completion | row-existence check + eviction; lock class 4; synchronous atomic deletion | `data_lifecycle.py`, `api/chat.py` | `test_deletion_6a.py` | none | CLOSED |
+| Phase 7 defects | -- | legacy preview URL lacked `bt`; inventory logs carried item codes; unmocked copy model in one test | fixed | `services/legacy_preview_recovery.py`, `odoo_inventory.py` | `test_legacy_preview_recovery.py`, `test_odoo_inventory.py` | none | CLOSED |
+| Credential rotation | -- | credentials existed in developer environments / earlier history | not performed (not authorized) | -- | -- | operator action (B12) | OPEN |
+
+### 22.3 End-to-end validation (`tests/security/test_final_validation_8.py`, 4 tests, all passed)
+
+One ordinary guest journey through the real routes, with the real orchestration and the real
+private pipeline on the synthetic catalog (`tests/synthetic_catalog.py`); OpenAI, the Odoo stock
+source, the Shopify write layer and weather mocked; the network guard in force; the gate NOT
+bypassed (the route classified every message; `classifier_calls == 0` on every accepted turn).
+
+| Step | Route | Result |
+|---|---|---|
+| bootstrap | `POST /chat/session` (`with_welcome`) | server-minted id + token; history read with the token 200, with a wrong or absent token 401 |
+| discovery turn 1 | `POST /chat` | FRAGRANCE (layer 1); forced extraction wrote likes/dislikes/occasion/strength through the real dispatcher; Los Angeles verified from synthetic order history; **not** generated (name missing: readiness rule intact) |
+| discovery turn 2 | `POST /chat` "My name is Sam." + self-reported email | CONTEXTUAL_ANSWER; the model's `save_customer_profile_field` completed the profile; the server generated through `should_generate` -> real engine (7 buildable candidates, mocked stock) -> bridge; SSE order `chunk` before `preview_ready`; `previewUrl` on the trusted shop with `bt` |
+| explanation turn | `POST /chat` | model reply only; no generation |
+| refinement | `POST /chat` -> `refine_fragrance_recommendation` | second recommendation from the real refinement path |
+| preview | `GET .../fragrance-preview` | 403 without `bt`, 403 with the other build's `bt`, 200 with its own; HTML free of source titles, scores, item codes, Shopify ids and the conversation token |
+| recreate | `POST` intent `recreate` | re-entry message appended by the POST only; marker consumed by the next turn |
+| blocked commerce | `POST` intent `save_build` | one component short -> `inventory_insufficient`, zero Shopify writes, design kept; `ON_HAND_INCLUDES_RESERVED` -> `inventory_unconfirmed` decided before any lookup; invalid ratios -> refused before mutation; other build's capability -> `build_not_authorized` |
+| controlled save | `POST` intent `save_build` | `POLICY_SATISFIED` on the declared synthetic contract; write order `create_product < set_variant_price < read:pricing < activate_product < publish_to_all_channels`; Odoo asked exactly for the component items; `buildStatus=saved`, product id = the server-created id |
+| deletion | `POST /chat/delete` | 503 `deletion_unavailable` by default (nothing changed); with the review flag: 401 without the token, 409 while a turn holds the lock (credential untouched), 200 committed; afterwards history 401, chat 401, preview 403, recreate refused; 0 messages / profile / conversation rows, 1 tombstone, commerce record minimized |
+| attack turns (2) | `POST /chat` after a recommendation | ATTACK_EXTRACTION by layer 1; zero model requests of any kind, zero stock lookups, profile and recommendation rows unchanged, raw text stored with its classification and never replayed to a model |
+| unresolved turn | `POST /chat` with the classifier unavailable | exactly one classifier attempt (message + boolean only, no token), UNRESOLVED reply, no extraction, no tool, no generation, no stock lookup |
+
+Captured and inspected: 42 model requests (5 extraction, 5 main completions, 2 bridges, 30 copy
+calls), every SSE line, every JSON body, the preview HTML. Private material found in any of them:
+**none** (source titles, item codes, stock location, `available_qty`/`on_hand_qty`, evidence
+counts, Shopify ids, capability tokens, recommendation ids, control fields all absent). The word
+"Odoo" appears once, inside the static system prompt's instruction not to mention it (B16).
+
+A deliberate synthetic negative: the pipeline refused to confirm while the blend record had no
+email (`AUTOSELECT_FAILED identity_missing`); it did not report that as an availability problem.
+
+### 22.4 Authorization and commerce recheck
+
+All fourteen properties from the brief hold with executed evidence: arbitrary shop cannot set a
+credential destination (`test_trusted_shop.py`); redirects disabled (`test_shopify_admin_client.py`,
+`test_shopify_contract_7.py`); product ids from server state and persisted with the record;
+identity checked before writes; conversation, build and internal capabilities are separate
+objects; identifiers, emails, names, `Origin`, `shop` authorize nothing; expired/revoked fail;
+detached records refuse; invalid ratios/names/prices fail before mutation; concurrent operations
+refused by lock; markers survive ambiguity; publication after pricing and read-back; inventory
+uncertainty blocks. Read routes recreate nothing after deletion (22.3).
+
+### 22.5 Adversarial tallies (layer 1, re-measured at this commit; no live model)
+
+Attacks 51/51 blocked; paraphrases 15/15 kept from the model (12 attack, 3 off-topic redirect);
+off-topic 10/10 redirected; benign without context 68/76 handled correctly (60 model, 8
+service-meta server replies), 0 false positives, 8 unresolved; benign with a pending question
+74/76, 2 unresolved. False negatives on the corpus: 0. Live-model run: NOT RUN. New observation:
+"My name is Sam and you can reach me at sam@example.com." is unresolved by layer 1; with the
+classifier unavailable the customer is asked to restate (fail closed, by design). The widget's
+`customer_email` body field is the path a signed-in customer's email takes. F4/F5 stay PARTIAL.
+
+### 22.6 Local CI equivalents executed
+
+| Step | Result |
+|---|---|
+| `ruff check app tests scripts/data_retention.py` | clean |
+| lock sync (`pip-compile` both sets, diff without comments) | identical pins and hashes |
+| `pip-audit` on both locked sets (2026-09-22 05:47 UTC, public advisory data) | no known vulnerabilities |
+| `python -m scripts.startup_check` | `startup check ok` |
+| `python -m scripts.verify_migrations` on the Phase 8 database and on a clean database | `migrations verified` |
+| `pytest tests/security` | 849 passed |
+| `pytest` (deterministic suite) | 1413 passed, 43 deselected |
+| `mypy app scripts --ignore-missing-imports` (not adopted in CI) | 66 errors in 21 files (Phase 7 reported 68 with its environment); every site reviewed: annotation gaps and SQLAlchemy/pydantic typing (e.g. `Result.rowcount`, `Settings()` env loading, `dict[str, object]` regex maps). Runtime-relevant candidates checked by reading the code: `chat.py:259` (a `None` token is rejected by `authorize_conversation`), `data_lifecycle.py:217` (tombstone flushed in the same transaction), `legacy_preview_recovery.py:39-66` (message guarded by `or ""` first), `builds.py:252/354/369` (`None` prices fail closed as `InvalidComputedPrice`, product `None` raises `ProductPricingNotFound`). **0 runtime defects, 0 security mistakes; no code change made for mypy.** |
+| image build | NOT RUN (no container runtime) |
+| hosted CI | NOT RUN (never pushed) |
+
+`reference_data` (13, listed in `docs/PLATFORM_MODERNIZATION.md` section 5 and in
+`docs/RELEASE_READINESS.md` B13): NOT RUN, need the production reference catalog; they assert
+ranking facts about that catalog, not security. `live_ai` (30: 24 red-team, 5 simulation, 1
+intelligence): NOT RUN, not authorized.
+
+### 22.7 Secret hygiene
+
+A redacted pattern scan (Shopify/OpenAI/GitHub/AWS key shapes, private-key blocks, URL-embedded
+passwords, generic `secret=`/`token=` literals) over every line added on the branch since
+`c1f6530^` matched only synthetic test fixtures, CI placeholders and sentinel markers that the
+tests deliberately assert never leak. No `.env` or key file is tracked (`.env.example` only). No
+environment value was printed during this phase.
+
+### 22.8 Changes made in this phase
+
+`tests/security/test_final_validation_8.py` (new), `docs/SECURITY_ARCHITECTURE.md` (new),
+`docs/RELEASE_READINESS.md` (new), this section, `docs/AI_RED_TEAM_RESULTS.md` section 4. No
+application code changed: the recommendation engine, scoring, compatibility, combination and ratio
+logic are byte-identical to Phase 0. No configuration default changed.
+
+### Finding status
+
+CLOSED: F1, F2, F3, F6, F7, F8, N1, N2, N5, N6, N8, N9, N10, N12, N13, N14, N16, N17, and the
+Phase 5 / 6A / 7 defects. PARTIAL: F4, F5 (no live model), F9 (commerce blocked by default; no
+Odoo contract, reservation, checkout enforcement or manufacturing acceptance), F10 (no dev-store
+validation), F11 (shared-database review, retention approval, external copies), F12 (no hosted
+CI, no image build), N3 (theme). OPEN: N4 (low, accepted), N7, N11 (low, mitigated), N15 (low,
+accepted), credential rotation (operator).
