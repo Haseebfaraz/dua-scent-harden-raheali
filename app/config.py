@@ -42,13 +42,15 @@ class Settings(BaseSettings):
     # Destructive retention runs are OFF until an operator reviews the policy. With this false the
     # maintenance command can only ever dry-run, whatever flags it is given.
     retention_execution_enabled: bool = False
-    # Phase 6A: the customer deletion route is OFF until the shared-database review in
-    # docs/DATA_RETENTION_AND_DELETION.md section 2 has been done. The rows it removes
-    # (Conversation, Message, CustomerProfileState, FragranceRecommendation) live in tables the
-    # other application also owns, and whether it still reads them could not be verified from this
-    # repository. While false the route answers 503 and changes nothing: no revocation, no marker.
-    # Setting this to true is NOT the review; it records that the review happened.
-    customer_deletion_enabled: bool = False
+    # Phase 6A / 7: EVERY destructive path (the customer deletion route AND age-based retention)
+    # is OFF until the shared-database review in docs/DATA_RETENTION_AND_DELETION.md section 2a
+    # has been done. The rows removed (Conversation, Message, CustomerProfileState,
+    # FragranceRecommendation) live in tables the other application also owns, and whether it
+    # still reads them could not be verified from this repository. The check sits at the common
+    # destructive boundary (data_lifecycle.delete_conversation), so no execution flag can bypass
+    # it. While false the route answers 503 and retention deletes nothing; neither writes
+    # anything. Setting this to true is NOT the review; it records that the review happened.
+    shared_data_deletion_reviewed: bool = False
     # A guest conversation is inactive when its LAST CUSTOMER MESSAGE (or, with none, its creation)
     # is older than this. Reads, polling, assistant or server writes never extend it.
     retention_inactive_conversation_days: int = 90
@@ -99,9 +101,13 @@ class Settings(BaseSettings):
     shopify_shop_domain: str = ""
     shopify_app_url: str = ""
     scopes: str = ""
-    # Node hardcodes ApiVersion.October25; shopify.app.toml's [webhooks] separately says 2025-04 --
+    # History: Node hardcoded ApiVersion.October25; shopify.app.toml's [webhooks] said 2025-04 --
     # picking one canonical value here rather than porting that mismatch.
-    shopify_api_version: str = "2025-04"
+    # Phase 7 (F10): 2026-07, verified against shopify.dev on 2026-09-21 (support until 2027-07-16).
+    # The previous default, 2025-04, left support in April 2026; Shopify then serves the oldest
+    # supported version instead and admin_client refuses that mismatch. Must be a released stable
+    # version (YYYY-MM); never "unstable" or a release candidate.
+    shopify_api_version: str = "2026-07"
 
     # Shared secret for the Node Shopify adapter -> this service hop (never customer-facing).
     # Enforced only when set, so local dev without it configured still works.

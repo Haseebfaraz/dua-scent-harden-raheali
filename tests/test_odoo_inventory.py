@@ -10,6 +10,9 @@ from app.db.time import utcnow
 from app.services import odoo_inventory
 
 
+# Phase 7: these tests need a product / hybrid / order-history row to exist, not the real catalog.
+pytestmark = pytest.mark.usefixtures("synthetic_catalog")
+
 def _mock_response(products, success=True, ok=True):
     return {"ok": ok, "status": 200, "json": {"success": success, "products": products}}
 

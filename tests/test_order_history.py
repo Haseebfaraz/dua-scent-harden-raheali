@@ -6,6 +6,8 @@ from sqlalchemy import select
 from app.db.models import ProductRegionSummary
 from app.services.order_history import analyze_customer_product_candidates
 
+pytestmark = pytest.mark.usefixtures("synthetic_catalog")
+
 ACCEPTANCE_PROFILE = {
     "city": "Los Angeles",
     "stateRegion": "California",
@@ -27,6 +29,7 @@ async def test_returns_real_catalog_backed_candidates(db_session):
         assert isinstance(c["orderHistoryNotes"], list)
 
 
+@pytest.mark.reference_data  # asserts what the REAL catalog contains; see docs/PLATFORM_MODERNIZATION.md
 @pytest.mark.asyncio
 async def test_carries_real_per_dimension_evidence_counts(db_session):
     candidates = await analyze_customer_product_candidates(db_session, ACCEPTANCE_PROFILE)

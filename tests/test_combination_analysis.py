@@ -9,6 +9,9 @@ from app.services.combination_analysis import (
 )
 
 
+# Phase 7: these tests need a product / hybrid / order-history row to exist, not the real catalog.
+pytestmark = pytest.mark.usefixtures("synthetic_catalog")
+
 @pytest.mark.asyncio
 async def test_confirms_real_hybrid_regardless_of_order(db_session):
     real = await db_session.scalar(select(ExistingCombination).where(ExistingCombination.type == "HYBRID").limit(1))

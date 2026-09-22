@@ -94,7 +94,7 @@ def shopify(monkeypatch):
         if "productVariantsBulkCreate" in name:
             return {"data": {"productVariantsBulkCreate": {"userErrors": [], "productVariants": [{"id": "gid://shopify/ProductVariant/2", "price": variables["variants"][0]["price"]}]}}}
         if "inventoryItemUpdate" in name:
-            return {"data": {"inventoryItemUpdate": {"userErrors": []}}}
+            return {"data": {"inventoryItemUpdate": {"inventoryItem": {"id": variables["id"], "tracked": False}, "userErrors": []}}}
         return {"data": {}}
 
     monkeypatch.setattr(products, "admin_graphql", _fake_admin_graphql)

@@ -3,28 +3,43 @@ name = "dua-scent-ai-python"
 version = "0.1.0"
 description = "DUA Scent AI Core Backend -- FastAPI service for the fragrance blend-builder recommendation engine, conversation orchestration, and Odoo inventory integration."
 requires-python = ">=3.12"
+# Direct runtime dependencies. Lower bounds are the versions the code was written against; the
+# exact resolved set (with hashes) that production and CI install is requirements.txt, produced
+# by `make lock` (docs/PLATFORM_MODERNIZATION.md). Upper bounds stop the next major release of a
+# validation- or transport-critical library changing security semantics without a review.
 dependencies = [
-    "fastapi>=0.115",
-    "uvicorn[standard]>=0.32",
-    "pydantic>=2.9",
-    "pydantic-settings>=2.6",
-    "sqlalchemy>=2.0",
-    "asyncpg>=0.30",
-    "httpx>=0.27",
-    "jinja2>=3.1",
+    "fastapi>=0.115,<1",
+    "uvicorn[standard]>=0.32,<1",
+    "pydantic>=2.9,<3",
+    "pydantic-settings>=2.6,<3",
+    "sqlalchemy>=2.0,<3",
+    # Phase 7: SQLAlchemy's asyncio extension imports greenlet at runtime; it was only ever an
+    # implicit transitive install before.
+    "greenlet>=3.1,<4",
+    "asyncpg>=0.30,<1",
+    "httpx>=0.27,<1",
+    "jinja2>=3.1,<4",
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=8.3", "pytest-asyncio>=0.24"]
+# Test and lint tooling (requirements-dev.txt). pgserver is the embedded PostgreSQL used only for
+# local runs; CI uses a PostgreSQL service container instead.
+dev = ["pytest>=8.3", "pytest-asyncio>=0.24", "ruff>=0.6", "pip-audit>=2.7"]
+localdb = ["pgserver>=0.1"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 # live_ai tests make real, paid OpenAI calls (agent + simulator + judge models) and can take a
 # long time -- excluded by default so a bare `pytest` run never triggers them by accident. Run
 # them explicitly with `pytest -m live_ai` (overrides this default marker filter).
-addopts = "-m 'not live_ai'"
+# reference_data tests assert what the production catalog contains (specific notes, fallback
+# anchors, per-region evidence counts) and cannot pass against a synthetic catalog; they need the
+# reference dataset described in docs/PLATFORM_MODERNIZATION.md. They are deselected by default and
+# listed in the CI summary. Run them explicitly with `pytest -m reference_data`.
+addopts = "-m 'not live_ai and not reference_data'"
 markers = [
     "live_ai: makes real, paid OpenAI API calls -- excluded from the default run, opt in with -m live_ai",
+    "reference_data: needs the production reference catalog (unavailable in CI) -- excluded from the default run, opt in with -m reference_data",
     "expects_network_block: the test deliberately attempts a connection to prove the default-deny network guard blocks it",
 ]
 
@@ -37,3 +52,15 @@ include = ["app*"]
 
 [tool.setuptools.package-data]
 app = ["templates/*.html", "static/css/*.css", "static/js/*.js"]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 200
+# Only these two directories were ever linted; scripts/ carries pre-existing style debt that is
+# out of scope for CI to enforce on this branch.
+extend-exclude = ["dua_scent_ai_python.egg-info"]
+
+[tool.ruff.lint]
+# F = pyflakes (undefined names, unused imports/variables). Style rules are deliberately not
+# enforced: the codebase predates the linter and mass reformatting is out of scope.
+select = ["F"]

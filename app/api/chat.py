@@ -54,7 +54,7 @@ from app.services.conversation_capability import (
     create_conversation_with_capability,
 )
 from app.services.customer_identity import SelfReportedIdentity, self_reported_identity
-from app.services.data_lifecycle import delete_conversation, evict_local_caches, is_conversation_deleted
+from app.services.data_lifecycle import SharedDataReviewPending, delete_conversation, evict_local_caches, is_conversation_deleted
 from app.services.customer_profile import get_customer_profile, save_customer_profile_field
 from app.services.legacy_preview_recovery import resolve_legacy_preview_short_circuit
 from app.services.rate_limit import Limit, RateLimitUnavailable, RateLimited, enforce, hash_abuse_identity, limit
@@ -507,14 +507,13 @@ async def delete_conversation_route(request: Request, body: ChatDeleteRequest, s
         await authorize_conversation(session, token=token, conversation_id=conversation_id)
     except ConversationNotAuthorized:
         return JSONResponse(_NOT_AUTHORIZED_BODY, status_code=401, headers=NO_STORE_HEADERS)
-    if not settings.customer_deletion_enabled:
-        # Fail closed BEFORE any irreversible step: no revocation, no marker, no purge
-        # (docs/DATA_RETENTION_AND_DELETION.md section 2: the shared-database review is pending).
-        logger.info("CONVERSATION_DELETE_UNAVAILABLE %s", json.dumps({"reason": "customer_deletion_disabled"}))
-        return JSONResponse(_DELETION_UNAVAILABLE_BODY, status_code=503, headers=NO_STORE_HEADERS)
-
     try:
         result = await delete_conversation(session, conversation_id)
+    except SharedDataReviewPending:
+        # Fail closed BEFORE any irreversible step: no revocation, no marker, no purge
+        # (docs/DATA_RETENTION_AND_DELETION.md section 2a: the shared-database review is pending).
+        logger.info("CONVERSATION_DELETE_UNAVAILABLE %s", json.dumps({"reason": "shared_data_review_pending"}))
+        return JSONResponse(_DELETION_UNAVAILABLE_BODY, status_code=503, headers=NO_STORE_HEADERS)
     except Exception as err:
         logger.error("CONVERSATION_DELETE_FAILED %s", json.dumps({"errorType": type(err).__name__}))
         return JSONResponse({"error": "We couldn't process this request right now. Nothing has been deleted yet. Please try again.", "code": "deletion_failed"}, status_code=503, headers=NO_STORE_HEADERS)

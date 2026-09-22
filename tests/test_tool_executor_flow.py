@@ -13,6 +13,8 @@ from app.services import copy_generation
 from app.services.customer_profile import get_customer_profile, save_customer_profile_fields
 from app.services.recommendation_engine import has_hard_excluded_family
 
+pytestmark = pytest.mark.usefixtures("synthetic_catalog")
+
 SHOP_DOMAIN = "test-shop.myshopify.com"
 
 
@@ -179,6 +181,7 @@ def test_derive_refinement_negation_direction():
     assert "Sweet" not in result["addLikes"]
 
 
+@pytest.mark.reference_data  # asserts what the REAL catalog contains; see docs/PLATFORM_MODERNIZATION.md
 @pytest.mark.asyncio
 async def test_refine_carries_unrecognized_keyword_family_into_profile(db_session):
     conversation_id = _conversation_id("refine-dislike")
@@ -198,6 +201,7 @@ async def test_refine_carries_unrecognized_keyword_family_into_profile(db_sessio
         await _cleanup(db_session, conversation_id)
 
 
+@pytest.mark.reference_data  # asserts what the REAL catalog contains; see docs/PLATFORM_MODERNIZATION.md
 @pytest.mark.asyncio
 async def test_refine_hard_excludes_named_family(db_session):
     conversation_id = _conversation_id("refine-hardexclude")
@@ -219,6 +223,7 @@ async def test_refine_hard_excludes_named_family(db_session):
         await _cleanup(db_session, conversation_id)
 
 
+@pytest.mark.reference_data  # asserts what the REAL catalog contains; see docs/PLATFORM_MODERNIZATION.md
 @pytest.mark.asyncio
 async def test_refine_recognizes_note_with_no_family_entry(db_session):
     conversation_id = _conversation_id("refine-orphan-note")
@@ -256,6 +261,7 @@ async def test_refine_recognizes_note_with_no_family_entry(db_session):
         await _cleanup(db_session, conversation_id)
 
 
+@pytest.mark.reference_data  # asserts what the REAL catalog contains; see docs/PLATFORM_MODERNIZATION.md
 @pytest.mark.asyncio
 async def test_refine_persists_refinement_into_stored_profile(db_session):
     conversation_id = _conversation_id("refine-persist")
@@ -313,7 +319,7 @@ async def test_select_recommendation_rehydrates_from_db_when_scratch_empty(db_se
         }
 
     try:
-        first_id = await save_recommendation(db_session, conversation_id=conversation_id, profile=profile, combination=combo("Alpha"))
+        await save_recommendation(db_session, conversation_id=conversation_id, profile=profile, combination=combo("Alpha"))
         second_id = await save_recommendation(db_session, conversation_id=conversation_id, profile=profile, combination=combo("Beta"))
 
         result = await execute_fragrance_tool(db_session, "select_recommendation", '{"selectionText": "2"}', _ctx(conversation_id))

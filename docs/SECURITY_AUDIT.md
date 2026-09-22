@@ -1372,3 +1372,86 @@ stays off until it is done); no deletion of Shopify (N7), log, backup or model-p
 **N14: CLOSED**, unchanged. F4, F5, F9 PARTIAL, N3 blocked on the theme, N7, F10, F12 open,
 credential rotation pending. F1, F2, N1, F6, F7, F8, N2, F3, N5, N8, N13: regression suites
 passing unchanged. Inventory commerce still fails closed.
+
+
+---
+
+## 21. Phase 7 (2026-09-21): Shopify API compatibility, dependency security, Python 3.12 parity, CI
+
+Branch `security-hardening`, continuing after `6e8d2ff`. Nothing deployed or pushed; no store,
+Odoo, geocoding or model call; no credential rotated; no gate enabled. Read-only use of
+shopify.dev, PyPI, the OSV advisory service and the GitHub tags API. Full detail:
+`docs/PLATFORM_MODERNIZATION.md`.
+
+### Phase 6A carryovers
+
+| Carryover | Finding | Correction | Test |
+|---|---|---|---|
+| A: "a 401 on a retry means the deletion completed" | The chat contract and the retention document both made that claim. A 401 is also what an expired, revoked or wrong token gets. | Both documents now state that a 401 is not proof of deletion, that only the 200 confirms completion, and that the widget must present "completion could not be confirmed". No application change: no id-only status endpoint, no receipt. | `test_a_401_is_never_documented_as_proof_of_deletion` |
+| B: the shared-data gate lived only in the HTTP route | `run_retention` → `delete_conversation` had no gate: enabling `RETENTION_EXECUTION_ENABLED` alone would have deleted the same shared rows. | The gate (`SHARED_DATA_DELETION_REVIEWED`, default false, replaces `CUSTOMER_DELETION_ENABLED`) is checked inside `delete_conversation`, the one boundary every destructive caller passes through. Retention with the review pending degrades to a dry run and reports `held.sharedDataReviewPending`; the route answers 503; direct callers get `SharedDataReviewPending`. | `test_enabling_retention_alone_cannot_bypass_the_shared_data_review` |
+
+### F10: original state, implementation, residual risk
+
+Original: `SHOPIFY_API_VERSION` defaulted to `2025-04`, which Shopify stopped supporting in April
+2026; Shopify then silently serves the oldest supported version. `productCreate` / `productUpdate`
+used the deprecated `input: ProductInput` argument. `set_variant_price`, `rename_product`,
+`set_inventory_item_untracked` and `publish_to_all_channels` ignored `userErrors`; top-level
+GraphQL `errors` (including throttling) and non-JSON bodies were passed through as if they were
+results.
+
+Implementation: version `2026-07` (verified 2026-09-21; supported until 2027-07-16); the served
+version header is compared and a mismatch refused; top-level errors, throttling, malformed bodies
+and missing `data` are typed transport errors carrying reason codes only; every mutation checks
+its result; `productCreate` / `productUpdate` use `product: ProductCreateInput` /
+`ProductUpdateInput`; a created product must come back as `DRAFT`. Every Phase 1 / 5 / 5A
+semantic (trusted shop, no redirects, capability ownership, DB-derived ids, identity checks,
+ratio / name / price validation, inventory preflight, draft-first, read-back before activation,
+durable markers, no automatic retry) is unchanged and its suites pass.
+
+Tests: `tests/security/test_shopify_contract_7.py` (29): version format and endpoint, served
+version mismatch refused and classified ambiguous, six transport failure shapes, HTTP status
+errors, request shape and result validation for every operation, and six creation failures
+(throttled / version mismatch / userError on create, throttled on price, errors and timeout on
+activation) that never publish, never report success and never retry. `tests/test_shopify_products.py`
+updated to the new contract.
+
+Residual risk: **not validated against a live store** (not authorized). **F10: PARTIAL.**
+
+### F12: original state, implementation, residual risk
+
+Original: no workflow files; dependencies unconstrained above a lower bound and re-resolved at
+every install; `greenlet` undeclared; no vulnerability audit; the suite always red (57 failures)
+so a green run was impossible; previous phases ran on Python 3.11 with `--ignore-requires-python`.
+
+Implementation: Python 3.12 environment (standalone build, isolated venv) and baseline parity
+(identical result to 3.11 at `6e8d2ff`); hash-locked `requirements.txt` / `requirements-dev.txt`
+produced by pip-tools and consumed by the Dockerfile, CI and `make install*`; `pip-audit` on both
+sets (2026-09-22, no advisories, no exceptions); the 57 failures classified (44 now own synthetic
+data, 2 were wrong assertions hidden behind the data failure, 5 were unmocked model calls the
+network guard exposed once a catalog existed, 13 genuinely need the reference catalog and are
+marked, deselected and listed in the CI summary); `ci.yml` (lint, lock sync, audit, startup
+check, migration verification, security suite, full deterministic suite) with `contents: read`,
+no secrets, SHA-pinned actions verified against the GitHub API; a manual `live-eval.yml` that is
+not triggered; `ruff` clean; `scripts/verify_migrations.py` and `scripts/startup_check.py`; a
+two-stage Dockerfile installing from the lock with a deny-by-default `.dockerignore`.
+
+Residual risk: the workflows have not run on GitHub; no container image was built (no runtime on
+this machine); type checking is not adopted (68 mypy errors, documented). **F12: PARTIAL.**
+
+### Test results (Python 3.12.14, disposable PostgreSQL 16.2, migrations 0001 to 0004)
+
+| Suite | Result |
+|---|---|
+| Baseline `6e8d2ff` on Python 3.12 | 1333 passed, 57 failed, 30 deselected (identical to the 3.11 result) |
+| Full deterministic suite now | 1409 passed, 0 failed, 43 deselected (13 `reference_data` + 30 `live_ai`), 0 skipped |
+| `tests/security/` | 845 passed, 0 failed |
+| `reference_data` (13) | NOT RUN: needs the production catalog |
+| `live_ai` (30) | NOT RUN: by instruction |
+| Phase 0 harness | unchanged |
+
+### Finding status
+
+F10 PARTIAL, F12 PARTIAL, F4 / F5 PARTIAL (no live validation; `live-eval.yml` exists but was not
+run), F9 PARTIAL (commerce still fails closed), F11 PARTIAL (review pending; both destructive
+paths now gated at one boundary), N3 blocked on the theme, N7 open, credential rotation pending.
+F1, F2, N1, F6, F7, F8, N2, F3, N5, N8, N13, N14: regression suites passing unchanged on 3.12.

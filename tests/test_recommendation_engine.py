@@ -16,7 +16,6 @@ from app.fragrance.scoring import classify_dislike_conflict, like_match_strength
 from app.services import copy_generation
 from app.services.order_history import analyze_customer_product_candidates
 from app.services.recommendation_engine import (
-    CUSTOMER_FIT_LOW_THRESHOLD,
     MAX_HISTORY_SCORE,
     assign_roles,
     build_fallback_anchors_for_missing_terms,
@@ -29,6 +28,8 @@ from app.services.recommendation_engine import (
     validate_combination_shape,
 )
 
+
+pytestmark = pytest.mark.usefixtures("synthetic_catalog")
 
 @pytest.fixture(autouse=True)
 def _no_real_openai_calls(monkeypatch):
@@ -383,6 +384,7 @@ _KARACHI_PROFILE = {
 }
 
 
+@pytest.mark.reference_data  # asserts what the REAL catalog contains; see docs/PLATFORM_MODERNIZATION.md
 @pytest.mark.asyncio
 async def test_only_returns_combinations_with_literal_named_notes(db_session):
     candidates = await analyze_customer_product_candidates(db_session, _KARACHI_PROFILE)
@@ -394,6 +396,7 @@ async def test_only_returns_combinations_with_literal_named_notes(db_session):
         assert literal_note_match_count(all_notes, literal_terms) > 0
 
 
+@pytest.mark.reference_data  # asserts what the REAL catalog contains; see docs/PLATFORM_MODERNIZATION.md
 @pytest.mark.asyncio
 async def test_covers_every_literal_note_across_final_batch(db_session):
     candidates = await analyze_customer_product_candidates(db_session, _KARACHI_PROFILE)
@@ -412,6 +415,7 @@ async def test_covers_every_literal_note_across_final_batch(db_session):
         assert not any(t in combo["missingExactNotes"] for t in combo["matchedExactNotes"])
 
 
+@pytest.mark.reference_data  # asserts what the REAL catalog contains; see docs/PLATFORM_MODERNIZATION.md
 @pytest.mark.asyncio
 async def test_finds_real_fallback_anchors_for_strawberry(db_session):
     products = (await db_session.execute(
@@ -426,6 +430,7 @@ async def test_finds_real_fallback_anchors_for_strawberry(db_session):
         assert len(matched_literal_terms(anchor["orderHistoryNotes"], ["strawberry"])) > 0
 
 
+@pytest.mark.reference_data  # asserts what the REAL catalog contains; see docs/PLATFORM_MODERNIZATION.md
 @pytest.mark.asyncio
 async def test_apple_only_pool_still_covers_strawberry_and_peach_via_fallback(db_session):
     products = (await db_session.execute(
@@ -473,6 +478,7 @@ async def test_never_invents_anchor_for_nonexistent_note(db_session):
     assert missing_literal_terms(["Apple", "Musk", "Vanilla"], ["zzznonexistentnote"]) == ["zzznonexistentnote"]
 
 
+@pytest.mark.reference_data  # asserts what the REAL catalog contains; see docs/PLATFORM_MODERNIZATION.md
 @pytest.mark.asyncio
 async def test_fallback_batch_still_respects_hard_dislikes_and_no_duplicates(db_session):
     candidates = await analyze_customer_product_candidates(db_session, _KARACHI_PROFILE)
@@ -488,6 +494,7 @@ async def test_fallback_batch_still_respects_hard_dislikes_and_no_duplicates(db_
         assert combo["canonicalKey"] not in existing_keys
 
 
+@pytest.mark.reference_data  # asserts what the REAL catalog contains; see docs/PLATFORM_MODERNIZATION.md
 @pytest.mark.asyncio
 async def test_persists_exact_note_coverage_score(db_session):
     candidates = await analyze_customer_product_candidates(db_session, _KARACHI_PROFILE)
@@ -497,6 +504,7 @@ async def test_persists_exact_note_coverage_score(db_session):
         assert combo["exactNoteCoverageScore"] == exact_note_coverage_score(len(combo["matchedExactNotes"]))
 
 
+@pytest.mark.reference_data  # asserts what the REAL catalog contains; see docs/PLATFORM_MODERNIZATION.md
 @pytest.mark.asyncio
 async def test_preference_score_reflects_exact_note_coverage(db_session):
     candidates = await analyze_customer_product_candidates(db_session, _KARACHI_PROFILE)
@@ -540,6 +548,7 @@ async def test_floral_only_customer_every_result_matches_floral(db_session):
         assert len(floral_notes) > 0
 
 
+@pytest.mark.reference_data  # asserts what the REAL catalog contains; see docs/PLATFORM_MODERNIZATION.md
 @pytest.mark.asyncio
 async def test_floral_dominant_product_can_win_anchor_role(db_session):
     profile = {"city": "Las Vegas", "country": "United States", "season": "Summer", "likes": ["Floral"], "dislikes": [], "locationVerified": True}

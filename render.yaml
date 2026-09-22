@@ -68,4 +68,4 @@ services:
       - key: SCOPES
         value: "read_products,write_products,write_inventory,read_publications,write_publications,unauthenticated_read_product_listings,write_app_proxy"
       - key: SHOPIFY_API_VERSION
-        value: "2025-04"
+        value: "2026-07"

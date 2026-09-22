@@ -27,6 +27,20 @@ from app.db.models import CustomerProfileState, FragranceRecommendation
 from app.db.time import utcnow
 from app.services.customer_profile import empty_profile, get_customer_profile, save_customer_profile_fields
 
+pytestmark = pytest.mark.usefixtures("synthetic_catalog")
+
+
+@pytest.fixture(autouse=True)
+def _no_copy_model(monkeypatch):
+    """Phase 7: with a catalog present these turns reach the customer-copy model. It was never
+    mocked here because the catalog used to be empty; the network guard caught the attempt."""
+    from app.services import copy_generation
+
+    async def _copy(messages):
+        return {"description": "bright and airy", "whySuits": "Built around what you told me."}
+
+    monkeypatch.setattr(copy_generation, "call_copy_model", _copy)
+
 SHOP_DOMAIN = "test-shop.myshopify.com"
 
 

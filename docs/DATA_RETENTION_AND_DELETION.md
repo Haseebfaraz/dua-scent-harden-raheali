@@ -76,10 +76,13 @@ prisma/schema.prisma exactly"; the Node routes now call this backend's internal 
 the Node application still reads or writes those rows directly **could not be verified from this
 repository**. Unknown is not "verified absent".
 
-Therefore the customer deletion route is gated by `CUSTOMER_DELETION_ENABLED` (default `false`).
-While false it authorizes the caller as usual and then answers `503 deletion_unavailable` **before
-any irreversible step**: no revocation, no tombstone, no purge. **Setting the flag is not the
-review.** It records that the following review was done:
+Therefore EVERY destructive path is gated by `SHARED_DATA_DELETION_REVIEWED` (default `false`),
+checked at the one boundary all of them pass through (`delete_conversation`), before any lock,
+marker, revocation or purge. The customer route authorizes the caller as usual and then answers
+`503 deletion_unavailable`; age-based retention degrades to a dry run and reports
+`held.sharedDataReviewPending`, whatever `RETENTION_EXECUTION_ENABLED` says. Approval to run
+retention is not evidence that deleting the shared rows is safe (Phase 7). **Setting the flag is
+not the review.** It records that the following review was done:
 
 | Table / rows | Owner | This app deletes | Review required before enabling |
 |---|---|---|---|
@@ -92,8 +95,8 @@ review.** It records that the following review was done:
 | `CustomerAccountUrls` | written by Node's customer-account OAuth code | **no** (no personal data; left alone) | none needed now; if Node later stores PII there, revisit |
 | `OrderHistory`, catalog tables, `Session` | Node / operator imports | no | out of scope; `OrderHistory` needs its own lifecycle decision |
 
-Age-based retention (section 3) removes the same rows and is gated separately by
-`RETENTION_EXECUTION_ENABLED`; the review above applies to it too.
+Age-based retention (section 3) removes the same rows; `RETENTION_EXECUTION_ENABLED` is an
+additional, separate approval to run it, and cannot substitute for the review above.
 
 ## 3. Retention policy (PROVISIONAL, configurable, execution DISABLED)
 
@@ -143,9 +146,11 @@ record only, never the conversation.
 | `401` | not authorized, unknown, or already deleted | - |
 
 There is no accepted-but-pending state and no status endpoint: nothing is ever "in progress"
-across requests, so there is nothing to poll. A lost `200` response is the only ambiguity; a
-repeat then returns `401`, which for the credential that just worked means the deletion
-completed (documented in the chat contract). No email or notification is sent.
+across requests, so there is nothing to poll. A lost `200` response is the only ambiguity. A
+repeat then returns `401`, and **a `401` is not proof of deletion** (Phase 7 correction): it is
+also what an expired, revoked or wrong token gets. The only confirmation of completion is the
+`200` itself. The widget must treat a `401` on a repeat as "completion could not be confirmed"
+and say so; the customer may still clear local state. No email or notification is sent.
 
 ## 5. Dependency graph and what remains
 

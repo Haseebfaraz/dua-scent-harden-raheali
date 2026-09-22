@@ -128,7 +128,7 @@ async def world():
 
 @pytest.fixture(autouse=True)
 def _deletion_enabled(monkeypatch):
-    monkeypatch.setattr(settings, "customer_deletion_enabled", True)
+    monkeypatch.setattr(settings, "shared_data_deletion_reviewed", True)
 
 
 @pytest.fixture(autouse=True)
@@ -474,7 +474,8 @@ async def test_lock_order_is_conversation_then_builds_and_everything_is_released
     async with conversation_turn_lock(cid):
         async with build_commerce_lock(r1), build_commerce_lock(r2):
             pass
-    monkeypatch.undo()
+    monkeypatch.undo()  # also undoes the autouse review-flag patch, so it is set again explicitly
+    monkeypatch.setattr(settings, "shared_data_deletion_reviewed", True)
     async with SessionLocal() as session:  # a retry with the still-valid credential completes it
         assert (await delete_conversation(session, cid)).completed is True
 

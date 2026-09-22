@@ -1,0 +1,107 @@
+# Deterministic CI (Phase 7, F12). No production, staging, Shopify, Odoo or OpenAI credential is
+# needed or accepted: the suite runs with fake settings behind the default-deny network guard in
+# tests/conftest.py. Live-model evaluation is a separate, manual workflow (live-eval.yml).
+#
+# Action revisions are pinned to full commit SHAs. Update procedure: docs/PLATFORM_MODERNIZATION.md
+# section 7 (verify the tag -> SHA mapping on GitHub before changing a pin).
+name: ci
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PYTHON_VERSION: "3.12"
+
+jobs:
+  lint-and-audit:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1 (verified via api.github.com tags, 2026-09-22)
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0 (verified via api.github.com tags, 2026-09-22)
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - name: Install locked dev dependencies (hash-checked)
+        run: |
+          python -m pip install --quiet --upgrade pip
+          pip install --quiet --require-hashes -r requirements-dev.txt
+          pip install --quiet --no-deps -e .
+      - name: Lint (ruff, pyflakes rules)
+        run: ruff check app tests scripts/data_retention.py
+      - name: Lock files are in sync with pyproject.toml
+        run: |
+          pip install --quiet pip-tools
+          pip-compile --quiet --generate-hashes --strip-extras --resolver=backtracking -o /tmp/requirements.txt pyproject.toml
+          pip-compile --quiet --generate-hashes --strip-extras --allow-unsafe --resolver=backtracking --extra dev -o /tmp/requirements-dev.txt pyproject.toml
+          diff <(grep -v '^#' requirements.txt) <(grep -v '^#' /tmp/requirements.txt)
+          diff <(grep -v '^#' requirements-dev.txt) <(grep -v '^#' /tmp/requirements-dev.txt)
+      - name: Dependency vulnerability audit (both locked sets; fails on any advisory)
+        run: |
+          pip-audit -r requirements.txt --require-hashes --progress-spinner off --desc on
+          pip-audit -r requirements-dev.txt --require-hashes --progress-spinner off --desc on
+
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: dua
+          POSTGRES_PASSWORD: ci-only-not-a-secret
+          POSTGRES_DB: dua_ci
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U dua -d dua_ci"
+          --health-interval 5s --health-timeout 5s --health-retries 20
+    env:
+      # The ONLY network destination the test guard allows is this database.
+      DATABASE_URL: postgresql://dua:ci-only-not-a-secret@127.0.0.1:5432/dua_ci
+      OPENAI_API_KEY: ci-placeholder-not-a-key
+      OPENAI_MODEL: ci-placeholder
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1 (verified via api.github.com tags, 2026-09-22)
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0 (verified via api.github.com tags, 2026-09-22)
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - name: Install locked dev dependencies (hash-checked)
+        run: |
+          python -m pip install --quiet --upgrade pip
+          pip install --quiet --require-hashes -r requirements-dev.txt
+          pip install --quiet --no-deps -e .
+      - name: Startup check (import with fake settings; no network, no migration)
+        run: python -m scripts.startup_check
+      - name: Migration verification (synthetic base schema, 0001-0004 applied twice)
+        run: python -m scripts.verify_migrations
+      - name: Security regression suite (never optional)
+        run: python -m pytest -q -p no:cacheprovider tests/security
+      - name: Complete deterministic suite
+        run: python -m pytest -q -p no:cacheprovider -rN --junitxml=junit.xml
+      - name: Summary of what this run did NOT cover
+        if: always()
+        run: |
+          {
+            echo "## Deselected by design (not run here)"
+            echo '- `live_ai`: real model calls (manual workflow only)'
+            echo '- `reference_data`: needs the production reference catalog; run locally with `make test-reference`:'
+            python -m pytest --co -q -m reference_data -o addopts="" -p no:cacheprovider | grep '::' | sed 's/^/  - /'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1 (verified via api.github.com tags, 2026-09-22)
+        if: always()
+        with:
+          name: junit
+          path: junit.xml
+          retention-days: 7

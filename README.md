@@ -71,7 +71,7 @@ request header, query parameter, or body can ever select a different shop. See
 
 ### Database
 
-Four additive migrations are required before running this code against any database, in order
+Four additive migrations are required (verify them against a disposable database with `make migrations`) before running this code against any database, in order
 (the fourth, `migrations/0004_conversation_deletion.sql`, adds the deletion tombstone table used by
 `POST /chat/delete` and the retention command -- `docs/DATA_RETENTION_AND_DELETION.md`; without it
 every chat write fails closed):
@@ -146,6 +146,16 @@ INTERNAL_API_KEY=<same value as this service's INTERNAL_API_KEY>
 `app/routes/chat.jsx` in the Node repo proxies `/chat` requests to this service's
 `POST /internal/chat` and `GET /internal/chat/history`, streaming the SSE response straight
 through to the storefront widget with no changes to the widget's contract.
+
+### Runtime, dependencies and CI (Phase 7)
+
+Python **3.12** and PostgreSQL 16. Dependencies are installed only from the hash-locked
+`requirements.txt` (runtime) or `requirements-dev.txt` (tooling): `make install-dev`. Re-resolve
+with `make lock`, audit with `make audit`, lint with `make lint`, verify migrations against a
+disposable database with `make migrations`, run everything deterministic with `make test`. The 13
+tests marked `reference_data` need the production catalog and are deselected by default
+(`make test-reference`). `.github/workflows/ci.yml` runs the same commands; see
+`docs/PLATFORM_MODERNIZATION.md`.
 
 ### Test network isolation
 

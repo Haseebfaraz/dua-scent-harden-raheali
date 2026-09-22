@@ -134,6 +134,8 @@ def _is_definitive_rejection(err: Exception) -> bool:
     is ambiguous."""
     if isinstance(err, httpx.HTTPStatusError):
         return 400 <= err.response.status_code < 500
+    # ShopifyTransportError / ShopifyApiVersionMismatch are deliberately NOT here: top-level
+    # errors, throttling or a fallen-forward version after a mutation was sent are ambiguous.
     return type(err).__name__ in ("ShopifyGraphqlError", "ShopNotAuthenticated", "UntrustedShopError")
 
 

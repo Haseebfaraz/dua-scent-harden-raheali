@@ -111,8 +111,11 @@ Content-Type: application/json
   Do not clear the session on this response.
 * `503 deletion_unavailable` / `503 deletion_failed`: nothing was changed. Keep the session and
   show `error`.
-* `401 conversation_not_authorized`: not authorized, or the conversation no longer exists. If this
-  is the reply to a repeat of a delete request whose `200` was lost, the deletion had completed.
+* `401 conversation_not_authorized`: not authorized, or the conversation no longer exists. **This
+  is not proof of deletion**: an expired, revoked or wrong token gets the same answer. If it is
+  the reply to a repeat of a delete request whose `200` was lost, show "we couldn't confirm
+  whether the deletion completed" (the customer may still clear the local transcript) and offer
+  the contact route. Only a `200` confirms completion.
 * There is no pending state and no status endpoint: a request either completes or changes nothing.
 
 **Session reset.** Only on `200` the widget MUST discard the conversation id and token

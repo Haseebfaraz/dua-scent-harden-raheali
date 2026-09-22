@@ -27,18 +27,23 @@ def _mock_graphql(monkeypatch, response, capture=None):
 
 
 async def test_create_product_returns_product_on_success(monkeypatch):
-    _mock_graphql(monkeypatch, {"data": {"productCreate": {"product": {"id": "gid://shopify/Product/1", "handle": "x"}, "userErrors": []}}})
+    calls = []
+    _mock_graphql(monkeypatch, {"data": {"productCreate": {"product": {"id": "gid://shopify/Product/1", "handle": "x", "status": "DRAFT"}, "userErrors": []}}}, capture=calls)
     result = await create_product(
         None, SHOP, title="Custom Blend", description_html="<p>x</p>", vendor="The Dua Brand",
         template_suffix="custom-scent", product_options=[], metafields=[],
     )
-    assert result == {"id": "gid://shopify/Product/1", "handle": "x"}
+    assert result == {"id": "gid://shopify/Product/1", "handle": "x", "status": "DRAFT"}
+    # Phase 7: the non-deprecated `product: ProductCreateInput` argument, created as DRAFT.
+    assert "productCreate(product: $product)" in calls[0]["query"] and calls[0]["variables"]["product"]["status"] == "DRAFT" and "input" not in calls[0]["variables"]
 
 
 async def test_create_product_raises_on_user_errors(monkeypatch):
     _mock_graphql(monkeypatch, {"data": {"productCreate": {"product": None, "userErrors": [{"field": "title", "message": "bad title"}]}}})
-    with pytest.raises(ShopifyGraphqlError, match="bad title"):
+    # Phase 7: the exception carries a reason code, never Shopify's raw message (it can echo input).
+    with pytest.raises(ShopifyGraphqlError, match="product_create_rejected") as err:
         await create_product(None, SHOP, title="", description_html="", vendor="", template_suffix="", product_options=[], metafields=[])
+    assert "bad title" not in str(err.value)
 
 
 async def test_get_default_variant_id_returns_first_edge(monkeypatch):
@@ -67,7 +72,7 @@ async def test_rename_product_sends_trimmed_title(monkeypatch):
     calls = []
     _mock_graphql(monkeypatch, {"data": {"productUpdate": {"userErrors": []}}}, capture=calls)
     await rename_product(None, SHOP, "gid://shopify/Product/1", "  My Blend  ")
-    assert calls[0]["variables"]["input"]["title"] == "My Blend"
+    assert calls[0]["variables"]["product"]["title"] == "My Blend" and "productUpdate(product: $product)" in calls[0]["query"]
 
 
 async def test_get_product_for_pricing_returns_product_payload(monkeypatch):
@@ -84,8 +89,9 @@ async def test_create_variant_returns_new_variant(monkeypatch):
 
 async def test_create_variant_raises_on_user_errors(monkeypatch):
     _mock_graphql(monkeypatch, {"data": {"productVariantsBulkCreate": {"userErrors": [{"field": "price", "message": "invalid price"}], "productVariants": []}}})
-    with pytest.raises(ShopifyGraphqlError, match="invalid price"):
+    with pytest.raises(ShopifyGraphqlError, match="variant_create_rejected") as err:
         await create_variant(None, SHOP, "gid://shopify/Product/1", "-1", [])
+    assert "invalid price" not in str(err.value)
 
 
 async def test_set_inventory_item_untracked_skips_none(monkeypatch):
@@ -95,7 +101,18 @@ async def test_set_inventory_item_untracked_skips_none(monkeypatch):
     assert calls == []
 
 
-async def test_attach_product_media_and_set_variant_price_do_not_raise(monkeypatch):
+async def test_attach_product_media_does_not_raise(monkeypatch):
     _mock_graphql(monkeypatch, {"data": {}})
     await attach_product_media(None, SHOP, "gid://shopify/Product/1", "https://example.com/x.png", "alt")
+
+
+async def test_set_variant_price_requires_a_confirmed_result(monkeypatch):
+    """Phase 7: a price update that Shopify did not confirm used to pass silently."""
+    _mock_graphql(monkeypatch, {"data": {"productVariantsBulkUpdate": {"productVariants": [{"id": "gid://shopify/ProductVariant/1", "price": "19.99"}], "userErrors": []}}})
     await set_variant_price(None, SHOP, "gid://shopify/Product/1", "gid://shopify/ProductVariant/1", "19.99")
+    for bad in ({"data": {}}, {"data": {"productVariantsBulkUpdate": {"productVariants": [], "userErrors": []}}},
+                {"data": {"productVariantsBulkUpdate": {"productVariants": [{"id": "gid://shopify/ProductVariant/OTHER", "price": "19.99"}], "userErrors": []}}},
+                {"data": {"productVariantsBulkUpdate": {"productVariants": [], "userErrors": [{"field": "price", "message": "x"}]}}}):
+        _mock_graphql(monkeypatch, bad)
+        with pytest.raises(ShopifyGraphqlError):
+            await set_variant_price(None, SHOP, "gid://shopify/Product/1", "gid://shopify/ProductVariant/1", "19.99")

@@ -9,6 +9,9 @@ from app.db.models import CustomerProfileState, FragranceRecommendation
 from app.services.legacy_preview_recovery import resolve_legacy_preview_short_circuit
 from app.services.recommendation_confirmation import save_recommendation
 
+# Phase 7: these tests need a product / hybrid / order-history row to exist, not the real catalog.
+pytestmark = pytest.mark.usefixtures("synthetic_catalog")
+
 SHOP_DOMAIN = "test-shop.myshopify.com"
 
 _PAIR_A = {"first": {"title": "The Opera", "notes": ["Rose", "Fruity Notes", "Ambergris", "Leather", "Nutmeg", "Cedar", "Vanilla", "Musk"]}, "second": {"title": "Water of Arabia", "notes": ["Mandarin", "Bergamot", "Blackcurrant", "Green Tea", "Sandalwood"]}}
@@ -50,7 +53,9 @@ async def test_resolves_bare_1_against_most_recent_batch(db_session):
         result = await resolve_legacy_preview_short_circuit(db_session, conversation_id, "1", "Test", "test@example.com", SHOP_DOMAIN)
         assert result is not None
         assert result["recommendationId"] == first_id
-        assert result["previewUrl"] == build_preview_url(SHOP_DOMAIN, first_id)
+        # Phase 1 changed this contract (the preview URL now carries a build capability, `bt=`);
+        # the assertion was hidden behind the missing-catalog failure until Phase 7.
+        assert result["previewUrl"].startswith(build_preview_url(SHOP_DOMAIN, first_id)) and "&bt=" in result["previewUrl"]
 
         record = await db_session.scalar(select(FragranceRecommendation).where(FragranceRecommendation.id == first_id))
         assert record.status == "confirmed"

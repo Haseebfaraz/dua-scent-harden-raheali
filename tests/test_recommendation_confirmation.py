@@ -16,6 +16,8 @@ from app.services.recommendation_confirmation import (
 )
 
 
+pytestmark = pytest.mark.usefixtures("synthetic_catalog")
+
 async def _base_combination(session):
     real_product = await session.scalar(
         select(FragranceProduct).where(FragranceProduct.notesJson.is_not(None)).where(~FragranceProduct.title.contains("pytest")).limit(1)

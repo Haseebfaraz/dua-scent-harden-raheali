@@ -4,6 +4,9 @@ import pytest
 from app.services import location_verification as lv
 
 
+# Phase 7: these tests need a product / hybrid / order-history row to exist, not the real catalog.
+pytestmark = pytest.mark.usefixtures("synthetic_catalog")
+
 def _mock_geocode_response(results):
     return httpx.Response(200, json={"results": results})
 

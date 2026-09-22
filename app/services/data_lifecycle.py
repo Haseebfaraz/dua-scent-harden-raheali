@@ -108,6 +108,12 @@ class ConversationDeleted(Exception):
     minimized, detached commerce record)."""
 
 
+class SharedDataReviewPending(Exception):
+    """Phase 7: destructive deletion of rows in shared tables is off until the shared-database
+    review has been recorded (settings.shared_data_deletion_reviewed). Raised at the common
+    boundary, before any lock, marker, revocation or purge, whichever caller asks."""
+
+
 def _now() -> datetime:
     return utcnow()
 
@@ -177,6 +183,8 @@ async def delete_conversation(session: AsyncSession, conversation_id: str, *, or
     from app.services.build_commerce import BuildOperationInProgress, build_commerce_lock
     from app.services.turn_lock import TurnInProgress, conversation_turn_lock
 
+    if not settings.shared_data_deletion_reviewed:
+        raise SharedDataReviewPending()  # the ONE place every destructive caller passes through
     key = conversation_key(conversation_id)
     if await is_conversation_deleted(session, conversation_id):
         held = await session.scalar(select(ConversationDeletion.heldRecords).where(ConversationDeletion.conversationKey == key)) or 0
@@ -325,6 +333,13 @@ async def run_retention(session: AsyncSession, *, execute: bool = False, now: da
     report.cutoffs = {name: value.isoformat() + "Z" for name, value in cut.items()}
 
     from app.db.session import engine
+
+    if execute and not settings.shared_data_deletion_reviewed:
+        # Approval to RUN retention is not evidence that deleting the shared rows is safe. Without
+        # the review the run degrades to a dry run and says so; nothing is written.
+        report.dry_run = True
+        report.held["sharedDataReviewPending"] = 1
+        execute = False
 
     lock_connection = await engine.connect()
     try:

@@ -169,3 +169,16 @@ def _default_deny_network(request):
     attempts = _GUARD.attempts[before:]
     if attempts and request.node.get_closest_marker("expects_network_block") is None:
         pytest.fail(f"this test attempted network access that was blocked (and possibly swallowed by application code): {attempts}", pytrace=False)
+
+
+@pytest.fixture
+async def synthetic_catalog():
+    """Phase 7: a small synthetic catalog (tests/synthetic_catalog.py) for deterministic tests that
+    only need some product / hybrid / order-history row to exist. Opt-in per module."""
+    from tests.synthetic_catalog import remove_synthetic_catalog, seed_synthetic_catalog
+
+    created = await seed_synthetic_catalog()
+    try:
+        yield created
+    finally:
+        await remove_synthetic_catalog(created)

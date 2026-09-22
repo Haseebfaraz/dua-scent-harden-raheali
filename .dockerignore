@@ -1,0 +1,10 @@
+# Nothing but the runtime needs enters the image (Phase 7). In particular: no environment files,
+# no local databases, no tests, no scripts, no transcripts, no virtualenvs, no git history.
+*
+!requirements.txt
+!pyproject.toml
+!README.md
+!app/
+!migrations/
+app/**/__pycache__/
+**/*.pyc

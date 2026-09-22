@@ -10,10 +10,10 @@ from app.shopify.admin_client import admin_graphql
 
 async def publish_to_all_channels(session: AsyncSession, shop: str, product_id: str) -> None:
     publications_result = await admin_graphql(session, shop, "query getPublications { publications(first: 25) { nodes { id } } }")
-    publication_ids = [n["id"] for n in (publications_result.get("data", {}).get("publications") or {}).get("nodes", [])]
+    publication_ids = [n["id"] for n in ((publications_result.get("data") or {}).get("publications") or {}).get("nodes", [])]
     if not publication_ids:
         return
-    await admin_graphql(
+    result = await admin_graphql(
         session, shop,
         """
         mutation publishToAllChannels($id: ID!, $input: [PublicationInput!]!) {
@@ -22,3 +22,7 @@ async def publish_to_all_channels(session: AsyncSession, shop: str, product_id: 
         """,
         {"id": product_id, "input": [{"publicationId": pub_id} for pub_id in publication_ids]},
     )
+    if ((result.get("data") or {}).get("publishablePublish") or {}).get("userErrors"):
+        from app.shopify.products import ShopifyGraphqlError
+
+        raise ShopifyGraphqlError("publish_rejected")  # the caller treats publication as best effort and logs the type

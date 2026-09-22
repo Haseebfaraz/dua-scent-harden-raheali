@@ -11,6 +11,9 @@ from app.fragrance.normalization import normalize_product_name
 from app.services.product_catalog import get_product_notes_and_combination_status
 
 
+# Phase 7: these tests need a product / hybrid / order-history row to exist, not the real catalog.
+pytestmark = pytest.mark.usefixtures("synthetic_catalog")
+
 @pytest.mark.asyncio
 async def test_not_found_exact_shape(db_session):
     result = await get_product_notes_and_combination_status(db_session, "Totally Fake Product Name That Does Not Exist")

@@ -1,0 +1,61 @@
+# Manual live-model evaluation (Phase 7 §13). NOT part of CI. Runs only when a maintainer starts
+# it by hand against a protected environment that holds a DEVELOPMENT-only model credential.
+# It never touches Shopify or Odoo (those integrations stay unconfigured), uses synthetic data in
+# a throwaway service database, and is bounded in cases, time and cost.
+#
+# Prerequisites an operator must create (NOT done by this repository): a GitHub environment named
+# `live-eval` with the secret OPENAI_API_KEY_DEV and required reviewers. Without it the job fails
+# at the first step. Never run from a fork.
+name: live-eval (manual)
+
+on:
+  workflow_dispatch:
+    inputs:
+      suite:
+        description: which live suite to run
+        type: choice
+        options: [red-team, simulation]
+        default: red-team
+
+permissions:
+  contents: read
+
+jobs:
+  live:
+    if: github.event.repository.fork == false
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    environment: live-eval
+    services:
+      postgres:
+        image: postgres:16
+        env: { POSTGRES_USER: dua, POSTGRES_PASSWORD: ci-only-not-a-secret, POSTGRES_DB: dua_live }
+        ports: ["5432:5432"]
+        options: --health-cmd "pg_isready -U dua -d dua_live" --health-interval 5s --health-timeout 5s --health-retries 20
+    env:
+      DATABASE_URL: postgresql://dua:ci-only-not-a-secret@127.0.0.1:5432/dua_live
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY_DEV }}
+      OPENAI_MODEL: ${{ vars.OPENAI_MODEL_DEV }}
+      ALLOW_LIVE_NETWORK: "1"
+      SHOPIFY_SHOP_DOMAIN: live-eval-only.myshopify.com
+    steps:
+      - name: Refuse without a development credential
+        run: test -n "$OPENAI_API_KEY" || { echo "no development credential configured"; exit 1; }
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1 (verified via api.github.com tags, 2026-09-22)
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0 (verified via api.github.com tags, 2026-09-22)
+        with:
+          python-version: "3.12"
+      - run: |
+          python -m pip install --quiet --upgrade pip
+          pip install --quiet --require-hashes -r requirements-dev.txt
+          pip install --quiet --no-deps -e .
+      - run: python -m scripts.verify_migrations
+      - name: Run the selected live suite (bounded by the suite's own case list and this job's timeout)
+        run: |
+          if [ "${{ inputs.suite }}" = "red-team" ]; then
+            python -m pytest -q -p no:cacheprovider -m live_ai -o addopts="" tests/e2e/test_ai_red_team_live.py -s
+          else
+            python -m pytest -q -p no:cacheprovider -m live_ai -o addopts="" tests/e2e/test_conversation_simulation.py -s
+          fi

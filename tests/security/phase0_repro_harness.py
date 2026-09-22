@@ -190,7 +190,7 @@ def test_F2c_first_time_create_accepts_negative_ratio_layers(monkeypatch):
 
     import asyncio
     # -100 + 100 + 100 == 100 passes the only check that exists.
-    result = asyncio.run(builds.create_shopify_build_product(None, "s.myshopify.com", recommendation=rec, custom_name="X", ratios={"top": -100, "middle": 100, "base": 100}, customer_name="a", customer_email="a@b.c"))
+    asyncio.run(builds.create_shopify_build_product(None, "s.myshopify.com", recommendation=rec, custom_name="X", ratios={"top": -100, "middle": 100, "base": 100}, customer_name="a", customer_email="a@b.c"))
     assert float(captured["price"]) == pytest.approx(136.0)  # only because top has no priced ml here
     assert any("(-100%)" in o["values"][0]["name"] for o in captured["options"])  # nonsense variant option created
 

@@ -41,7 +41,7 @@ RATIOS = {"top": 34, "middle": 33, "base": 33}
 
 @pytest.fixture(autouse=True)
 def _deletion_enabled(monkeypatch):
-    monkeypatch.setattr(settings, "customer_deletion_enabled", True)
+    monkeypatch.setattr(settings, "shared_data_deletion_reviewed", True)
 
 
 @pytest.fixture(autouse=True)
@@ -144,8 +144,8 @@ async def test_a_failure_inside_the_transaction_leaves_nothing_behind_and_the_cr
 # ===========================================================================
 
 async def test_deletion_is_off_by_default_and_the_gate_changes_nothing_before_any_irreversible_step(world, monkeypatch):
-    assert Settings.model_fields["customer_deletion_enabled"].default is False
-    monkeypatch.setattr(settings, "customer_deletion_enabled", False)
+    assert Settings.model_fields["shared_data_deletion_reviewed"].default is False
+    monkeypatch.setattr(settings, "shared_data_deletion_reviewed", False)
     mine = await world.conversation()
     cid = mine["conversationId"]
     with TestClient(app) as client:
@@ -159,7 +159,7 @@ async def test_deletion_is_off_by_default_and_the_gate_changes_nothing_before_an
 
 def test_the_review_the_gate_stands_for_is_documented():
     text_ = " ".join(open("docs/DATA_RETENTION_AND_DELETION.md").read().split())
-    assert "CUSTOMER_DELETION_ENABLED" in text_ and "is not the review" in text_
+    assert "SHARED_DATA_DELETION_REVIEWED" in text_ and "is not the review" in text_
     for table in ("Conversation", "Message", "CustomerProfileState", "FragranceRecommendation", "CustomerAccountUrls", "OrderHistory"):
         assert table in text_
 
@@ -550,3 +550,35 @@ async def test_retention_conflicts_are_held_and_customer_deletion_never_reads_th
 
     assert "retention_execution_enabled" not in inspect.getsource(data_lifecycle.delete_conversation)
     assert "retention_execution_enabled" not in inspect.getsource(__import__("app.api.chat", fromlist=["x"]).delete_conversation_route)
+
+
+# ===========================================================================
+# 8. Phase 7 carryovers
+# ===========================================================================
+
+async def test_enabling_retention_alone_cannot_bypass_the_shared_data_review(world, monkeypatch):
+    """Approval to RUN age-based retention is not evidence that deleting the shared rows is safe.
+    The gate sits at the common destructive boundary, so every caller hits it."""
+    from app.services.data_lifecycle import SharedDataReviewPending
+
+    monkeypatch.setattr(settings, "shared_data_deletion_reviewed", False)
+    monkeypatch.setattr(settings, "retention_execution_enabled", True)
+    old = await world.conversation(age_days=300)
+    before = await _counts(old["conversationId"])
+    async with SessionLocal() as session:
+        report = await run_retention(session, execute=True)
+        assert report.dry_run is True and report.deleted == {} and report.held.get("sharedDataReviewPending") == 1
+        assert report.eligible.get("inactiveConversations", 0) >= 1  # it still reports what it WOULD do
+        with pytest.raises(SharedDataReviewPending):  # a direct service caller is refused the same way
+            await delete_conversation(session, old["conversationId"], origin="retention")
+    assert await _counts(old["conversationId"]) == before and await _tombstones(old["conversationId"]) == 0
+    monkeypatch.setattr(settings, "shared_data_deletion_reviewed", True)
+    async with SessionLocal() as session:
+        assert (await run_retention(session, execute=True)).deleted.get("conversations", 0) >= 1
+
+
+def test_a_401_is_never_documented_as_proof_of_deletion():
+    for path in ("docs/CHAT_SECURITY_CONTRACT.md", "docs/DATA_RETENTION_AND_DELETION.md"):
+        text_ = " ".join(open(path).read().split())
+        assert "not proof of deletion" in text_, path
+        assert "means the deletion had completed" not in text_ and "means the deletion completed" not in text_, path

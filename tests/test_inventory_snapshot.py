@@ -13,6 +13,9 @@ from app.services.inventory_snapshot import get_inventory_snapshot, save_invento
 from app.services.recommendation_confirmation import save_recommendation
 
 
+# Phase 7: these tests need a product / hybrid / order-history row to exist, not the real catalog.
+pytestmark = pytest.mark.usefixtures("synthetic_catalog")
+
 async def _real_combo(session):
     products = (await session.execute(select(FragranceProduct.title, FragranceProduct.notesJson).limit(2))).all()
     (title_a, notes_a), (title_b, notes_b) = products
@@ -216,8 +219,10 @@ async def test_evaluate_candidate_inventory_integrates_with_save_snapshot(db_ses
 
         # Real SKU/ratio/requiredOilMl must be logged; no secret ever appears.
         log_text = "\n".join(r.getMessage() for r in caplog.records)
-        assert "OIL-PYTEST-SNAP-A" in log_text
-        assert "requiredOilMl" in log_text
+        # Phase 6 removed item codes and quantities from inventory logs (privacy); the snapshot row
+        # is where that detail lives now. The log carries counts, and never a credential.
+        assert "ODOO_INVENTORY_REQUEST" in log_text and "ODOO_INVENTORY_RESPONSE" in log_text
+        assert "OIL-PYTEST-SNAP-A" not in log_text and "requiredOilMl" not in log_text
         assert "Bearer" not in log_text
         assert "Authorization" not in log_text
     finally:
