@@ -137,6 +137,10 @@ class Settings(BaseSettings):
     # Per-turn cost ceilings.
     chat_max_tool_turns: int = 10
     chat_max_tool_calls_per_turn: int = 6
+    # Phase 9 (B15): hard ceiling on outbound model HTTP requests per customer turn, every kind
+    # counted at the send boundary (app/ai/model_budget.py). Sized for one full generation turn
+    # (classifier + extraction + a few completions + bridge + 8 copy items x 2 waves) with headroom.
+    chat_max_model_requests_per_turn: int = 48
     chat_turn_deadline_seconds: int = 90
     openai_max_output_tokens: int = 700
     openai_copy_max_output_tokens: int = 200

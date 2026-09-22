@@ -7,6 +7,7 @@ import logging
 
 import httpx
 
+from app.ai import model_budget
 from app.config import settings
 
 logger = logging.getLogger(__name__)
@@ -28,6 +29,11 @@ async def call_openai_once(messages: list[dict], tools: list[dict] | None, tool_
     url = "https://api.openai.com/v1/chat/completions"
     headers = {"Content-Type": "application/json", "Authorization": f"Bearer {settings.openai_api_key}"}
 
+    # Phase 9 (B15): the per-turn request budget is checked at the send boundary, for the first
+    # request and for every bounded correction resend below.
+    kind = "classifier" if tool_choice and isinstance(tool_choice, dict) and tool_choice.get("function", {}).get("name") == "classify_customer_message" else "completion"
+    if not model_budget.try_start(kind):
+        return None
     try:
         async with httpx.AsyncClient(timeout=settings.openai_timeout_seconds) as client:
             response = await client.post(url, json=payload, headers=headers)
@@ -49,6 +55,8 @@ async def call_openai_once(messages: list[dict], tools: list[dict] | None, tool_
                     payload["reasoning_effort"] = "none"
                 else:
                     break
+                if not model_budget.try_start(kind):
+                    return None
                 response = await client.post(url, json=payload, headers=headers)
         if response.status_code != 200:
             # Phase 6: never the response body (it can echo request content) -- status only.

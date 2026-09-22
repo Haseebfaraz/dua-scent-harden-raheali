@@ -134,8 +134,15 @@ dispatcher even if it exists globally. Generation is never a model tool: the ser
 when the profile is complete (`app/services/recommendation_pipeline.should_generate`).
 
 Bounds: at most 10 tool-resolution completions and 6 tool calls per completion per turn, 40
-messages / 24 000 characters of history in context, 700 output tokens per completion, 30 s per
-model request, 90 s per turn.
+messages / 24 000 characters of history in context, 700 output tokens per completion (200 for
+copy), 30 s per model request (12 s per copy request), 90 s per turn (the deadline cancels the
+turn's task tree, so an outstanding request is cancelled, not abandoned). On top of these, one
+**per-turn model request budget** (`CHAT_MAX_MODEL_REQUESTS_PER_TURN`, default 48; Phase 9, B15)
+counts every outbound request of every kind at the send boundary (`app/ai/model_budget.py`,
+checked in `app/ai/openai_client.py` and `app/services/copy_generation.py`, including the bounded
+parameter-correction resends). When it is exhausted no further request starts and the caller
+falls into the failure path it already handles (UNRESOLVED, the outage reply, or the deterministic
+template copy). Nothing the model says can raise it.
 
 ## 6. Model-visible data and the private pipeline (F1, F2, F3)
 
@@ -256,5 +263,10 @@ blocked), `SHARED_DATA_DELETION_REVIEWED=false` (deletion unavailable),
 `RETENTION_EXECUTION_ENABLED=false` (dry run). Enabling any of them is a documented operator
 decision with prerequisites listed in `docs/RELEASE_READINESS.md`.
 
-Not verified on this branch: a container image build (no runtime on the machine), a hosted CI run,
-a live Shopify development store, a live model evaluation, a staging smoke test.
+The `Dockerfile` has two buildable targets: the serving image (the default target: uvicorn as
+PID 1, non-root, application code read-only, no scripts) and `--target ops` (the same runtime plus
+`psql`, `scripts/data_retention.py` and `scripts/verify_migrations.py`) so migrations and the
+retention job run from a supplied artifact. `scripts/image_smoke.sh` (`make image-check`, CI job
+`image`) builds both and exercises the serving image against a disposable PostgreSQL on an
+internal network. Verified locally in Phase 9 in a task-owned VM; a hosted CI run, a live Shopify
+development store, a live model evaluation and a staging smoke test remain unverified.

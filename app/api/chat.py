@@ -37,6 +37,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.ai.conversation_flow import call_ai, deterministic_scope_reply, get_conversation, set_conversation_cache
+from app.ai.model_budget import begin_turn_budget
 from app.ai.scope_responses import unresolved_reply
 from app.ai.security_gate import classify_message, permissions_for
 from app.api.client_identity import client_ip
@@ -315,6 +316,11 @@ async def _run_chat_turn(
         new_token, new_token_expires_at = None, None
 
     identity: SelfReportedIdentity = self_reported_identity(body.customer_name, body.customer_email)
+
+    # ---- MODEL REQUEST BUDGET (Phase 9, B15): one counter for every outbound model request this
+    # turn will make (classifier, extraction, completions, bridge, repair, copy), shared by every
+    # task the turn spawns. Created here so the classifier below is inside it.
+    begin_turn_budget()
 
     # ---- SCOPE / SECURITY GATE (Phase 4: after auth + limits, before any model work) ----
     # Layer 1 is deterministic; layer 2 is at most one low-privilege structured classifier call

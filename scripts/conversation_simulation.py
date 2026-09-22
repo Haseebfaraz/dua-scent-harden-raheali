@@ -36,6 +36,7 @@ import httpx
 from sqlalchemy import delete, select
 
 from app.ai.conversation_flow import call_ai
+from app.ai.model_budget import begin_turn_budget
 from app.ai.security_gate import classify_message
 from app.config import settings
 from app.db.models import CustomerProfileState, FragranceRecommendation
@@ -259,6 +260,7 @@ async def run_simulation(
             # the previous assistant reply as the only context. Without this a direct call_ai gets
             # layer 1 only and an uncertain message is answered with the restate invitation.
             last_assistant = next((m["content"] for m in reversed(agent_history[:-1]) if m.get("role") == "assistant" and isinstance(m.get("content"), str)), None)
+            begin_turn_budget()  # the same per-turn model request ceiling the route applies
             gate = await classify_message(customer_message, last_assistant_message=last_assistant, conversation_has_fragrance_context=len(agent_history) > 1)
             result = await call_ai(session, agent_history, conversation_id, None, None, SHOP_DOMAIN, gate=gate)
             reply_text = result.get("replyText") or ""

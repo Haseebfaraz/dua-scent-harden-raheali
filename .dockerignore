@@ -6,5 +6,9 @@
 !README.md
 !app/
 !migrations/
+# Operator target only (Dockerfile `ops` stage); the serving stage never copies these.
+!scripts/__init__.py
+!scripts/data_retention.py
+!scripts/verify_migrations.py
 app/**/__pycache__/
 **/*.pyc

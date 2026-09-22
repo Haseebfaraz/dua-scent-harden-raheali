@@ -105,3 +105,19 @@ jobs:
           name: junit
           path: junit.xml
           retention-days: 7
+
+  image:
+    # Phase 9 (B8): the ACTUAL serving and operator images, built from the committed Dockerfile and
+    # the hash-locked requirements, started against a disposable PostgreSQL on an internal docker
+    # network with placeholder settings. Build-time downloads only (base images, packages); the
+    # running container has no route to any external service. Publishes nothing, needs no secret.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1 (verified via api.github.com tags, 2026-09-22)
+        with:
+          persist-credentials: false
+      - name: Build both images and run the serving image against disposable services
+        run: bash scripts/image_smoke.sh

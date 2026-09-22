@@ -114,3 +114,32 @@ saturated with canaries. Structural tests assert the exact field sets of the saf
 an unknown internal field added later is rejected. Any new field reaching a model must be added
 to an allowlist deliberately, and any new private key name should be added to
 `FORBIDDEN_MODEL_KEYS`.
+
+## 9. Cost bounds per customer turn (Phase 9, B15)
+
+Every request that leaves the process for the model provider is counted once, right before it is
+sent, against one budget object created per customer turn (`app/ai/model_budget.py`; created in
+`app/api/chat.py` before the scope classifier, so the classifier is inside it; the live scripts
+create their own per turn). The counters and the arithmetic behind the default of **48**:
+
+| Source | Requests per turn (logical) | Sends per request | Notes |
+|---|---|---|---|
+| scope classifier | 0 or 1 | 1 + up to 2 corrections | only when layer 1 is uncertain |
+| extraction | 0 or 1 | 1 + up to 2 | FRAGRANCE_DISCOVERY turns only |
+| main completions | at most `CHAT_MAX_TOOL_TURNS` (10) | 1 + up to 2 | each may carry at most 6 tool calls |
+| bridge | at most 1 per generated recommendation | 1 + up to 2 | tools disabled |
+| output repair | at most 1 | 1 + up to 2 | only for a privacy violation; scope violations are deterministic |
+| copy generation | at most 2 per proposal (one wave + one retry wave), at most 8 proposals per generation attempt (`DEFAULT_MAX_RESULTS`, not a model argument) | 1 + up to 2 | parallel waves; an unrecoverable copy result keeps the deterministic template text |
+
+Without the budget, a turn in which the model keeps changing the profile (or keeps calling
+`refine_fragrance_recommendation`) could trigger a generation attempt per loop iteration, each
+with its own copy waves: the structural bound was `10 x 6 x 16 = 960` copy requests per turn
+(more with corrections), limited only by the 90 s deadline. With the budget, **48 requests per
+turn** is the hard ceiling for all kinds combined, and the ordinary generation turn (classifier 0,
+extraction 1, completions 1 to 3, bridge 1, copy 8 to 16) fits with headroom. Output is bounded by
+`OPENAI_MAX_OUTPUT_TOKENS` (700) and `OPENAI_COPY_MAX_OUTPUT_TOKENS` (200); time by the 30 s / 12 s
+request timeouts, the 8 s classifier timeout and the 90 s turn deadline, which cancels the turn's
+task tree. There are no automatic retries other than the two bounded parameter corrections and the
+single copy retry wave. Tests: `tests/security/test_model_cost_bounds_9.py` (transport-level
+fake; exact counts; exhaustion; cancellation; isolation between simultaneous turns; positive
+control with copy exhausted).

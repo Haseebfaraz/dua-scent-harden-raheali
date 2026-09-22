@@ -6,7 +6,7 @@ BIN := $(VENV)/bin
 export OPENAI_API_KEY ?= test-placeholder-not-a-key
 export OPENAI_MODEL ?= test-model
 
-.PHONY: venv install install-dev lock audit lint test test-security test-reference migrations db-local db-stop startup-check
+.PHONY: venv install install-dev lock audit lint test test-security test-reference migrations db-local db-stop startup-check image-check
 
 venv:
 	$(PY) -m venv $(VENV) && $(BIN)/pip install --quiet --upgrade pip
@@ -43,6 +43,9 @@ test-reference:        ## the 13 tests that need the production reference catalo
 
 startup-check:         ## import the app and build the ASGI object with fake settings; no network, no migration
 	$(BIN)/python -m scripts.startup_check
+
+image-check:           ## build the serving + ops images and run the serving image against a disposable PostgreSQL (needs docker)
+	bash scripts/image_smoke.sh
 
 db-local:              ## start an embedded disposable PostgreSQL 16 (pgserver) for local runs
 	$(BIN)/pip install --quiet pgserver && $(BIN)/python -m scripts.local_db start

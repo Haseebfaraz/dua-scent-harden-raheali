@@ -169,11 +169,15 @@ runners; that requires a push, which this phase does not authorize.
   nothing in the image applies a migration. `.dockerignore` is deny-by-default: only
   `requirements.txt`, `pyproject.toml`, `README.md`, `app/` and `migrations/` enter the context
   (90 files; verified by simulating the context: no `.env`, tests, scripts, databases or git data).
-* **A container image was not built:** no container runtime exists on this machine. The image
-  recipe was verified as far as possible without one: a clean Python 3.12 venv installed
-  `requirements.txt` hash-checked, installed the application with `--no-deps`, and ran
-  `uvicorn app.main:app` against the disposable database; `/health` answered 200 with no `Server`
-  header.
+* **Phase 7: a container image was not built** (no container runtime on the machine); the recipe
+  was only approximated in a venv. **Phase 9 built and ran the actual image** (section 11): this
+  found that `sh -c "uvicorn ..."` left `sh` as PID 1, so SIGTERM never reached uvicorn and every
+  stop ended in SIGKILL after the grace period; the CMD now `exec`s uvicorn. The Dockerfile has two
+  targets: the serving image (default, last stage) and `--target ops` (the same runtime plus
+  `psql`, `scripts/data_retention.py`, `scripts/verify_migrations.py`) so migrations and the
+  retention job run from a supplied artifact rather than a developer checkout. `.dockerignore`
+  additionally admits those two scripts (plus `scripts/__init__.py`) into the context; the serving
+  stage never copies them.
 * `scripts/startup_check.py` (run in CI): imports the application with fake settings and asserts
   that no import opens a network connection, that Odoo has no destination, that the destructive
   gates (`SHARED_DATA_DELETION_REVIEWED`, `RETENTION_EXECUTION_ENABLED`) are off, that no proxy hop
@@ -225,3 +229,16 @@ against an existing environment.
 3. **Actions:** section 6.
 4. **Python:** change `requires-python`, the Dockerfile base and the CI matrix together; re-run
    the baseline comparison as in section 1.
+
+## 11. Phase 9 (2026-09-22): actual container verification
+
+| | |
+|---|---|
+| Runtime used | Lima 2.2.0 (official release tarball, SHA256 verified) with the macOS Virtualization framework, unprivileged, task-owned (`LIMA_HOME=~/.lima-dua9`, removed afterwards); Ubuntu 26.04 arm64 guest with rootless Docker 29.8.1. No system-wide installation, no change to any existing context. |
+| Build | `DOCKER_BUILDKIT=1 docker build` from the committed `Dockerfile`; dependencies installed with `--require-hashes` from `requirements.txt` (never re-resolved); base image `python:3.12-slim` pulled from Docker Hub; no build argument, no secret in any layer (`docker history` inspected). |
+| Serving image facts | Python 3.12.14; user `app` (uid 999); workdir `/app` (read-only for `app`, as is the installed package; `/home/app` and `/tmp` writable); `EXPOSE 8000`; CMD `sh -c "exec uvicorn app.main:app --host 0.0.0.0 --port ${PORT} --no-access-log --no-server-header"`; 28 lock pins present at the pinned versions (`pip list` normalised by name), plus `pip` and the application itself; no `.env`, key, git, test, script or database file in the filesystem (only the distribution's CA bundle); 81 `.pyc` files from the install step exist in the package (bytecode of the same sources; harmless, noted). |
+| Missing configuration | `import app.main` fails at import with pydantic's `ValidationError` naming `database_url`, `openai_api_key`, `openai_model` (field names only, no values). |
+| Runtime against a disposable PostgreSQL 16 on an `--internal` network | startup complete in about 2 s; `/health` 200; with **no migrations applied** `POST /chat/session` answers 503 `Service temporarily unavailable.` and logs `RATE_LIMIT_STORE_UNAVAILABLE ProgrammingError` (type only); after the synthetic base schema + 0001..0004 (applied from the `ops` image, then re-applied with `psql -f` from the same image without error) a full guest turn runs with the model provider unreachable (`OpenAI request failed: ConnectError`, two attempts: extraction + main completion; the customer gets the outage sentence), an attack turn is answered by the server without any provider attempt, history without the token is 401, deletion is 503 `deletion_unavailable`, the internal route without the key is 401, an unsigned App Proxy POST is 400; from inside the container `api.openai.com`, `admin.shopify.com` and `geocoding-api.open-meteo.com` are unresolvable (`gaierror`); container logs contain no traceback and no placeholder credential value; `docker stop` ends with exit code 0 (SIGTERM handled) after the fix, 137 before it. |
+| Ops image | `psql (PostgreSQL) 17.11`; `python -m scripts.verify_migrations` (local database only, by its own guard) and `python -m scripts.data_retention` (dry run: `"dryRun": true`, execution disabled) both run from the artifact. |
+| Automation | `scripts/image_smoke.sh` performs all of the above and is what `make image-check` and the CI job `image` run. Executed locally in the VM: **PASSED**. Executed on GitHub: **NO** (never pushed). |
+| Not verified | behaviour on a hosted runner; the platform's own build (`render.yaml` uses `runtime: python` with `pip install .`, which does not use the hash lock and does not use this Dockerfile); a readiness probe (`/health` is liveness only: it does not check the database). |

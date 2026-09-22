@@ -1616,3 +1616,79 @@ Odoo contract, reservation, checkout enforcement or manufacturing acceptance), F
 validation), F11 (shared-database review, retention approval, external copies), F12 (no hosted
 CI, no image build), N3 (theme). OPEN: N4 (low, accepted), N7, N11 (low, mitigated), N15 (low,
 accepted), credential rotation (operator).
+
+## 23. Phase 9 (2026-09-22): actual container verification, model-cost bound, prompt cleanup
+
+Bounded follow-up to Phase 8 on `security-hardening` after `e37ce20`. No push, no deployment, no
+live integration, no credential rotation, no destructive feature enabled. Baseline re-verified at
+`e37ce20` before any change: branch clean, Python 3.12.14, locks in sync with `pyproject.toml`,
+fresh disposable PostgreSQL 16.2 with `migrations verified`.
+
+### B8: container verification (F12)
+
+* **Original state (verified):** no image had ever been built (Phase 7/8: IMAGE BUILD NOT RUN).
+* **Runtime:** no container runtime or administrator access on the machine; a task-owned,
+  unprivileged VM was created with the official Lima 2.2.0 release (checksum verified) and rootless
+  Docker inside Ubuntu 26.04; nothing system-wide was installed or changed; the VM and its home
+  directory were removed at the end.
+* **Result:** image built from the committed Dockerfile and hash lock; contents, user, lock
+  agreement, missing-configuration behaviour, startup, `/health`, missing-migration behaviour,
+  route behaviour with the provider unreachable, outbound isolation, log hygiene and shutdown
+  verified (`docs/PLATFORM_MODERNIZATION.md` section 11).
+* **Defect found and fixed:** the CMD ran uvicorn under `sh -c` without `exec`, so `sh` was PID 1
+  and SIGTERM never reached uvicorn: every stop ended in SIGKILL after the grace period (exit 137;
+  in-flight turns would be cut off on every deploy or scale-down). Fixed with `exec`; verified exit
+  0 after SIGTERM.
+* **Operational artifact:** the Dockerfile gained an `ops` target (same runtime + `psql` +
+  `scripts/data_retention.py` + `scripts/verify_migrations.py`) so migrations and the retention
+  job run from a supplied artifact; the serving stage stays last so a plain build never yields it.
+* **Automation:** `scripts/image_smoke.sh` + `scripts/image_probe.py`, `make image-check`, CI job
+  `image` (contents: read, no secrets, no publish). Executed locally: PASSED. On GitHub: NOT RUN.
+* **Status:** VERIFIED LOCALLY; hosted execution and the platform build path (B17) remain open.
+
+### B15: model-call cost bound (F6)
+
+* **Original state (verified by tracing every call site):** copy generation sends one request per
+  proposal (at most 8) plus one retry wave, each request with up to two parameter-correction
+  resends; the main loop allows 10 completions with 6 tool calls each; a generation attempt (copy
+  waves included) could run on every loop iteration in which the model changed the profile or
+  called `refine_fragrance_recommendation`. Structural ceiling per turn: about 960 copy sends plus
+  completions, bounded only by the 90 s deadline. This is a cost-amplification path the model can
+  steer, so the Phase 8 label "low observation" understated it; it is recorded here as an F6 gap.
+* **Implementation:** `app/ai/model_budget.py`, one budget per turn created in the route before
+  the classifier, checked at the send boundary in `app/ai/openai_client.py` and
+  `app/services/copy_generation.py` (including corrections); default 48
+  (`CHAT_MAX_MODEL_REQUESTS_PER_TURN`); exhaustion falls into the existing failure paths
+  (UNRESOLVED / outage reply / deterministic template copy); nothing model-controlled can raise
+  it. No change to ranking, compatibility, ratios or candidate selection.
+* **Tests:** `tests/security/test_model_cost_bounds_9.py` (14): exact counts for copy (8; 8 + 7
+  with collisions; 3 sends with two corrections), exhaustion at the budget with template text
+  kept, a 40-item set capped at 48, repeated tool requests capped at 1 + 10 sends, exhaustion
+  mid-loop with no further sends, exactly one repair send, the classifier counted in the same
+  budget, the 90 s deadline (set to 1 s) cancelling the outstanding request with nothing started
+  afterwards, isolation between simultaneous turns, and the real pipeline on the synthetic catalog
+  still producing a safe recommendation with the copy budget at zero.
+* **Status:** CLOSED for the deterministic guarantee; live spend per turn is still unmeasured.
+
+### B16: model-visible wording
+
+* **Original state (verified by grep over every model-visible string):** two sentences in
+  `app/ai/prompt.py` named "querying a database", "checking Odoo", "validating inventory",
+  "a recommendation engine", "the backend", "inventory validation", "the database".
+* **Change:** neutral wording in those two sentences only. No other model-visible text (tool
+  descriptions, classifier prompt, copy prompt, status guidance, repair prompt) names an internal
+  system; the customer-output validator's forbidden-phrase list (server-side, never sent to a
+  model) still blocks those words in replies.
+* **Tests:** `test_prompt_scope.py`, `test_security_gate.py`, `test_security_routing.py`,
+  `test_gate_fail_closed.py`, `test_model_boundary.py`, `test_conversation_intelligence.py`,
+  `test_prompt.py`: unchanged and passing.
+* **Status:** CLOSED.
+
+### Results
+
+Deterministic suite 1427 passed, 43 deselected (Phase 8: 1413 + 14 new); `tests/security` 863
+passed; lint clean; locks unchanged and in sync; startup check ok; image smoke PASSED locally.
+`reference_data` 13 and `live_ai` 30: NOT RUN (prerequisites absent). Live-model evaluation,
+theme migration, inventory/manufacturing integration, purchase enforcement, external deletion,
+retention approval, hosted CI, live Shopify compatibility and credential rotation are unchanged and
+still open (`docs/RELEASE_READINESS.md`).

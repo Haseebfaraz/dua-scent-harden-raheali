@@ -17,6 +17,7 @@ from typing import Any
 import httpx
 from pydantic import BaseModel, ConfigDict, Field
 
+from app.ai import model_budget
 from app.config import settings
 from app.fragrance.compatibility import matched_literal_terms
 
@@ -186,6 +187,8 @@ async def call_copy_model(messages: list[dict]) -> dict[str, str] | None:
         "response_format": {"type": "json_object"},
     }
     headers = {"Content-Type": "application/json", "Authorization": f"Bearer {settings.openai_api_key}"}
+    if not model_budget.try_start("copy"):  # Phase 9 (B15): per-turn budget at the send boundary
+        return None
     try:
         response = await _http_post("https://api.openai.com/v1/chat/completions", payload, headers)
         # Some models (reasoning-tier ones in particular) only support the default temperature and
@@ -199,6 +202,8 @@ async def call_copy_model(messages: list[dict]) -> dict[str, str] | None:
                 payload["max_completion_tokens"] = payload.pop("max_tokens")
             else:
                 break
+            if not model_budget.try_start("copy"):
+                return None
             response = await _http_post("https://api.openai.com/v1/chat/completions", payload, headers)
     except Exception:
         return None

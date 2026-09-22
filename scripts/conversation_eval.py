@@ -25,6 +25,7 @@ sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 from sqlalchemy import delete
 
 from app.ai.conversation_flow import call_ai
+from app.ai.model_budget import begin_turn_budget
 from app.db.models import CustomerProfileState, FragranceRecommendation
 from app.db.session import SessionLocal
 
@@ -60,6 +61,7 @@ async def _run_scenario(label: str, spec: dict) -> dict:
     async with SessionLocal() as session:
         for user_message in spec["turns"]:
             history.append({"role": "user", "content": user_message})
+            begin_turn_budget()  # the same per-turn model request ceiling the route applies
             result = await call_ai(session, history, conversation_id, f"{conversation_id}@example.test", spec["customer_name"], SHOP_DOMAIN)
             transcript.append({"role": "user", "content": user_message})
             transcript.append({"role": "assistant", "content": result["replyText"]})
