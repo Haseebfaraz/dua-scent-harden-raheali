@@ -39,6 +39,8 @@ jobs:
           pip install --quiet --no-deps -e .
       - name: Lint (ruff, pyflakes rules)
         run: ruff check app tests scripts/data_retention.py
+      - name: Deployment build path agrees with the lock and the verified image (B17)
+        run: python -m scripts.check_deploy_consistency
       - name: Lock files are in sync with pyproject.toml
         run: |
           pip install --quiet pip-tools

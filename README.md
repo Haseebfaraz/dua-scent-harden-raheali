@@ -120,16 +120,36 @@ database with one long-lived event loop.
 
 ## Deployment (Render)
 
-`render.yaml` defines a single web service. Push this repo to GitHub, connect it to Render, and
-fill in the `sync: false` environment variables in the Render dashboard (never in the repo). The
-service binds to Render's `$PORT` automatically via the start command:
+`render.yaml` defines a single web service built **from the committed `Dockerfile`**
+(`runtime: docker`): the same artifact `scripts/image_smoke.sh` verifies. The image installs
+dependencies only from the hash-locked `requirements.txt`, installs the application with
+`--no-deps`, runs as the non-root user `app`, and starts uvicorn as PID 1 with
+`--no-access-log --no-server-header`, binding Render's `$PORT`. A platform builds the Dockerfile's
+last stage, which is the serving stage; the operator stage (`--target ops`) is never the web
+service. `python -m scripts.check_deploy_consistency` (also `make deploy-check`, CI, and the image
+smoke) fails if the blueprint, the Dockerfile, the lock, `.python-version` or the start command
+drift apart.
+
+The blueprint declares `autoDeployTrigger: "off"`: a service created or synced from it does not
+deploy on a git push. **This file does not change an already-existing Render service**, its
+tracked branch or its auto-deploy setting; check those in the Render dashboard
+(`docs/EXTERNAL_VALIDATION_HANDOFF.md`).
+
+Fill in the `sync: false` environment variables in the Render dashboard (never in the repo). The
+destructive and external features stay off unless set deliberately: `SHARED_DATA_DELETION_REVIEWED`,
+`RETENTION_EXECUTION_ENABLED`, the Odoo inventory contract keys (commerce stays blocked without
+them), `ALLOWED_ORIGINS`.
+
+**Migrations are not applied by the service.** `/health` is a liveness probe only (it does not
+touch the database): a service whose migrations are missing passes it and answers 503 on the chat
+routes (`RATE_LIMIT_STORE_UNAVAILABLE` in the logs). Apply `migrations/0001..0004` in order, once,
+from the operator image before the first deploy of a schema change:
 
 ```bash
-uvicorn app.main:app --host 0.0.0.0 --port $PORT
+docker build --target ops -t dua-scent-ai:ops .
+docker run --rm -e DATABASE_URL=... dua-scent-ai:ops psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f /app/migrations/0001_build_capability.sql   # then 0002, 0003, 0004
+docker run --rm -e DATABASE_URL=... -e OPENAI_API_KEY=x -e OPENAI_MODEL=x dua-scent-ai:ops python -m scripts.data_retention   # dry run
 ```
-
-A `Dockerfile` is also provided for platform-independent deployment (runs as a non-root user,
-same `$PORT` binding).
 
 **Do not point the live Shopify storefront at this service until parity is proven** in
 staging/integration testing. Keep the existing Node-only production path available until then.

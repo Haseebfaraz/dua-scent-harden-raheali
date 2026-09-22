@@ -29,6 +29,9 @@ DOCKER_BUILDKIT=1 docker build --quiet -t "$TAG" "$HERE" >/dev/null
 echo "== build (ops stage)"
 DOCKER_BUILDKIT=1 docker build --quiet --target ops -t "$OPS_TAG" "$HERE" >/dev/null
 
+echo "== the blueprint selects this very build (B17), checked with the image's own interpreter"
+docker run --rm --network none -v "$HERE:/src:ro" "$TAG" python /src/scripts/check_deploy_consistency.py /src
+
 echo "== image facts"
 docker image inspect "$TAG" --format 'id={{.Id}} user={{.Config.User}} ports={{.Config.ExposedPorts}} cmd={{json .Config.Cmd}}'
 docker run --rm --network none "$TAG" python --version

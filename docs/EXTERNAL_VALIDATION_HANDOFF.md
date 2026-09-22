@@ -5,18 +5,35 @@ has been executed.** Each needs its own explicit authorization. Nothing here is 
 
 ## 1. Push for hosted CI (B7)
 
+Read-only inspection performed on 2026-09-22 (`git ls-remote`, `git fetch`, unauthenticated
+GitHub API; no push, nothing changed):
+
+| Fact | Finding |
+|---|---|
+| Remote | `origin` = `https://github.com/rahealiduabrand/dua-scent-ai-python.git` (no credential in the URL; macOS keychain helper) |
+| Remote branches | only `refs/heads/main` at `9416bd3`; **no remote `security-hardening`**, so a push creates the branch (normal, non-force) and cannot overwrite anything; local `main` == `origin/main` == the branch base, no divergence |
+| Workflows on the remote | none on `origin/main` (no `.github/` at all); the remote has no workflow that could run on `workflow_run`, `deployment` or `pull_request_target` today. A push of this branch adds `ci.yml` (jobs `lint-and-audit`, `test`, `image`; triggers `push`, `pull_request`) and `live-eval.yml` (`workflow_dispatch` only) on that branch |
+| Remote deployment files | `render.yaml` on `origin/main` is the OLD native blueprint (`runtime: python`, default auto-deploy) |
+| Repository visibility | private (unauthenticated API: 404); webhooks endpoint requires authentication (401) |
+| Repository webhooks / connected services | **UNKNOWN**: no `gh`, no GitHub or Render API token in this environment; not searched elsewhere |
+| Render services linked to the repository, tracked branch, auto-deploy, preview deployments | **UNKNOWN** (same reason) |
+
+The operator must verify, in the GitHub repository settings and the Render dashboard, before any
+push: (1) whether a Render (or other) service is linked to this repository; (2) its tracked branch
+(`main` or `security-hardening`); (3) its auto-deploy setting (Render's default is deploy on
+commit to the tracked branch); (4) whether pull-request previews are enabled; (5) which repository
+webhooks exist and what they trigger. No secret value is needed for any of these.
+
 | | |
 |---|---|
-| Intended repository | `github.com/rahealiduabrand/dua-scent-ai-python` (the `origin` of the local clone; the remote URL carries no credential) |
-| Branch | `security-hardening` (never pushed; 12 local commits on top of `main` since `c1f6530`) |
-| Exact commit | the Phase 9 commit recorded in `docs/SECURITY_AUDIT.md` section 23 (`git rev-parse HEAD` before pushing; push that hash, not the branch tip of a later working state) |
-| Workflows expected to run on push | `.github/workflows/ci.yml`: jobs `lint-and-audit`, `test`, `image` (triggers: `push` to any branch, `pull_request`); `live-eval.yml` does **not** run (`workflow_dispatch` only) |
-| Permissions the workflows request | `contents: read` only (top level and per job); `persist-credentials: false` on checkout; no `pull_request_target`; no `continue-on-error`; no secret referenced by `ci.yml` |
-| What CI downloads | `python:3.12-slim` and `postgres:16` from Docker Hub, the hash-locked wheels from PyPI, the pinned actions; the running application container has no external route |
-| Deployment triggers on push | **UNKNOWN.** `render.yaml` declares a web service with no `branch:` or `autoDeploy:` key; Render's default for a Blueprint-linked service is to auto-deploy the linked branch on push. Whether a Render service (or any other hosting webhook) is connected to this repository, and to which branch, cannot be determined from the repository. Repository workflow inspection proves nothing about external services. |
-| Precondition before pushing | confirm in the Render dashboard (and any other connected service) that no service auto-deploys from `security-hardening`; if one deploys from `main`, do not merge; record the finding. Until this is confirmed the push cannot be described as deployment-free. |
-| Expected evidence | the run URL for each job; green status; the `image` job's `IMAGE SMOKE PASSED` line; the step summary listing the 43 deselected tests |
-| Closes | B7 (hosted CI) and the hosted half of B8. It does not close B5, B6, B13, B14 or B17. |
+| Intended repository | `github.com/rahealiduabrand/dua-scent-ai-python` |
+| Source branch / commit | `security-hardening` at the B17 commit recorded in `docs/SECURITY_AUDIT.md` section 24 (`git rev-parse HEAD` immediately before pushing) |
+| Remote target branch | `security-hardening` (new; normal non-force push: `git push origin security-hardening:security-hardening`) |
+| Workflows expected to run | `ci.yml` jobs `lint-and-audit` (lint, deploy-consistency check, lock sync, audit), `test`, `image` (builds both images, runs the smoke on a runner-local docker); `live-eval.yml` does not run |
+| Permissions | `contents: read` only; no secret referenced; `persist-credentials: false` |
+| Expected deployment behaviour | none from the repository's workflows; from external services: **UNKNOWN until the five facts above are verified**. If a Render service tracks `main`, a push to `security-hardening` does not deploy it, but a later merge would. The corrected blueprint (`autoDeployTrigger: "off"`, Docker runtime) only governs services created or synced from it |
+| Expected evidence | run URLs; green status; `deploy consistency ok` in the lint job; `IMAGE SMOKE PASSED` in the image job; the step summary listing the 43 deselected tests |
+| Closes | B7 and the hosted half of B8/B17. Not B5, B6, B13, B14 |
 
 ## 2. Development-store validation (B6)
 

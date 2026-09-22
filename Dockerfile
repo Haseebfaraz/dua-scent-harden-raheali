@@ -1,7 +1,7 @@
 # Production image (Phase 7). Python 3.12, dependencies installed ONLY from the hash-locked
 # requirements.txt (never re-resolved at build time), non-root user, read-only application code,
 # no access log (capability tokens travel in query strings on the App Proxy).
-FROM python:3.12-slim AS build
+FROM python:3.12.14-slim AS build
 
 WORKDIR /build
 COPY requirements.txt ./
@@ -12,7 +12,7 @@ COPY pyproject.toml README.md ./
 COPY app ./app
 RUN python -m pip install --no-cache-dir --no-deps .
 
-FROM python:3.12-slim AS runtime-base
+FROM python:3.12.14-slim AS runtime-base
 
 RUN groupadd --system app && useradd --system --gid app --create-home app
 COPY --from=build /usr/local/lib/python3.12/site-packages /usr/local/lib/python3.12/site-packages

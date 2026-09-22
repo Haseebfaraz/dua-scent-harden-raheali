@@ -243,3 +243,32 @@ against an existing environment.
 | Final artifacts (built from `git archive 5f5e87f`, the Phase 9 commit, so no working-tree file could enter the context) | serving image `sha256:134d126be43d0b905b90e9bc17069e158b9b0430b7aea29a772a3a37012a1cfe` (335 546 448 bytes); ops image `sha256:51467287c87242a7ed97c1036690c5f83c2abdef2d69a0a6078f79e08b9c5fc6` (419 524 589 bytes); both smoke-tested with the script below (PASSED), then discarded with the VM. Image ids are content addresses inside that Docker engine; a rebuild elsewhere produces a different id (the build is not bit-reproducible: `python:3.12-slim` and `postgres:16` are tag-pinned, not digest-pinned). |
 | Automation | `scripts/image_smoke.sh` performs all of the above and is what `make image-check` and the CI job `image` run. Executed locally in the VM: **PASSED**. Executed on GitHub: **NO** (never pushed). |
 | Not verified | behaviour on a hosted runner; the platform's own build (`render.yaml` uses `runtime: python` with `pip install .`, which does not use the hash lock and does not use this Dockerfile); a readiness probe (`/health` is liveness only: it does not check the database). |
+
+## 12. B17 (2026-09-22): deployment build consistency
+
+| | Before | After |
+|---|---|---|
+| Blueprint runtime | `runtime: python` (Render native) | `runtime: docker`, `dockerfilePath: ./Dockerfile`, `dockerContext: .`, no `dockerCommand` (the Dockerfile CMD) |
+| Build | `pip install --no-cache-dir .`: every dependency re-resolved at deploy time from `pyproject.toml` bounds; the hash lock unused | the Dockerfile build stage: `pip install --require-hashes -r requirements.txt`, then the application with `--no-deps`; a platform builds the last stage = `serve` (the Blueprint spec has no target selection; verified against https://render.com/docs/blueprint-spec and /docs/docker on 2026-09-22) |
+| Interpreter | `.python-version` 3.12.10 (Render native), image `python:3.12-slim` (floating patch) | `.python-version` 3.12.14 and `python:3.12.14-slim` in both Dockerfile stages; the same interpreter the Phase 9 image verified |
+| Start | `uvicorn app.main:app --host 0.0.0.0 --port $PORT --no-access-log` under Render's process manager, default user | `sh -c "exec uvicorn ... --no-access-log --no-server-header"` as PID 1, user `app`, `$PORT` from the platform (image default 8000) |
+| Deploy on push | Blueprint default (`autoDeployTrigger: commit`) | `autoDeployTrigger: "off"` (quoted: YAML 1.1 readers load a bare `off` as false) |
+| Health | `/health` | unchanged: liveness only (no database check), documented in the blueprint and README; missing migrations are visible as 503 on the chat routes and `RATE_LIMIT_STORE_UNAVAILABLE` in the logs |
+| Operator tooling | none in the deployed artifact | `--target ops` (psql, migrations, retention dry run); README "Deployment" |
+| Guard | none | `scripts/check_deploy_consistency.py`: parses the blueprint, the Dockerfile stages, the lock and pyproject; fails on a native runtime, an overriding start command, auto-deploy on push, a credential or gate key with a literal value, a proxy-hop count above 1, an operator stage built by default, a non-`exec` CMD, an unhashed or non-`--no-deps` install, a root runtime, interpreter drift, lock drift, an unhashed pin, or a context that admits tests/scripts/env files. Run by `tests/security/test_deploy_consistency_17.py` (15 tests: the repository plus 14 detected drifts), `make deploy-check`, the CI `lint-and-audit` job and `scripts/image_smoke.sh` inside the built image |
+
+Build-system dependency: installing the application (`pip install --no-deps .`) still fetches
+`setuptools>=68` into pip's isolated build environment at image build time; it is not part of the
+hash lock in either the old or the new path and never enters the runtime image. Base images are
+tag-pinned, not digest-pinned.
+
+Operator implications of the runtime change: a service created from this blueprint is a Docker
+service (Render builds the image on its builders; env vars still come from the dashboard; Render
+turns env vars into build args, and the Dockerfile references no `ARG`, so no value can enter a
+layer). **Changing this file does not convert an existing native service**; an existing service
+keeps its runtime, tracked branch and auto-deploy setting until an operator changes them.
+
+Local verification of the declared path: `scripts/image_smoke.sh` on the corrected tree in the
+task-owned VM (section 11 method) built the default target and ran the consistency check with the
+image's own interpreter against the mounted tree: PASSED (details in `docs/SECURITY_AUDIT.md`
+section 24). Hosted: not executed.

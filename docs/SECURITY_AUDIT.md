@@ -1692,3 +1692,65 @@ passed; lint clean; locks unchanged and in sync; startup check ok; image smoke P
 theme migration, inventory/manufacturing integration, purchase enforcement, external deletion,
 retention approval, hosted CI, live Shopify compatibility and credential rotation are unchanged and
 still open (`docs/RELEASE_READINESS.md`).
+
+## 24. B17 (2026-09-22): deployment build consistency and read-only push-safety inspection
+
+Bounded follow-up after `ecb5673`. No push, no deployment, no hosting setting changed, no live
+integration, no credential rotation, nothing enabled.
+
+### Mismatch verified from code
+
+`render.yaml` declared `runtime: python`, `buildCommand: pip install --no-cache-dir .`,
+`startCommand: uvicorn ... --no-access-log` (no `--no-server-header`), `.python-version` 3.12.10;
+the verified artifact (Phase 9) is the Dockerfile image: `--require-hashes -r requirements.txt`,
+application `--no-deps`, `python:3.12-slim` (3.12.14 at build time), user `app`, `exec uvicorn`.
+A Render deploy from that blueprint would have re-resolved every dependency at deploy time and run
+nothing that had been tested.
+
+### Repository configuration corrected
+
+* `render.yaml`: `runtime: docker`, `dockerfilePath: ./Dockerfile`, `dockerContext: .`, no
+  `dockerCommand` (Dockerfile CMD), `autoDeployTrigger: "off"`, `/health` documented as liveness
+  only; env var list unchanged (credentials and gates `sync: false`, no literal values added).
+* `Dockerfile` base images pinned to `python:3.12.14-slim`; `.python-version` 3.12.14.
+* Official documentation consulted read-only (2026-09-22): Blueprint spec (`runtime` values,
+  `dockerfilePath`/`dockerContext`/`dockerCommand`, no build-target field, `autoDeployTrigger`
+  default `commit`, `previews.generation`), Docker services (CMD honoured when `dockerCommand` is
+  unset; env vars become build args), Python version precedence (`PYTHON_VERSION` over
+  `.python-version`), web services (`PORT`, default 10000).
+* Guard: `scripts/check_deploy_consistency.py` (executable parse of blueprint, Dockerfile stages,
+  lock, pyproject, `.dockerignore`), run by `tests/security/test_deploy_consistency_17.py` (15),
+  `make deploy-check`, the CI `lint-and-audit` job and `scripts/image_smoke.sh` inside the built
+  image. README "Deployment" rewritten for the Docker path, migrations and the liveness caveat.
+* Build-system note: `pip install --no-deps .` still fetches `setuptools>=68` into an isolated
+  build environment (unhashed) at image build time in both the old and the new path; it never
+  enters the runtime image.
+
+### Intended build path verified locally
+
+In the recreated task-owned Lima VM (Phase 9 method): `scripts/image_smoke.sh` on the corrected
+tree PASSED (consistency check with the image's interpreter, Python 3.12.14, every lock pin
+present, no development data, missing configuration refused, empty-database 503, migrations from
+the ops artifact, routes with the provider unreachable, outbound blocked, safe logs, SIGTERM exit
+0). A plain `docker build .` (what a platform runs) and `docker build --target serve` produced
+identical filesystem layers and the verified CMD; `--target ops` produced the operator image
+(`python -m scripts.data_retention`, psql present) which the serving image does not contain.
+
+### Deployment-trigger inspection (read-only)
+
+`git ls-remote` / `git fetch` against `origin` (https, keychain helper, URL carries no credential):
+the remote has only `main` at `9416bd3` (= local `main` = the base of `security-hardening`; no
+divergence; no remote `security-hardening`, so a push creates it and overwrites nothing); no
+`.github/` on the remote (no workflow, hence no `workflow_run`/`deployment`/`pull_request_target`
+trigger exists there today); `render.yaml` on the remote is the old native blueprint. The
+repository is private (unauthenticated GitHub API 404; hooks endpoint 401). No `gh`/Render CLI and
+no GitHub or Render API token exist in this environment and none was searched for elsewhere, so
+repository webhooks, connected services, any Render service linked to the repository, its tracked
+branch, auto-deploy and preview settings are **UNKNOWN**. Push safety: **UNKNOWN**
+(`docs/EXTERNAL_VALIDATION_HANDOFF.md` section 1 lists the five facts the operator must verify).
+
+### Status
+
+B17: repository configuration corrected and verified locally; hosted service configuration
+UNKNOWN; hosted deployment not performed. Every other blocker unchanged
+(`docs/RELEASE_READINESS.md`).

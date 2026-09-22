@@ -1,14 +1,31 @@
 # Render Blueprint for the DUA Scent AI Core Backend. No real secrets here -- every value below
 # is either a placeholder Render will prompt for (sync: false) or a literal, non-sensitive default.
+#
+# B17 (docs/PLATFORM_MODERNIZATION.md section 12): the service is built from the committed
+# Dockerfile, i.e. the SAME artifact that scripts/image_smoke.sh verifies (hash-locked
+# requirements.txt, application installed with --no-deps, non-root user, `exec uvicorn` as PID 1,
+# --no-access-log --no-server-header). Before this change the blueprint used `runtime: python` with
+# `pip install .`, which re-resolved every dependency at deploy time and ran nothing that had been
+# tested. A platform builds the Dockerfile's LAST stage (there is no target selection in the
+# Blueprint spec), which is the serving stage on purpose; the operator `ops` stage is never the
+# web service. Migrations are NOT applied by the service: see README "Deployment".
+#
+# This file describes services created or synced FROM this blueprint. It does not change an
+# already-existing Render service, its tracked branch, or its auto-deploy setting.
 services:
   - type: web
     name: dua-scent-ai-python
-    runtime: python
+    runtime: docker
     plan: starter
-    buildCommand: pip install --no-cache-dir .
-    # --no-access-log: the app already logs one line per request (method/path/status) without the
-    # query string; uvicorn's access log would record preview URLs that carry a capability token.
-    startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT --no-access-log
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    # No dockerCommand: the Dockerfile CMD is the verified start command and binds $PORT
+    # (Render sets PORT; the image defaults it to 8000 when unset).
+    # Nothing deploys on a git push unless an operator changes this deliberately (the Blueprint
+    # default would be `commit`).
+    autoDeployTrigger: "off"
+    # /health is LIVENESS only (it does not touch the database). A service whose migrations are
+    # missing passes it and answers 503 on the chat routes; see README "Deployment".
     healthCheckPath: /health
     envVars:
       - key: APP_ENV
