@@ -89,7 +89,7 @@ on the HTTP status.
 To start over, discard the stored pair and bootstrap again. Old history stays retrievable only
 with the old token until it expires.
 
-## 7. Deleting a conversation (Phase 6)
+## 7. Deleting a conversation (Phase 6, corrected in Phase 6A)
 
 ```
 POST /chat/delete
@@ -102,18 +102,24 @@ Content-Type: application/json
 * The token goes in the header, never in a URL. Name, email or any other field is ignored and
   authorizes nothing. There is no "delete everything for this email".
 * `200 {"status": "deleted", "message": "...", "notCovered": "...", "commerceRecordRetained": bool}`
-  Show `message`. If you describe the result yourself, do not promise more than `notCovered`
-  allows: anything already created in the store and routine backups are not removed.
-* `202 {"status": "deletion_pending", ...}`: the request is recorded and the conversation is
-  already unusable, but removal finishes when the step in progress ends. Do not tell the customer
-  it is deleted yet. You may repeat the same request with the same token; it returns `202` or `200`.
-* `401 conversation_not_authorized`: not authorized. Also what a repeat returns once deletion has
-  completed, and what any other conversation's token gets.
-* `429` / `503`: try again later. Nothing was reported as deleted.
+  The deletion has fully completed on the server. Show `message`. If you describe the result
+  yourself, do not promise more than `notCovered` allows: anything already created in the store
+  and routine backups are not removed.
+* `409 {"error": "...", "code": "deletion_conflict"}` with `Retry-After`: a step was still in
+  progress and **nothing was deleted**. Keep the conversation id and token, show `error`, and let
+  the customer try again in a moment (or retry automatically once after `Retry-After` seconds).
+  Do not clear the session on this response.
+* `503 deletion_unavailable` / `503 deletion_failed`: nothing was changed. Keep the session and
+  show `error`.
+* `401 conversation_not_authorized`: not authorized, or the conversation no longer exists. If this
+  is the reply to a repeat of a delete request whose `200` was lost, the deletion had completed.
+* There is no pending state and no status endpoint: a request either completes or changes nothing.
 
-**Session reset.** On `200` or `202` the widget MUST discard the conversation id and token
+**Session reset.** Only on `200` the widget MUST discard the conversation id and token
 (sessionStorage and memory), clear the visible transcript, and start over with `POST /chat/session`
-for any further chat. Every request with the old id or token returns `401` from that moment.
+for any further chat. Every request with the old id or token returns `401` from that moment. The
+widget may hide the transcript immediately on the customer's request while waiting for the
+response, but it must keep the credential until it sees `200`.
 
 **History reads are read-only (finding N14).** `GET /chat?history=true` no longer appends the
 "What would you like to change about your fragrance?" prompt or edits the profile. That prompt is

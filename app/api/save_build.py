@@ -40,6 +40,7 @@ from app.db.session import get_session
 from app.services.build_capability import BuildNotAuthorized, authorize_build_token
 from app.services.build_commerce import BuildOperationInProgress, BuildPendingReview, execute_build_commerce
 from app.services.commerce_inventory import InventoryNotVerified, commerce_failure
+from app.services.data_lifecycle import ConversationDeleted
 from app.services.recommendation_confirmation import get_recommendation
 from app.shopify.admin_client import ShopNotAuthenticated
 from app.shopify.build_input import InvalidCustomName, InvalidRatios, validate_custom_name, validate_ratios
@@ -159,6 +160,8 @@ async def save_build(request: Request, session: AsyncSession = Depends(get_sessi
     try:
         outcome = await execute_build_commerce(session, shop, recommendation_id=body.recommendationId, ratios=ratios, name=name, allow_create=False, want_product_url=False, record_saved=False)
         return _json({"price": outcome["price"], "variantId": outcome["variantId"], "created": outcome["created"]}, 200, cors)
+    except ConversationDeleted:
+        return _json({"error": _NOT_AUTHORIZED_MESSAGE, "code": "build_not_authorized"}, 403, cors)
     except InventoryNotVerified as err:
         logger.info("SAVE_BUILD_REJECTED %s", json.dumps({"recommendationId": body.recommendationId, "reason": "inventory", "state": err.state.value}))
         status, payload = commerce_failure(err.state)

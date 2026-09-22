@@ -40,7 +40,7 @@ from app.services.conversation import create_or_update_conversation, save_messag
 from app.services.conversation_capability import CONVERSATION_TOKEN_HEADER, ConversationNotAuthorized, authorize_conversation, create_conversation_with_capability
 from app.services.customer_profile import get_customer_profile, save_customer_profile_fields
 from app.services.data_lifecycle import (
-    DETACHED_PREFIX, ConversationDeleted, complete_conversation_deletion, conversation_key, request_conversation_deletion, run_retention,
+    DETACHED_PREFIX, ConversationDeleted, conversation_key, delete_conversation, run_retention,
 )
 from app.services.inventory_snapshot import save_inventory_snapshot
 from app.services.recommendation_confirmation import mark_recommendation_draft, save_recommendation
@@ -127,6 +127,11 @@ async def world():
 
 
 @pytest.fixture(autouse=True)
+def _deletion_enabled(monkeypatch):
+    monkeypatch.setattr(settings, "customer_deletion_enabled", True)
+
+
+@pytest.fixture(autouse=True)
 def _model(monkeypatch):
     async def _fake(messages, tools, tool_choice=None):
         return {"choices": [{"finish_reason": "stop", "message": {"content": None if tool_choice else "Tell me more about the scent."}}]}
@@ -146,7 +151,7 @@ async def _counts(conversation_id: str) -> dict[str, int]:
             return await session.scalar(select(func.count()).select_from(model).where(column == conversation_id))
         return {
             "conversation": await n(Conversation, Conversation.id), "messages": await n(Message, Message.conversationId),
-            "profile": await n(CustomerProfileState, CustomerProfileState.conversationId), "accountUrls": await n(CustomerAccountUrls, CustomerAccountUrls.conversationId),
+            "profile": await n(CustomerProfileState, CustomerProfileState.conversationId),
             "capabilities": await n(ConversationCapability, ConversationCapability.conversationId), "buildCapabilities": await n(BuildCapability, BuildCapability.conversationId),
             "recommendations": await n(FragranceRecommendation, FragranceRecommendation.conversationId),
             "buckets": await session.scalar(select(func.count()).select_from(RateLimitBucket).where(RateLimitBucket.key.like(f"%{conversation_id}"))),
@@ -157,7 +162,7 @@ async def _database_dump() -> str:
     """Every text value in the tables that can hold customer data, for marker searches."""
     async with SessionLocal() as session:
         parts = []
-        for table in ("Conversation", "Message", "CustomerProfileState", "FragranceRecommendation", "ConversationDeletion", "CustomerAccountUrls"):
+        for table in ("Conversation", "Message", "CustomerProfileState", "FragranceRecommendation", "ConversationDeletion"):
             parts.append(json.dumps([dict(r._mapping) for r in (await session.execute(text(f'SELECT * FROM "{table}"'))).all()], default=str))
         return "\n".join(parts)
 
@@ -175,6 +180,8 @@ async def test_owner_can_delete_their_conversation_and_everything_keyed_to_it(wo
     assert "no-store" in response.headers.get("cache-control", "")
     assert set((await _counts(mine["conversationId"])).values()) == {0}
     async with SessionLocal() as session:
+        # Phase 6A: the account-URL row (other application's, no personal data) is left alone.
+        assert await session.scalar(select(func.count()).select_from(CustomerAccountUrls).where(CustomerAccountUrls.conversationId == mine["conversationId"])) == 1
         assert await session.scalar(select(func.count()).select_from(FragranceRecommendation).where(FragranceRecommendation.id == plain)) == 0
         assert await session.scalar(select(func.count()).select_from(RecommendationInventorySnapshot).where(RecommendationInventorySnapshot.recommendationId == plain)) == 0
         assert await session.scalar(select(func.count()).select_from(MessageSecurityClassification)
@@ -245,7 +252,7 @@ def test_there_is_no_bulk_or_email_based_deletion_entry_point():
 
     paths = set(app.openapi()["paths"])
     assert "/chat/delete" in paths and not [p for p in paths if "delete" in p.lower() and p != "/chat/delete"]
-    signature = inspect.signature(request_conversation_deletion)
+    signature = inspect.signature(delete_conversation)
     assert set(signature.parameters) == {"session", "conversation_id", "origin"}
     source = inspect.getsource(data_lifecycle)
     assert "customerEmail" not in source and "WHERE email" not in source
@@ -324,7 +331,7 @@ async def test_after_deletion_nothing_works_and_nothing_comes_back(world, monkey
         headers = {CONVERSATION_TOKEN_HEADER: mine["conversationToken"]}
         assert client.get("/chat", params={"history": "true", "conversation_id": cid}, headers=headers).status_code == 401
         assert client.post("/chat", json={"conversation_id": cid, "message": "I love vanilla"}, headers=headers).status_code == 401
-        assert _delete(client, mine).status_code == 401  # repeat after completion: same generic refusal as anyone else
+        assert _delete(client, mine).status_code == 401  # repeat after completion: the capability is gone; same refusal as anyone else
         internal = {"X-Internal-Api-Key": settings.internal_api_key}
         assert client.get("/internal/chat/history", params={"conversation_id": cid}, headers=internal).json() == {"messages": []}
         continued = client.post("/internal/chat", json={"conversation_id": cid, "message": "I love vanilla and sandalwood"}, headers=internal)
@@ -343,7 +350,7 @@ async def test_every_write_path_refuses_a_deleted_conversation_even_with_a_stale
     cid = mine["conversationId"]
     kept = await world.recommendation(cid, build_status="saved", product_id="gid://shopify/Product/779")
     async with SessionLocal() as session:
-        await request_conversation_deletion(session, cid)
+        await delete_conversation(session, cid)
     conversation_flow._CONVERSATIONS[cid] = [{"role": "user", "content": MESSAGE}]  # the other instance's stale cache
     async with SessionLocal() as session:
         with pytest.raises(ConversationDeleted):
@@ -371,11 +378,9 @@ async def test_every_write_path_refuses_a_deleted_conversation_even_with_a_stale
 # 4. Races (synchronization barriers, never sleeps)
 # ===========================================================================
 
-async def test_deletion_during_an_active_chat_turn_is_pending_then_finished_by_that_turn_and_nothing_is_written_back(world, monkeypatch):
+async def test_deletion_during_an_active_chat_turn_is_a_retryable_conflict_that_writes_nothing(world, monkeypatch):
     mine = await world.conversation()
     cid = mine["conversationId"]
-    # threading.Event barriers: the turn runs on the test client's own event loop (another
-    # thread), so an asyncio.Event set from this loop would never wake it.
     in_model, release = threading.Event(), threading.Event()
     completed_normally = []
 
@@ -394,43 +399,37 @@ async def test_deletion_during_an_active_chat_turn_is_pending_then_finished_by_t
         turn = loop.run_in_executor(None, lambda: client.post("/chat", json={"conversation_id": cid, "message": f"I love vanilla, I'm {NAME}"}, headers=headers))
         assert await loop.run_in_executor(None, in_model.wait, 20)  # the turn holds the conversation lock, mid-model-call
 
-        first = await loop.run_in_executor(None, lambda: _delete(client, mine))
-        assert first.status_code == 202 and first.json()["status"] == "deletion_pending"  # never "deleted" while data remains
-        # Capabilities are already dead for everyone else ...
-        assert (await loop.run_in_executor(None, lambda: client.get("/chat", params={"history": "true", "conversation_id": cid}, headers=headers))).status_code == 401
-        # ... but the same token may repeat the DELETE while it is pending (idempotent), and only that.
-        again = await loop.run_in_executor(None, lambda: _delete(client, mine))
-        assert again.status_code == 202
-        assert (await _counts(cid))["conversation"] == 1  # not purged yet: the turn still holds the lock
+        conflict = await loop.run_in_executor(None, lambda: _delete(client, mine))
+        assert conflict.status_code == 409 and conflict.json()["code"] == "deletion_conflict" and "Nothing has been deleted" in conflict.json()["error"]
+        # NOTHING was written: no tombstone, capabilities intact, history still readable.
+        async with SessionLocal() as session:
+            assert await session.scalar(select(func.count()).select_from(ConversationDeletion).where(ConversationDeletion.conversationKey == conversation_key(cid))) == 0
+            assert (await session.scalar(select(ConversationCapability.revokedAt).where(ConversationCapability.conversationId == cid))) is None
+        assert (await loop.run_in_executor(None, lambda: client.get("/chat", params={"history": "true", "conversation_id": cid}, headers=headers))).status_code == 200
 
         release.set()
         finished = await turn
-    assert completed_normally == [True] and finished.status_code == 200  # the turn really completed AFTER the deletion request (not via a timeout)
-    # The delayed completion of the in-flight turn did not write anything back, and the turn
-    # itself finished the deletion when it released its lock.
-    assert set((await _counts(cid)).values()) == {0}
-    async with SessionLocal() as session:
-        tombstone = await session.scalar(select(ConversationDeletion).where(ConversationDeletion.conversationKey == conversation_key(cid)))
-        assert tombstone.state == "completed" and tombstone.pendingConversationId is None and tombstone.expiresAt is not None
-    assert cid not in conversation_flow._CONVERSATIONS
+        assert completed_normally == [True] and finished.status_code == 200
+        # The same credential simply retries once the turn is over.
+        done = await loop.run_in_executor(None, lambda: _delete(client, mine))
+        assert done.status_code == 200 and done.json()["status"] == "deleted"
+    assert set((await _counts(cid)).values()) == {0} and cid not in conversation_flow._CONVERSATIONS
     dump = await _database_dump()
     for marker in MARKERS:
         assert marker not in dump, marker
 
 
-async def test_deletion_during_a_build_operation_waits_and_the_build_record_is_minimized_afterwards(world):
+async def test_deletion_during_a_build_operation_is_a_conflict_then_minimizes_the_build_record_afterwards(world):
     mine = await world.conversation()
     cid = mine["conversationId"]
     building = await world.recommendation(cid, build_status="creating")
     async with build_commerce_lock(building):  # a build operation is in flight on another worker
         async with SessionLocal() as session:
-            result = await request_conversation_deletion(session, cid)
-        assert result.completed is False
-        assert (await _counts(cid))["messages"] > 0
-        with TestClient(app) as client:  # and the capability is already revoked
-            assert client.get("/chat", params={"history": "true", "conversation_id": cid}, headers={CONVERSATION_TOKEN_HEADER: mine["conversationToken"]}).status_code == 401
+            result = await delete_conversation(session, cid)
+        assert result.completed is False and result.state == "conflict"
+        assert (await _counts(cid))["messages"] > 0 and (await _counts(cid))["capabilities"] == 1
     async with SessionLocal() as session:
-        await data_lifecycle.complete_pending_deletion(session, cid)  # what the build operation does when it releases its lock
+        assert (await delete_conversation(session, cid)).completed is True
     assert set((await _counts(cid)).values()) == {0}
     async with SessionLocal() as session:
         row = await session.scalar(select(FragranceRecommendation).where(FragranceRecommendation.id == building))
@@ -465,19 +464,19 @@ async def test_lock_order_is_conversation_then_builds_and_everything_is_released
     monkeypatch.setattr(data_lifecycle, "_purge", _boom)
     async with SessionLocal() as session:
         with pytest.raises(RuntimeError):
-            await request_conversation_deletion(session, cid)
+            await delete_conversation(session, cid)
     assert order == [("conversation", cid), ("build", r1), ("build", r2)]
     assert real_turn is None and real_build is None
-    # Nothing was removed, nothing is reported deleted, and every lock was released.
-    assert (await _counts(cid))["messages"] > 0
+    # ATOMIC: nothing was removed, no tombstone, capabilities untouched, every lock released.
+    assert (await _counts(cid))["messages"] > 0 and (await _counts(cid))["capabilities"] == 1
     async with SessionLocal() as session:
-        assert (await session.scalar(select(ConversationDeletion.state).where(ConversationDeletion.conversationKey == conversation_key(cid)))) == "deleting"
+        assert await session.scalar(select(func.count()).select_from(ConversationDeletion).where(ConversationDeletion.conversationKey == conversation_key(cid))) == 0
     async with conversation_turn_lock(cid):
         async with build_commerce_lock(r1), build_commerce_lock(r2):
             pass
     monkeypatch.undo()
-    async with SessionLocal() as session:  # a retry completes it
-        assert (await complete_conversation_deletion(session, cid)).completed is True
+    async with SessionLocal() as session:  # a retry with the still-valid credential completes it
+        assert (await delete_conversation(session, cid)).completed is True
 
 
 async def test_repeated_and_concurrent_deletion_requests_are_idempotent(world):
@@ -486,13 +485,16 @@ async def test_repeated_and_concurrent_deletion_requests_are_idempotent(world):
 
     async def _once():
         async with SessionLocal() as session:
-            return await request_conversation_deletion(session, cid)
+            return await delete_conversation(session, cid)
 
     results = await asyncio.gather(_once(), _once(), _once(), return_exceptions=True)
-    assert all(not isinstance(r, Exception) or type(r).__name__ == "IntegrityError" for r in results)
+    # Exactly one completes; the others either see it already done (completed, already_deleted) or
+    # conflict (nothing written) because the winner held the locks. Never an exception, never two purges.
+    assert all(not isinstance(r, Exception) for r in results), results
+    assert sum(1 for r in results if r.completed and not r.already_deleted) == 1
     async with SessionLocal() as session:
-        final = await request_conversation_deletion(session, cid)
-    assert final.completed is True and set((await _counts(cid)).values()) == {0}
+        final = await delete_conversation(session, cid)
+    assert final.completed is True and final.already_deleted is True and set((await _counts(cid)).values()) == {0}
     async with SessionLocal() as session:
         assert await session.scalar(select(func.count()).select_from(ConversationDeletion).where(ConversationDeletion.conversationKey == conversation_key(cid))) == 1
 
@@ -623,14 +625,14 @@ async def test_only_one_retention_run_at_a_time(world, retention_enabled):
 async def test_partial_failure_is_reported_and_never_counted_as_deleted(world, retention_enabled, monkeypatch):
     good = await world.conversation(age_days=300, with_data=False)
     bad = await world.conversation(age_days=301, with_data=False)
-    real = data_lifecycle.request_conversation_deletion
+    real = data_lifecycle.delete_conversation
 
     async def _flaky(session, conversation_id, **kw):
         if conversation_id == bad["conversationId"]:
             raise RuntimeError(f"boom for {NAME}")
         return await real(session, conversation_id, **kw)
 
-    monkeypatch.setattr(data_lifecycle, "request_conversation_deletion", _flaky)
+    monkeypatch.setattr(data_lifecycle, "delete_conversation", _flaky)
     report = await _run(execute=True)
     assert report.failed == 1 and report.deleted.get("conversations") >= 1
     assert (await _counts(bad["conversationId"]))["conversation"] == 1 and (await _counts(good["conversationId"]))["conversation"] == 0
@@ -665,8 +667,8 @@ async def test_dead_capabilities_buckets_and_tombstones_follow_their_own_clocks(
         session.add(ConversationCapability(id=new_id(), conversationId=cid, tokenHash=f"revoked-{uuid.uuid4().hex}", expiresAt=now + timedelta(days=30), revokedAt=now - timedelta(days=8), createdAt=now - timedelta(days=9)))
         session.add(ConversationCapability(id=new_id(), conversationId=cid, tokenHash=f"justexpired-{uuid.uuid4().hex}", expiresAt=now - timedelta(days=1), createdAt=now - timedelta(days=9)))
         session.add(RateLimitBucket(key=f"pytest-f11-old:{uuid.uuid4().hex}", windowStart=now - timedelta(days=9), count=1, updatedAt=now - timedelta(days=9)))
-        session.add(ConversationDeletion(conversationKey=f"pytest-f11-{uuid.uuid4().hex}", state="completed", origin="customer", requestedAt=now - timedelta(days=40), completedAt=now - timedelta(days=40), expiresAt=now - timedelta(days=33), heldRecords=0))
-        session.add(ConversationDeletion(conversationKey=f"pytest-f11-{uuid.uuid4().hex}", state="completed", origin="customer", requestedAt=now, completedAt=now, expiresAt=now + timedelta(days=7), heldRecords=0))
+        session.add(ConversationDeletion(conversationKey=f"pytest-f11-{uuid.uuid4().hex}", origin="customer", completedAt=now - timedelta(days=40), expiresAt=now - timedelta(days=33), heldRecords=0))
+        session.add(ConversationDeletion(conversationKey=f"pytest-f11-{uuid.uuid4().hex}", origin="customer", completedAt=now, expiresAt=now + timedelta(days=7), heldRecords=0))
         await session.commit()
     report = await _run(execute=True)
     assert report.deleted.get("conversationCapabilities") == 2 and report.deleted.get("rateLimitBuckets", 0) >= 1 and report.deleted.get("tombstones", 0) >= 1
@@ -678,17 +680,6 @@ async def test_dead_capabilities_buckets_and_tombstones_follow_their_own_clocks(
         await session.commit()
     # Capability expiry is NOT deletion of the customer's data: the live conversation is untouched.
     assert (await _counts(cid))["messages"] == 2
-
-
-async def test_interrupted_deletion_is_finished_by_retention(world, retention_enabled):
-    mine = await world.conversation()
-    cid = mine["conversationId"]
-    async with conversation_turn_lock(cid):
-        async with SessionLocal() as session:
-            assert (await request_conversation_deletion(session, cid)).completed is False
-    # (the process that would have finished it died here)
-    report = await _run(execute=True)
-    assert report.deleted.get("pendingDeletionsCompleted") == 1 and set((await _counts(cid)).values()) == {0}
 
 
 def test_maintenance_command_output_is_counts_only_even_on_failure(monkeypatch, capsys):
@@ -868,15 +859,15 @@ async def test_ordinary_guest_flow_is_unchanged(world):
     assert [m["role"] for m in history.json()["messages"]] == ["user", "assistant", "user", "assistant"]
 
 
-async def test_draft_save_refuses_a_deleted_conversation(world):
+async def test_draft_save_refuses_a_deleted_or_minimized_record(world):
     mine = await world.conversation()
-    rec = await world.recommendation(mine["conversationId"])
-    async with conversation_turn_lock(mine["conversationId"]):  # deletion requested but still pending
-        async with SessionLocal() as session:
-            await request_conversation_deletion(session, mine["conversationId"])
+    kept = await world.recommendation(mine["conversationId"], build_status="saved", product_id="gid://shopify/Product/790")
     async with SessionLocal() as session:
-        with pytest.raises(ConversationDeleted):
-            await mark_recommendation_draft(session, rec, name=BLEND_NAME, ratios={"top": 34, "middle": 33, "base": 33})
+        assert (await delete_conversation(session, mine["conversationId"])).completed
+    async with SessionLocal() as session:
+        with pytest.raises(ConversationDeleted):  # the retained record accepts no further customer write
+            await mark_recommendation_draft(session, kept, name=BLEND_NAME, ratios={"top": 34, "middle": 33, "base": 33})
+        assert (await session.scalar(select(FragranceRecommendation.draftName).where(FragranceRecommendation.id == kept))) is None
 
 
 def test_outbound_http_client_loggers_cannot_emit_request_urls():

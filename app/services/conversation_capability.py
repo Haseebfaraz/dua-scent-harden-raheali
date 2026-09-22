@@ -124,18 +124,3 @@ async def revoke_conversation_tokens(session: AsyncSession, conversation_id: str
     await session.commit()
     return len(rows)
 
-
-async def is_pending_deletion_retry(session: AsyncSession, *, token: object, conversation_id: object) -> bool:
-    """Phase 6: true only for the conversation's OWN (now revoked, unexpired) capability while
-    that conversation's deletion is still pending. It authorizes repeating the deletion request
-    and nothing else."""
-    from app.db.models import ConversationDeletion
-    from app.services.data_lifecycle import STATE_DELETING, conversation_key
-
-    if not isinstance(token, str) or not token or len(token) > _MAX_TOKEN_LENGTH or not isinstance(conversation_id, str) or not conversation_id:
-        return False
-    row = await session.scalar(select(ConversationCapability).where(ConversationCapability.tokenHash == hash_conversation_token(token)))
-    if row is None or not hmac.compare_digest(row.conversationId.encode(), conversation_id.encode()) or row.expiresAt <= utcnow():
-        return False
-    state = await session.scalar(select(ConversationDeletion.state).where(ConversationDeletion.conversationKey == conversation_key(conversation_id)))
-    return state == STATE_DELETING

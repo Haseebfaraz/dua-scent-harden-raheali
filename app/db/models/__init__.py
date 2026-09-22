@@ -327,16 +327,14 @@ class MessageSecurityClassification(Base):
 
 
 class ConversationDeletion(Base):
-    """Phase 6 (F11): a deletion tombstone. No customer content: a SHA-256 of the conversation id,
-    a state and timestamps. Python-owned table (migrations/0004_conversation_deletion.sql)."""
+    """Phase 6 / 6A (F11): a COMPLETED deletion tombstone. No customer content: a SHA-256 of the
+    conversation id, an origin and timestamps. Python-owned table
+    (migrations/0004_conversation_deletion.sql)."""
 
     __tablename__ = "ConversationDeletion"
 
     conversationKey: Mapped[str] = mapped_column(primary_key=True)
-    pendingConversationId: Mapped[str | None]       # only while state == deleting; NULL once completed
-    state: Mapped[str] = mapped_column(index=True)  # deleting | completed
     origin: Mapped[str]                              # customer | retention
-    requestedAt: Mapped[datetime]
-    completedAt: Mapped[datetime | None]
-    expiresAt: Mapped[datetime | None] = mapped_column(index=True)
+    completedAt: Mapped[datetime]
+    expiresAt: Mapped[datetime] = mapped_column(index=True)
     heldRecords: Mapped[int] = mapped_column(default=0)

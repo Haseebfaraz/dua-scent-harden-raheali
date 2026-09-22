@@ -34,6 +34,7 @@ from app.services.customer_identity import VerifiedShopifyCustomer, verified_sho
 from app.services.conversation import save_message
 from app.services.customer_profile import get_customer_profile, save_customer_profile_field
 from app.services.data_lifecycle import ConversationDeleted
+from app.services.turn_lock import TurnInProgress, conversation_turn_lock
 from app.services.fragrance_build import compute_default_ratios, compute_note_position_buckets, compute_price_per_5ml_by_position
 from app.services.build_commerce import BuildOperationInProgress, BuildPendingReview, execute_build_commerce, save_recreate_draft
 from app.services.commerce_inventory import InventoryNotVerified, commerce_failure
@@ -173,17 +174,19 @@ async def preview_action(body: PreviewAction, signed: dict = Depends(verified_si
         return _json({"error": str(err), "code": "invalid_input"})
 
     if body.intent == "recreate":
+        # Phase 6A: the conversation writes below happen under the conversation turn lock (class 1),
+        # taken BEFORE the build lock (class 2), the same order deletion uses. Each write also
+        # applies rule W, so a deleted conversation is refused whatever the caller cached.
         try:
-            await save_recreate_draft(session, recommendation_id=body.recommendationId, name=name, ratios=ratios)
-        except BuildOperationInProgress:
+            async with conversation_turn_lock(recommendation.conversationId):
+                await save_recreate_draft(session, recommendation_id=body.recommendationId, name=name, ratios=ratios)
+                # N14: the re-entry prompt is appended HERE, by this explicit authorized POST.
+                await save_message(session, recommendation.conversationId, "assistant", RECREATE_REENTRY_MESSAGE)
+                await save_customer_profile_field(session, recommendation.conversationId, "pendingRecreateRecommendationId", body.recommendationId)
+        except (BuildOperationInProgress, TurnInProgress):
             return _json(commerce_failure("build_in_progress")[1])
         except BuildPendingReview:
             return _json(commerce_failure("build_pending_review")[1])
-        # Phase 6 (N14): the re-entry prompt is appended HERE, by this explicit authorized POST. The
-        # history GET used to do it as a side effect. Both writes refuse a deleted conversation.
-        try:
-            await save_message(session, recommendation.conversationId, "assistant", RECREATE_REENTRY_MESSAGE)
-            await save_customer_profile_field(session, recommendation.conversationId, "pendingRecreateRecommendationId", body.recommendationId)
         except ConversationDeleted:
             return _json({"error": _NOT_AUTHORIZED_MESSAGE, "code": "build_not_authorized"})
         return _json({"status": "recreate", "redirectUrl": f"https://{shop}/"})
@@ -220,6 +223,8 @@ async def preview_action(body: PreviewAction, signed: dict = Depends(verified_si
         )
         shopify_product_id, shopify_variant_id, product_url = outcome["productId"], outcome["variantId"], outcome["productUrl"]
         logger.info("SHOPIFY_VARIANT_RESOLVED %s", json.dumps({"shop": shop, "recommendationId": body.recommendationId, "created": outcome["created"]}))
+    except ConversationDeleted:
+        return _json({"error": _NOT_AUTHORIZED_MESSAGE, "code": "build_not_authorized"})
     except InventoryNotVerified as err:
         logger.info("COMMERCE_BLOCKED %s", json.dumps({"shop": shop, "recommendationId": body.recommendationId, "intent": body.intent, "state": err.state.value}))
         return _json(commerce_failure(err.state)[1])

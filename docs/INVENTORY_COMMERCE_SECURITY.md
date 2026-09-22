@@ -368,3 +368,17 @@ server-authored `availabilityGuidance` sentence with each recommendation (never 
 never to say anything is reserved or guaranteed). No item codes, quantities, source products,
 Odoo identifiers, locations, raw responses or exception text reach the browser, any model or the
 commerce decision log.
+
+## 12. Deletion and commerce records (Phase 6A)
+
+A customer's deletion request that arrives while a build operation holds the build lock is
+refused with a retryable conflict and writes nothing; it cannot unsend a Shopify request. When the
+operation ends (success, ambiguous outcome, or a crash that leaves `creating`), the retried
+deletion MINIMIZES the recommendation instead of removing it: it keeps only `id`, the component
+titles and notes, `ratiosJson`, `combinationType`, `status`, `buildStatus`, `shopifyProductId`,
+`shopifyVariantId`, `createdAt`, `confirmedAt`, blanks everything else, detaches it from the
+conversation and deletes its capabilities. Reconciliation (section 8) therefore still has the
+product id and the pending-review marker, duplicate creation stays impossible (`creating` /
+`pending_review` are refused, and a detached record accepts no customer operation at all), and
+the deleted profile, draft name and customer-facing copy are never restored. Deletion itself
+performs no Shopify operation.

@@ -9,6 +9,18 @@ removed by anything here.
 
 This is engineering work. It is **not a statement of legal compliance** with any privacy law.
 
+> **Phase 6A corrections (2026-09-21).** The Phase 6 version of this page described an
+> accepted-but-pending deletion (`202`) whose completion depended on the in-flight request's
+> `finally` block, on the customer retrying, or on the age-based retention command, which is
+> disabled. That could strand an accepted deletion indefinitely while the customer had already
+> discarded their credential. Deletion is now **synchronous and atomic**: `200` means the single
+> transaction that removed everything promised locally has committed; `409` means nothing at all
+> was written and the same credential can simply retry (section 4). The write guard is now a
+> database-level lock rule, not a check-then-write (section 6). The customer route is **off by
+> default** pending the shared-database review (section 2a). `CustomerAccountUrls` is no longer
+> deleted (section 2). Migration 0004 was revised before any application outside the disposable
+> test database.
+
 ## 1. What is stored, why, who owns it
 
 Everything a guest creates hangs off one conversation id. There is no customer account in this
@@ -34,7 +46,7 @@ backend; "owner" means "holder of that conversation's capability".
 | Rate-limit buckets | `RateLimitBucket` | conversation id; keyed hash of IP | abuse control | last update | 2 days | the conversation's buckets deleted | yes |
 | Deletion tombstone | `ConversationDeletion` | no (SHA-256 of the id) | stop late writes re-creating deleted data | completion | 7 days | removed by retention | yes |
 | In-memory history and scratch | process memory (`_CONVERSATIONS`, `_conversation_scratch`) | **Yes** | speed | process life, LRU 500 | - | evicted locally; harmless elsewhere (section 6) | yes |
-| Customer account URLs | `CustomerAccountUrls` (written by the other application) | no | legacy | conversation | - | deleted (keyed to the conversation) | yes |
+| Customer account URLs | `CustomerAccountUrls` (written by the other application) | no (endpoint URLs) | legacy | not conversation-owned by this app | - | **left untouched** (Phase 6A) | n/a |
 | Order history | `OrderHistory` | pseudonymous (salted hash of a name), city | recommendation evidence | **not conversation-owned** | **UNKNOWN, not set here** | **untouched** | **no** |
 | Shopify product for a build | Shopify: title (the customer's blend name), metafields `custom.customer_name`, `custom.customer_email`, `custom.internal_components`, `custom.note_composition` (finding N7) | **Yes** | manufacturing / the order | - | Shopify's | **NOT deleted** | **no** |
 | Application logs | hosting platform | request ids, conversation and recommendation ids; no content since this phase | diagnostics | platform | platform's | not deleted | no |
@@ -54,6 +66,34 @@ migrations): `BuildCapability`, `ConversationCapability`, `RateLimitBucket`,
   never existed. This is the main reason F11 is PARTIAL, together with `OrderHistory`.
 * `OrderHistory`, the catalog tables and `Session` are not customer-owned by any conversation and
   are never touched.
+
+### 2a. The shared-database review, and the gate that stands in for it
+
+Deleting rows from `Conversation`, `Message`, `CustomerProfileState` and `FragranceRecommendation`
+is irreversible, and those tables are defined by the other application's Prisma schema. This
+repository is a port of that application's chat and build services (the models "mirror
+prisma/schema.prisma exactly"; the Node routes now call this backend's internal adapter). Whether
+the Node application still reads or writes those rows directly **could not be verified from this
+repository**. Unknown is not "verified absent".
+
+Therefore the customer deletion route is gated by `CUSTOMER_DELETION_ENABLED` (default `false`).
+While false it authorizes the caller as usual and then answers `503 deletion_unavailable` **before
+any irreversible step**: no revocation, no tombstone, no purge. **Setting the flag is not the
+review.** It records that the following review was done:
+
+| Table / rows | Owner | This app deletes | Review required before enabling |
+|---|---|---|---|
+| `Conversation` (name, email, timestamps) | Prisma schema; rows created by this app's bootstrap and by the legacy Node chat | yes | confirm no Node route, job or report reads a conversation after this app deleted it, and that no Node code re-inserts one from its own cache |
+| `Message` (+ `MessageSecurityClassification` by cascade) | Prisma schema; rows written by this app | yes | same; confirm the Node widget only reads history through this app's routes |
+| `CustomerProfileState` | Prisma schema; rows written by this app | yes | same |
+| `FragranceRecommendation` without commerce footprint | Prisma schema; rows written by this app | yes | confirm nothing in Node keys off a recommendation id after preview (email, analytics, admin screens) |
+| `FragranceRecommendation` with commerce footprint | as above | no (minimized, section 5) | confirm the Node admin / manufacturing views tolerate blanked customer-facing fields |
+| `ConversationCapability`, `BuildCapability`, `RateLimitBucket`, `ConversationDeletion` | this app (own migrations) | yes | none |
+| `CustomerAccountUrls` | written by Node's customer-account OAuth code | **no** (no personal data; left alone) | none needed now; if Node later stores PII there, revisit |
+| `OrderHistory`, catalog tables, `Session` | Node / operator imports | no | out of scope; `OrderHistory` needs its own lifecycle decision |
+
+Age-based retention (section 3) removes the same rows and is gated separately by
+`RETENTION_EXECUTION_ENABLED`; the review above applies to it too.
 
 ## 3. Retention policy (PROVISIONAL, configurable, execution DISABLED)
 
@@ -83,30 +123,29 @@ counted in every run under `held.unresolvedCommerceRecords`, and released only b
 resolving them (`docs/INVENTORY_COMMERCE_SECURITY.md` section 8). A hold keeps the minimized
 record only, never the conversation.
 
-## 4. Deletion: authorization and contract
+## 4. Deletion: authorization and contract (Phase 6A)
 
 `POST /chat/delete`, body `{"conversation_id": "..."}`, header `X-Conversation-Token`.
 
 * Authorized **only** by that conversation's capability. A conversation id, a name, an email, a
   shop or any extra body field authorizes nothing. There is no deletion by email and no bulk
-  deletion. Tokens are never accepted from a URL.
-* A Shopify-signed customer id is not used by the chat routes (they are not App-Proxied). Where a
-  capability is bound to a verified customer, the existing rule still applies: a different signed
-  id is refused, and the same id on another conversation is not ownership of it.
+  deletion. Tokens are never accepted from a URL. A different signed Shopify customer id is
+  refused; the same id on another conversation is not ownership of it.
 * Every refusal is the same `401 conversation_not_authorized` returned for an id that does not
   exist.
 
-| Response | Meaning |
-|---|---|
-| `200 {"status": "deleted", "commerceRecordRetained": bool, "notCovered": "..."}` | the purge finished |
-| `202 {"status": "deletion_pending", ...}` | recorded durably, capabilities already dead, removal finishes when the step in progress ends. **Not** reported as deleted |
-| `401` | not authorized (also: a repeat after completion) |
-| `429` / `503` | rate limited / could not be processed |
+| Response | Meaning | Credential afterwards |
+|---|---|---|
+| `200 {"status": "deleted", "commerceRecordRetained": bool, "notCovered": "..."}` | the ONE transaction that removed everything promised locally has committed | gone (row deleted); a repeat is a plain `401` |
+| `409 deletion_conflict` (+ `Retry-After`) | a chat turn, a build operation or a writer's transaction is in flight. **Nothing was written**: no marker, no revocation | still valid; repeat the request |
+| `503 deletion_unavailable` | the gate in section 2a is off. Nothing was changed | still valid |
+| `503 deletion_failed` | the transaction failed and was rolled back. Nothing was changed | still valid |
+| `401` | not authorized, unknown, or already deleted | - |
 
-The message never promises more than happened: `notCovered` says that anything already created in
-the store and routine backups are not removed. Repeats: while pending, the same (now revoked)
-token may repeat the request and gets `202` or `200`; after completion the capability row no
-longer exists and a repeat is a plain `401`. No email or notification is sent.
+There is no accepted-but-pending state and no status endpoint: nothing is ever "in progress"
+across requests, so there is nothing to poll. A lost `200` response is the only ambiguity; a
+repeat then returns `401`, which for the credential that just worked means the deletion
+completed (documented in the chat contract). No email or notification is sent.
 
 ## 5. Dependency graph and what remains
 
@@ -132,28 +171,49 @@ can reach it through the old conversation or an old token.
 It is called **minimized**, not anonymous: the Shopify product it points to still carries the
 customer's name and email (N7), and its id appears in earlier logs.
 
-## 6. Concurrency, caches and resurrection
+## 6. Concurrency, caches and resurrection (Phase 6A)
 
-1. **Durable first.** The tombstone and the revocation of every capability are one committed
-   transaction, before anything is removed. From then on every instance refuses the old tokens.
-2. **Write guard.** `ensure_conversation_writable` is called by every path that can create or
-   re-create conversation data: conversation upsert, message save (plain and classified), profile
-   upsert, recommendation save, build-token issue, draft save. A process holding a stale cached
-   copy (another instance) is refused by the database, not by its own memory.
-3. **Locks**, all non-blocking: conversation turn lock first, then each recommendation's build
-   lock in id order. Nothing waits, so nothing can deadlock. No transaction is held open while
-   locks are taken, and no external service is called.
-4. **In flight.** If a chat turn or a build operation holds a lock, the deletion stays `deleting`
-   and the caller gets `202`. The turn's own writes are refused by the guard; when it releases its
-   lock it finishes the deletion itself. So does a build operation. If the process dies, the
-   retention command finishes it.
-5. **Caches.** The deleting process evicts its history and scratch caches. Other instances keep
-   theirs until LRU eviction or restart, but cannot serve them (authorization fails) or persist
-   them (write guard). The internal adapter routes check the tombstone explicitly.
-6. **Tombstone lifecycle.** SHA-256 of the conversation id, state, counts, timestamps. While
-   `deleting` it also holds the id it must finish (the conversation still exists then); that is
-   cleared on completion. Removed 7 days after completion. After that, the only id-addressed route
-   (the internal adapter) still refuses ids that do not exist.
+Two rules, enforced in code and pinned by tests that use real PostgreSQL sessions and barriers:
+
+**Rule W (writers).** Every write of conversation-owned data runs inside a transaction that first
+takes the SHARED write-guard advisory lock for that conversation (`pg_advisory_xact_lock_shared`,
+class 4), then checks that no tombstone exists (`ensure_conversation_writable`), then writes, then
+commits before any external call. A new transaction means a new guard call (the message writers
+commit the conversation upsert first and guard again before inserting the message). Applied by:
+conversation upsert, both message saves, the profile upsert, recommendation save, build-token
+issue, draft save. A minimized (detached) commerce record is refused outright.
+
+**Rule D (deletion).** Try the conversation turn lock (class 1) and every build lock of the
+conversation (class 2, by id); then, in ONE transaction, try the EXCLUSIVE write-guard lock
+(class 4), insert the completed tombstone, purge, commit. Any lock that cannot be taken means
+CONFLICT and nothing written.
+
+Why this closes the race: a writer holds the shared lock from its check to its commit; deletion
+needs the exclusive lock for its whole transaction. So a writer either committed before deletion
+began (its rows are purged) or takes its lock after deletion committed (it sees the tombstone).
+There is no window in which a writer that saw no tombstone can commit after the tombstone
+exists. This is a database guarantee that holds for direct service callers, other instances and
+stale caches alike. The turn and build locks add conflict semantics so an in-flight operation
+finishes cleanly instead of failing half way (tested: a chat turn in flight gets a `409`, the
+turn completes normally, the retry deletes).
+
+Lock order is fixed (1, then 2 by id, then 4) and every deletion-side lock is a try-lock, so
+nothing waits and nothing can deadlock. Writers' shared requests wait only for the milliseconds
+of a purge. No transaction is held open while session-level locks are taken and no external
+service is called under any lock.
+
+**Caches.** The deleting process evicts its history and scratch caches. Another instance may keep
+a stale copy until LRU eviction or restart; it cannot serve it (authorization fails; the internal
+routes also verify the row exists and evict) and cannot persist it (rule W).
+
+**Tombstone lifecycle and expiry.** A tombstone records a COMPLETED deletion only: SHA-256 of the
+conversation id, origin, timestamps, held count. Retention removes it after
+`RETENTION_TOMBSTONE_DAYS`. After that, what prevents recreation is structural, not the
+tombstone: every entry point that takes a conversation id either requires a live capability
+(deleted with the conversation) or verifies the `Conversation` row exists and otherwise mints a
+fresh, server-controlled id; no route calls the insert-capable upsert for an id the server did
+not mint; and a minimized commerce record refuses every customer write for ever. Tested with an
+advanced clock.
 
 ## 7. Retention command
 
@@ -168,7 +228,10 @@ customer's name and email (N7), and its id appears in earlier logs.
   transaction; a processed conversation drops out of the query, so there is no offset to drift.
   A failed item is counted as failed, never as deleted, and the run continues. Re-running is safe.
 * It applies exactly the same deletion service as a customer request, so the same ownership,
-  minimization and hold rules apply.
+  minimization and hold rules apply. A conversation whose operation is in flight is counted as
+  `held.operationInFlight` and picked up by the next run.
+* A customer's explicit deletion never depends on this command: it completes in its own request
+  or it is refused with nothing written.
 * Not an HTTP endpoint. **Not scheduled by this repository.** It has only ever been run against the
   disposable test database.
 
@@ -189,14 +252,24 @@ sufficient) with alerting on a non-zero exit code.
 | Database backups | not deleted; a deleted record persists until the backup expires. A restore would bring it back |
 | The other application sharing the database | unknown caches or copies |
 
-## 9. Failure and recovery
+## 9. Failure and recovery (Phase 6A)
 
-* A failed purge rolls back; the tombstone stays `deleting`, the capabilities stay revoked, the
-  caller gets `503`, and nothing is reported as deleted. A retry or the retention command
-  completes it.
-* A tombstone can never exist alongside usable capabilities (same transaction).
-* Restoring a backup resurrects deleted data and removes tombstones younger than the backup; the
-  operator must re-apply deletions made since that backup. No tooling exists for this.
+| Situation | Behaviour |
+|---|---|
+| Process crash during deletion | the transaction never committed: no marker, no revocation, no partial purge; the credential still works; retry |
+| Database interruption mid-purge | rolled back; `503 deletion_failed`; nothing changed |
+| Missing migration 0004 | every guarded write fails closed (`ProgrammingError`), the delete route answers `503 deletion_failed`; nothing changed |
+| One record failing minimization | the whole transaction rolls back; nothing changed; the failure is logged by type only |
+| Blocked shared dependency | the gate (section 2a) answers `503 deletion_unavailable` before any irreversible step |
+| Another worker deleting the same conversation | it holds the locks: this request gets `409`; a retry finds the tombstone and answers `200` (already deleted) |
+| Application restart | nothing to resume: there is no in-progress state |
+| Completion, then tombstone cleanup | section 6 |
+| Backup restore | resurrects deleted rows and removes tombstones younger than the backup; deletions since that backup must be re-applied by hand (no tooling) |
+
+Counts: the route logs `state` (completed / conflict) and the failure type; retention reports
+eligible, deleted, minimized, held (`operationInFlight`, `unresolvedCommerceRecords`,
+`anotherRetentionRunActive`) and failed. Never an id, a name, a message, a token or a
+connection string.
 
 ## 10. Limitations
 

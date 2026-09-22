@@ -38,6 +38,7 @@ async def create_or_update_conversation(
 
 async def save_message(session: AsyncSession, conversation_id: str, role: str, content: str) -> Message:
     await create_or_update_conversation(session, conversation_id)
+    await ensure_conversation_writable(session, conversation_id)  # Phase 6A: a new transaction, a new guard (rule W)
     message = Message(id=new_id(), conversationId=conversation_id, role=role, content=content, createdAt=utcnow())
     session.add(message)
     await session.commit()
@@ -59,6 +60,7 @@ async def save_user_message_with_classification(session: AsyncSession, conversat
     so a stored customer turn can never exist without its classification because the second write
     failed. On any error nothing is written and the exception propagates to the caller."""
     await create_or_update_conversation(session, conversation_id)
+    await ensure_conversation_writable(session, conversation_id)  # Phase 6A: rule W, per transaction
     message = Message(id=new_id(), conversationId=conversation_id, role="user", content=content, createdAt=utcnow())
     session.add(message)
     session.add(MessageSecurityClassification(id=new_id(), messageId=message.id, classification=classification, reasonCode=reason_code, classifierVersion=version, createdAt=utcnow()))

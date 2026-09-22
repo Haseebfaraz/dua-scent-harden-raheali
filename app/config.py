@@ -42,6 +42,13 @@ class Settings(BaseSettings):
     # Destructive retention runs are OFF until an operator reviews the policy. With this false the
     # maintenance command can only ever dry-run, whatever flags it is given.
     retention_execution_enabled: bool = False
+    # Phase 6A: the customer deletion route is OFF until the shared-database review in
+    # docs/DATA_RETENTION_AND_DELETION.md section 2 has been done. The rows it removes
+    # (Conversation, Message, CustomerProfileState, FragranceRecommendation) live in tables the
+    # other application also owns, and whether it still reads them could not be verified from this
+    # repository. While false the route answers 503 and changes nothing: no revocation, no marker.
+    # Setting this to true is NOT the review; it records that the review happened.
+    customer_deletion_enabled: bool = False
     # A guest conversation is inactive when its LAST CUSTOMER MESSAGE (or, with none, its creation)
     # is older than this. Reads, polling, assistant or server writes never extend it.
     retention_inactive_conversation_days: int = 90

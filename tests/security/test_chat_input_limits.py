@@ -97,13 +97,12 @@ def downstream(monkeypatch):
     monkeypatch.setattr(chat_module, "save_message", _noop)
     monkeypatch.setattr(chat_module, "resolve_legacy_preview_short_circuit", _noop)
 
-    # Phase 6: the turn now reads the profile (recreate marker) and finishes any pending deletion
-    # after releasing its lock. This fixture runs without a database, so both are stubbed.
+    # Phase 6: the turn now reads the profile (recreate marker). This fixture runs without a
+    # database, so it is stubbed.
     async def _empty_profile(*a, **kw):
         return {}
 
     monkeypatch.setattr(chat_module, "get_customer_profile", _empty_profile)
-    monkeypatch.setattr(chat_module, "complete_pending_deletion", _noop)
 
     async def _call_ai(session, history, conversation_id, email, name, shop, gate=None):
         calls["openai"] += 1

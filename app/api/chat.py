@@ -48,14 +48,13 @@ from app.schemas.chat import ChatDeleteRequest, ChatRequest, ChatSessionRequest
 from app.services.build_capability import preview_url_for_logging
 from app.services.conversation import create_or_update_conversation, save_message, save_user_message_with_classification
 from app.services.conversation_capability import (
-    is_pending_deletion_retry,
     CONVERSATION_TOKEN_HEADER,
     ConversationNotAuthorized,
     authorize_conversation,
     create_conversation_with_capability,
 )
 from app.services.customer_identity import SelfReportedIdentity, self_reported_identity
-from app.services.data_lifecycle import complete_pending_deletion, is_conversation_deleted, request_conversation_deletion
+from app.services.data_lifecycle import delete_conversation, evict_local_caches, is_conversation_deleted
 from app.services.customer_profile import get_customer_profile, save_customer_profile_field
 from app.services.legacy_preview_recovery import resolve_legacy_preview_short_circuit
 from app.services.rate_limit import Limit, RateLimitUnavailable, RateLimited, enforce, hash_abuse_identity, limit
@@ -180,7 +179,10 @@ async def chat_history(conversation_id: str | None = None, session: AsyncSession
             validate_conversation_id(conversation_id)
         except InvalidChatInput:
             return JSONResponse({"messages": []}, headers=NO_STORE_HEADERS)
-        if await is_conversation_deleted(session, conversation_id):
+        # Phase 6A: the row must exist NOW. A tombstone, or a stale in-memory copy that outlived
+        # the tombstone window on this instance, never serves history for a deleted conversation.
+        if await is_conversation_deleted(session, conversation_id) or not await session.scalar(select(Conversation.id).where(Conversation.id == conversation_id)):
+            evict_local_caches(conversation_id)
             return JSONResponse({"messages": []}, headers=NO_STORE_HEADERS)  # identical to an unknown id
     return JSONResponse(await _history_payload(session, conversation_id), headers=NO_STORE_HEADERS)
 
@@ -277,9 +279,10 @@ async def _resolve_internal_conversation(body: ChatRequest, session: AsyncSessio
             conversation_id = validate_conversation_id(body.conversation_id)
         except InvalidChatInput:
             conversation_id = None
-        if conversation_id and await is_conversation_deleted(session, conversation_id):
-            conversation_id = None  # Phase 6: a deleted conversation is never continued; a fresh one is minted below
-        if conversation_id and await session.scalar(select(Conversation.id).where(Conversation.id == conversation_id)):
+        if conversation_id and (await is_conversation_deleted(session, conversation_id) or not await session.scalar(select(Conversation.id).where(Conversation.id == conversation_id))):
+            evict_local_caches(conversation_id)  # Phase 6 / 6A: never continued, never served from a stale cache
+            conversation_id = None
+        if conversation_id:
             await _enforce_limits(session, [
                 limit("chat_turn_conv", conversation_id, settings.rate_limit_chat_turn_per_conversation),
                 limit("chat_turn_conv_day", conversation_id, settings.rate_limit_chat_turn_per_conversation_daily),
@@ -445,9 +448,6 @@ async def _run_chat_turn(
         finally:
             turn_slots.release()
             await lock.__aexit__(None, None, None)
-            # Phase 6: if the owner asked for deletion while this turn was running, the turn's own
-            # writes were refused (tombstone) and the purge is finished now, not "eventually".
-            await complete_pending_deletion(session, conversation_id)
 
     return StreamingResponse(
         _stream(),
@@ -467,26 +467,35 @@ async def chat_action(request: Request, body: ChatRequest, session: AsyncSession
 
 
 # ---------------------------------------------------------------------------
-# Phase 6 (F11): owner-requested deletion of ONE conversation
+# Phase 6 / 6A (F11): owner-requested deletion of ONE conversation
 # ---------------------------------------------------------------------------
 
+_NOT_COVERED = "Anything already created in the store (for example a saved blend or an order) and routine backups are not removed by this request."
 _DELETED_BODY = {
     "status": "deleted",
     "message": "This conversation and the preferences we stored with it have been deleted from the fragrance designer.",
-    "notCovered": "Anything already created in the store (for example a saved blend or an order) and routine backups are not removed by this request.",
+    "notCovered": _NOT_COVERED,
 }
-_DELETION_PENDING_BODY = {
-    "status": "deletion_pending",
-    "message": "Your deletion request is recorded and this conversation can no longer be used. Removal finishes as soon as the step in progress ends.",
-    "notCovered": _DELETED_BODY["notCovered"],
+_DELETION_CONFLICT_BODY = {
+    "error": "This conversation is still finishing a step. Nothing has been deleted yet. Please try again in a moment.",
+    "code": "deletion_conflict",
+}
+_DELETION_UNAVAILABLE_BODY = {
+    "error": "Deleting conversations isn't available here yet. Nothing has been changed. Please contact us and we'll take care of it.",
+    "code": "deletion_unavailable",
 }
 
 
 @router.post("/chat/delete")
-async def delete_conversation(request: Request, body: ChatDeleteRequest, session: AsyncSession = Depends(get_session)) -> JSONResponse:
+async def delete_conversation_route(request: Request, body: ChatDeleteRequest, session: AsyncSession = Depends(get_session)) -> JSONResponse:
     """Authorized ONLY by the conversation capability (header, never a URL). A conversation id, a
     name or an email authorizes nothing. Scope: exactly this conversation and the records keyed to
-    it (app/services/data_lifecycle.py). Every refusal is the same 401 used for unknown ids."""
+    it (app/services/data_lifecycle.py). Every refusal is the same 401 used for unknown ids.
+
+    Phase 6A contract: 200 means the single transaction that removed everything promised locally
+    has COMMITTED. 409 means nothing was written (no marker, no revocation) because an operation on
+    this conversation is in flight: the credential still works and the request can simply be
+    repeated. There is no accepted-but-pending state."""
     try:
         conversation_id = validate_conversation_id(body.conversation_id)
         token = validate_token_shape(request.headers.get(CONVERSATION_TOKEN_HEADER))
@@ -494,24 +503,22 @@ async def delete_conversation(request: Request, body: ChatDeleteRequest, session
         return JSONResponse(_NOT_AUTHORIZED_BODY, status_code=401, headers=NO_STORE_HEADERS)
     ip_subject = hash_abuse_identity(client_ip(request))
     await _enforce_limits(session, [limit("conversation_delete_ip", ip_subject, settings.rate_limit_history_read_per_ip)])
-
-    pending_retry = False
     try:
         await authorize_conversation(session, token=token, conversation_id=conversation_id)
     except ConversationNotAuthorized:
-        # The first request revokes the capability. While removal is still pending, the SAME
-        # token may ask again (idempotent retry); after completion the capability row is gone and
-        # this is indistinguishable from any other unauthorized request.
-        pending_retry = await is_pending_deletion_retry(session, token=token, conversation_id=conversation_id)
-        if not pending_retry:
-            return JSONResponse(_NOT_AUTHORIZED_BODY, status_code=401, headers=NO_STORE_HEADERS)
+        return JSONResponse(_NOT_AUTHORIZED_BODY, status_code=401, headers=NO_STORE_HEADERS)
+    if not settings.customer_deletion_enabled:
+        # Fail closed BEFORE any irreversible step: no revocation, no marker, no purge
+        # (docs/DATA_RETENTION_AND_DELETION.md section 2: the shared-database review is pending).
+        logger.info("CONVERSATION_DELETE_UNAVAILABLE %s", json.dumps({"reason": "customer_deletion_disabled"}))
+        return JSONResponse(_DELETION_UNAVAILABLE_BODY, status_code=503, headers=NO_STORE_HEADERS)
 
     try:
-        result = await request_conversation_deletion(session, conversation_id)
+        result = await delete_conversation(session, conversation_id)
     except Exception as err:
         logger.error("CONVERSATION_DELETE_FAILED %s", json.dumps({"errorType": type(err).__name__}))
-        return JSONResponse({"error": "We couldn't process this request right now. Please try again.", "code": "deletion_failed"}, status_code=503, headers=NO_STORE_HEADERS)
-    logger.info("CONVERSATION_DELETE %s", json.dumps({"state": result.state, "retry": pending_retry}))
+        return JSONResponse({"error": "We couldn't process this request right now. Nothing has been deleted yet. Please try again.", "code": "deletion_failed"}, status_code=503, headers=NO_STORE_HEADERS)
+    logger.info("CONVERSATION_DELETE %s", json.dumps({"state": result.state}))
     if result.completed:
         return JSONResponse({**_DELETED_BODY, "commerceRecordRetained": result.minimized_commerce_records > 0}, headers=NO_STORE_HEADERS)
-    return JSONResponse(_DELETION_PENDING_BODY, status_code=202, headers=NO_STORE_HEADERS)
+    return JSONResponse(_DELETION_CONFLICT_BODY, status_code=409, headers={"Retry-After": "5", **NO_STORE_HEADERS})

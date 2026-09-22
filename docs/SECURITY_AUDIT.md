@@ -1198,6 +1198,12 @@ this phase. F1, F2, N1, F6, F7, F8, N2, F3, N5, N8: regression suites passing un
 
 ## 19. Phase 6 (2026-09-21): customer data lifecycle, ownership-aware deletion, retention, privacy-safe observability
 
+> **Corrected in part by section 20 (Phase 6A).** This section is kept as written. Its
+> accepted-but-pending deletion (`202`) had no reliable completion path, its write guard was a
+> check-then-write across separate transactions, its deletion of `CustomerAccountUrls` and of
+> rows in tables the other application owns was not gated on any review, and the internal
+> history route could serve a stale cached copy after the tombstone expired.
+
 Branch `security-hardening`, continuing after `11e96e4`. Nothing deployed or pushed. No production
 or staging data, no external request, no real customer record touched. Synthetic records in a
 disposable local PostgreSQL only. The original F11 and N14 findings above are kept as written.
@@ -1289,3 +1295,80 @@ Unchanged: F4 PARTIAL, F5 PARTIAL, F9 PARTIAL (commerce still fails closed; noth
 added a default or bypass), N3 blocked on the theme, N7 OPEN (now also documented as a deletion
 dependency), F10, F12 open, credential rotation pending. F1, F2, N1, F6, F7, F8, N2, F3, N5, N8,
 N13: regression suites passing unchanged.
+
+
+---
+
+## 20. Phase 6A (2026-09-21): reliable deletion completion, shared-data safety, resurrection regression testing
+
+Branch `security-hardening`, continuing after `11fed57`. Nothing deployed or pushed. No production
+or staging access, no external request, no real record touched. Synthetic records in a disposable
+local PostgreSQL only.
+
+### Concerns, verified or rejected against the code at `11fed57`
+
+| # | Concern | Exact implementation found | Disposition |
+|---|---|---|---|
+| 1 | An accepted (`202`) deletion may stay pending indefinitely | `request_conversation_deletion` wrote a `deleting` tombstone and revoked capabilities, then returned pending if a lock was held. Completion depended on `complete_pending_deletion` in the chat route's `finally` block (in-memory), on the customer repeating the request with a now-revoked token, or on `run_retention`, whose pending-deletion step ran only `if execute`, i.e. only with `RETENTION_EXECUTION_ENABLED=true` (line 340 of `data_lifecycle.py`). Meanwhile the contract told the widget to discard the credential on `202`. | **VERIFIED.** Deletion is now synchronous and atomic; the pending state, the `finally` hook, the retry helper and the retention step are removed. |
+| 2 | One disabled flag disables both explicit deletion and age-based retention | As above: the only restart-safe completion path for an accepted deletion was inside the age-based command's execute branch. | **VERIFIED.** Explicit deletion no longer touches `retention_execution_enabled` (pinned by a source test). |
+| 3 | Shared-database dependencies assumed safe | The purge deleted `CustomerAccountUrls` (written by the Node OAuth code, not by this app) and rows of four Prisma-defined tables with no review. | **VERIFIED.** `CustomerAccountUrls` is left untouched (no personal data). The customer route is gated by `CUSTOMER_DELETION_ENABLED` (default false), failing closed before any irreversible step; the exact review is documented. |
+| 4 | Write-guard race (check tombstone, deletion commits, write commits) | `ensure_conversation_writable` was a plain `SELECT`; `save_message` committed the conversation upsert and then inserted the message in a NEW transaction with no guard at all. Direct callers had no lock. | **VERIFIED.** Rule W / rule D advisory-lock discipline (docs section 6); the paused-writer race is tested against real sessions for all seven writers. |
+| 5 | Tombstone expiry reopens resurrection | After the tombstone was gone, `GET /internal/chat/history` served this process's stale `_CONVERSATIONS` copy of a deleted conversation (found by the new test). Public routes and the internal chat route were already safe (capability gone; row existence checked). | **VERIFIED for one route.** Both internal routes now verify the row exists and evict the cache. Structural proof for the rest is documented and tested with an advanced clock. |
+| 6 | Deletion during in-flight commerce discards reconciliation facts | Minimization already kept `shopifyProductId`, `buildStatus` and the recipe; `execute_build_commerce` still accepted a detached record for a new draft/operation. | **Mostly REJECTED, one gap VERIFIED.** A detached record now refuses every customer operation before any lock or read. |
+| 7 | Deletion depends on a `finally` block / in-memory task | see 1 | **VERIFIED**, removed. |
+
+### Remediation
+
+* `app/services/data_lifecycle.py`: `delete_conversation` (try turn lock, try build locks by id,
+  then one transaction: try exclusive write-guard lock, insert completed tombstone, purge,
+  commit); `ensure_conversation_writable` takes the shared write-guard lock before the check and
+  refuses detached records; no pending state; `CustomerAccountUrls` untouched.
+* `app/services/conversation.py`: a guard call per transaction in both message writers.
+* `app/api/chat.py`: `200` / `409 deletion_conflict` / `503 deletion_unavailable` /
+  `503 deletion_failed`; gate before any irreversible step; internal routes verify the row exists
+  and evict stale caches; no `finally` hook.
+* `app/api/preview.py`: the recreate writes run under the conversation turn lock, taken before the
+  build lock (the same order deletion uses).
+* `app/services/build_commerce.py`: detached records refused; completion hook removed.
+* `app/config.py`: `customer_deletion_enabled` (default false).
+* `migrations/0004_conversation_deletion.sql` and the model: revised to a completed-only
+  tombstone (no state, no pending id) before any application outside the disposable database.
+
+### Tests (Python 3.11, disposable local Postgres 16, migrations 0001 to 0004 as revised, no catalog data)
+
+`tests/security/test_deletion_6a.py`, 27 tests: no pending state anywhere; `200` / `409` / retry
+with the same credential; a completed deletion survives a restart with retention disabled; a
+failure inside the transaction leaves nothing behind and the credential works; the gate is off by
+default and changes nothing (authorization still checked first); the review is documented; foreign
+and operational records untouched; a minimized record grants no access and accepts no customer
+operation from any caller; a writer paused after its guard, in its own session, for each of seven
+writers: deletion reports conflict, the writer commits, the retried deletion removes it, a later
+writer is refused; two concurrent shared holders; unrelated conversations independent; every
+writer applies rule W (source check); tombstone expiry with an advanced clock against every route
+and direct caller; no route adopts a caller-supplied id for a missing row; deletion during
+creation (remote success, ambiguous timeout, process interruption) conflicts, then minimizes and
+keeps only reconciliation facts, and no duplicate creation follows; known product id and deletion
+while repricing; deletion triggers no external operation; no status endpoint; retention conflicts
+are held and explicit deletion never reads the retention flag. The Phase 6 suite was adapted to
+the new contract (47 tests; one pending-completion test removed as no longer meaningful).
+
+| Suite | Result |
+|---|---|
+| New Phase 6A tests | 27 passed |
+| Phase 6 tests (adapted) | 47 passed |
+| `tests/security/` | 814 passed, 0 failed |
+| Full suite | 1333 passed, 57 failed, 30 deselected (`live_ai`), 0 skipped, 0 errors (`11fed57`: 1307 / 57 / 30) |
+| Failing now but passing at `11fed57` | **none** (identical production-catalog set of 57) |
+| Network attempts flagged by the guard | 0 |
+
+### Closure status
+
+**F11: PARTIAL, unchanged.** Now truthful about completion, database-safe against resurrection,
+and fail-closed on the shared-data question. Still open: the provisional retention policy;
+destructive retention disabled and unscheduled; the shared-database review itself (the route
+stays off until it is done); no deletion of Shopify (N7), log, backup or model-provider copies;
+`OrderHistory` lifecycle; no account-level deletion.
+
+**N14: CLOSED**, unchanged. F4, F5, F9 PARTIAL, N3 blocked on the theme, N7, F10, F12 open,
+credential rotation pending. F1, F2, N1, F6, F7, F8, N2, F3, N5, N8, N13: regression suites
+passing unchanged. Inventory commerce still fails closed.

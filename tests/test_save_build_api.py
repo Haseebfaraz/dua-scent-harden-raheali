@@ -48,7 +48,7 @@ def _authorized_build(monkeypatch):
         return SimpleNamespace(recommendationId=REC_ID)
 
     async def _get_recommendation(session, recommendation_id):
-        return SimpleNamespace(id=REC_ID, shopifyProductId="gid://shopify/Product/1", buildStatus="saved")
+        return SimpleNamespace(id=REC_ID, conversationId="conv-pytest", shopifyProductId="gid://shopify/Product/1", buildStatus="saved")
 
     app.dependency_overrides[get_session] = _fake_get_session
     monkeypatch.setattr(save_build_module, "authorize_build_token", _authorize)
