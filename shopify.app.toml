@@ -1,0 +1,13 @@
+# Links this repo's theme app extension to the existing "DUA Scent AI raheali" Partners app.
+# TODO: run `shopify app config link` and select that app -- it will fill in client_id and
+# application_url for you. Nothing else in this repo (the FastAPI backend, OAuth, webhooks) is
+# managed by this file; it exists only so `shopify app deploy` can push extensions/.
+name = "DUA Scent AI raheali"
+client_id = ""
+application_url = ""
+embedded = true
+
+extension_directories = ["extensions/*"]
+
+[access_scopes]
+scopes = "read_products,write_products,write_inventory,read_publications,write_publications,unauthenticated_read_product_listings,write_app_proxy"

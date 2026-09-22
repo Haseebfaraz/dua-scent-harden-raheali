@@ -1,0 +1,46 @@
+{{ 'chat-widget.css' | asset_url | stylesheet_tag }}
+
+<div
+  id="dua-chat-widget"
+  data-backend-url="{{ block.settings.backend_url }}"
+  data-bubble-color="{{ block.settings.bubble_color }}"
+>
+  <button id="dua-chat-toggle" type="button" aria-label="Open fragrance chat" style="background-color: {{ block.settings.bubble_color }};">
+    <span aria-hidden="true">&#128172;</span>
+  </button>
+  <div id="dua-chat-panel" class="dua-chat-panel" hidden>
+    <div class="dua-chat-header" style="background-color: {{ block.settings.bubble_color }};">
+      <span>Fragrance Designer</span>
+      <button id="dua-chat-close" type="button" aria-label="Close chat">&times;</button>
+    </div>
+    <div id="dua-chat-messages" class="dua-chat-messages" role="log" aria-live="polite"></div>
+    <form id="dua-chat-form" class="dua-chat-form">
+      <input id="dua-chat-input" type="text" autocomplete="off" maxlength="4000" placeholder="Ask about a fragrance..." aria-label="Message" />
+      <button type="submit" style="background-color: {{ block.settings.bubble_color }};">Send</button>
+    </form>
+  </div>
+</div>
+
+<script src="{{ 'chat-widget.js' | asset_url }}" defer="defer"></script>
+
+{% schema %}
+{
+  "name": "DUA Fragrance Chat",
+  "target": "body",
+  "settings": [
+    {
+      "type": "text",
+      "id": "backend_url",
+      "label": "Backend URL",
+      "default": "https://dua-scent-harden-raheali.onrender.com",
+      "info": "The DUA Scent AI Render service origin, no trailing slash. Update here whenever the backend URL changes -- no theme redeploy needed."
+    },
+    {
+      "type": "color",
+      "id": "bubble_color",
+      "label": "Bubble color",
+      "default": "#AB9372"
+    }
+  ]
+}
+{% endschema %}

@@ -14,6 +14,9 @@ from app.shopify.trusted_shop import UntrustedShopError, trusted_shop
 configure_logging(settings.log_level)
 
 app = FastAPI(title="DUA Scent AI Core Backend")
+@app.get("/")
+def read_root():
+    return {"status": "ok", "message": "DUA Scent AI Core Backend is running"}
 
 
 def trusted_browser_origins() -> set[str]:
