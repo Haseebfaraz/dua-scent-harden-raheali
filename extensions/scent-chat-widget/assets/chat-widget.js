@@ -17,7 +17,13 @@
   var conversationToken = localStorage.getItem(STORAGE_TOKEN) || null;
   var sending = false;
 
+  function hideEmptyState() {
+    var emptyState = document.getElementById("dua-chat-empty-state");
+    if (emptyState) emptyState.remove();
+  }
+
   function appendMessage(role, text) {
+    hideEmptyState();
     var el = document.createElement("div");
     el.className = "dua-chat-message " + role;
     el.textContent = text;
@@ -151,5 +157,13 @@
     if (!text) return;
     input.value = "";
     handleSend(text);
+  });
+
+  document.querySelectorAll(".scent-pill").forEach(function (pill) {
+    pill.addEventListener("click", function () {
+      if (sending) return;
+      var scent = pill.getAttribute("data-scent");
+      handleSend("My preferred fragrance classification is " + scent + ".");
+    });
   });
 })();

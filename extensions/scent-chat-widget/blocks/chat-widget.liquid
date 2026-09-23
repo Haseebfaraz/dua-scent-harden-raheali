@@ -2,20 +2,77 @@
 
 <div
   id="dua-chat-widget"
-  class="dua-chat-section"
+  class="scent-architect-section-wrapper"
   data-backend-url="{{ block.settings.backend_url }}"
-  data-bubble-color="{{ block.settings.bubble_color }}"
   {{ block.shopify_attributes }}
 >
-  <div class="dua-chat-panel">
-    <div class="dua-chat-header" style="background-color: {{ block.settings.bubble_color }};">
-      <span>Fragrance Designer</span>
+  <div class="scent-architect-container">
+
+    <div class="scent-architect-branding-col">
+      <div class="brand-icon-box" style="background-color: {{ block.settings.bubble_color }};">
+        <div class="inner-brand-symbol"></div>
+      </div>
+      <h2 class="scent-architect-title">Fragrance Designer</h2>
+      <p class="scent-architect-description">
+        Our intelligence engine analyzes your aesthetic preferences, memories, and desired mood to
+        synthesize a one-of-a-kind fragrance profile.
+      </p>
+      <div class="scent-pill-grid">
+        <span class="scent-pill" data-scent="Oriental">ORIENTAL</span>
+        <span class="scent-pill" data-scent="Spicy Woody">SPICY WOODY</span>
+        <span class="scent-pill" data-scent="Chypre">CHYPRE</span>
+        <span class="scent-pill" data-scent="Aromatic">AROMATIC</span>
+        <span class="scent-pill" data-scent="Fruity">FRUITY</span>
+        <span class="scent-pill" data-scent="Citrus">CITRUS</span>
+      </div>
     </div>
-    <div id="dua-chat-messages" class="dua-chat-messages" role="log" aria-live="polite"></div>
-    <form id="dua-chat-form" class="dua-chat-form">
-      <input id="dua-chat-input" type="text" autocomplete="off" maxlength="4000" placeholder="Ask about a fragrance..." aria-label="Message" />
-      <button type="submit" style="background-color: {{ block.settings.bubble_color }};">Send</button>
-    </form>
+
+    <div class="scent-architect-interface-col">
+      <div class="shop-ai-chat-container" style="--scent-accent: {{ block.settings.bubble_color }};">
+        <div class="shop-ai-chat-window">
+
+          <div class="scent-interface-header" style="background-color: {{ block.settings.bubble_color }};">
+            <div class="header-left-meta">
+              <div class="meta-icon-square">
+                <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="15" height="15" fill="currentColor">
+                  <rect x="9" y="2" width="6" height="3" rx="1"/>
+                  <rect x="10" y="5" width="4" height="3"/>
+                  <rect x="6" y="8" width="12" height="13" rx="3"/>
+                </svg>
+              </div>
+              <div class="meta-text-lines">
+                <span class="meta-label-top">Fragrance Designer</span>
+                <span class="meta-label-sub"><span class="status-pulse-dot"></span>Online</span>
+              </div>
+            </div>
+            <div class="header-right-status">
+              <span class="traffic-dot traffic-dot-red"></span>
+              <span class="traffic-dot traffic-dot-yellow"></span>
+              <span class="traffic-dot traffic-dot-green"></span>
+            </div>
+          </div>
+
+          <div id="dua-chat-messages" class="shop-ai-chat-messages" role="log" aria-live="polite">
+            <div class="shop-ai-empty-state" id="dua-chat-empty-state">
+              <div class="shop-ai-empty-state-title">Start a conversation</div>
+              <p class="shop-ai-empty-state-subtitle">Say hello, ask me anything, or tell me when you&rsquo;re ready to create your fragrance.</p>
+            </div>
+          </div>
+
+          <form id="dua-chat-form" class="shop-ai-chat-input">
+            <input id="dua-chat-input" type="text" autocomplete="off" maxlength="4000" placeholder="Ask about a fragrance..." aria-label="Message" />
+            <button type="submit" class="shop-ai-chat-send" aria-label="Send">
+              <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <line x1="22" y1="2" x2="11" y2="13"></line>
+                <polygon points="22 2 15 22 11 13 2 9 22 2"></polygon>
+              </svg>
+            </button>
+          </form>
+
+        </div>
+      </div>
+    </div>
+
   </div>
 </div>
 
@@ -36,7 +93,7 @@
     {
       "type": "color",
       "id": "bubble_color",
-      "label": "Bubble color",
+      "label": "Accent color",
       "default": "#AB9372"
     }
   ]
