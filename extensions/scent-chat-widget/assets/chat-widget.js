@@ -8,9 +8,6 @@
   var STORAGE_ID = "duaChat:conversationId";
   var STORAGE_TOKEN = "duaChat:conversationToken";
 
-  var toggleBtn = document.getElementById("dua-chat-toggle");
-  var closeBtn = document.getElementById("dua-chat-close");
-  var panel = document.getElementById("dua-chat-panel");
   var messagesEl = document.getElementById("dua-chat-messages");
   var form = document.getElementById("dua-chat-form");
   var input = document.getElementById("dua-chat-input");
@@ -18,7 +15,6 @@
 
   var conversationId = localStorage.getItem(STORAGE_ID) || null;
   var conversationToken = localStorage.getItem(STORAGE_TOKEN) || null;
-  var opened = false;
   var sending = false;
 
   function appendMessage(role, text) {
@@ -140,22 +136,13 @@
     }
   }
 
-  toggleBtn.addEventListener("click", async function () {
-    panel.hidden = !panel.hidden;
-    if (!panel.hidden && !opened) {
-      opened = true;
-      try {
-        await ensureSession();
-      } catch (err) {
-        appendMessage("error", "Couldn't reach the fragrance studio. Please try again.");
-      }
-      input.focus();
+  (async function init() {
+    try {
+      await ensureSession();
+    } catch (err) {
+      appendMessage("error", "Couldn't reach the fragrance studio. Please try again.");
     }
-  });
-
-  closeBtn.addEventListener("click", function () {
-    panel.hidden = true;
-  });
+  })();
 
   form.addEventListener("submit", function (evt) {
     evt.preventDefault();

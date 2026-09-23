@@ -2,16 +2,14 @@
 
 <div
   id="dua-chat-widget"
+  class="dua-chat-section"
   data-backend-url="{{ block.settings.backend_url }}"
   data-bubble-color="{{ block.settings.bubble_color }}"
+  {{ block.shopify_attributes }}
 >
-  <button id="dua-chat-toggle" type="button" aria-label="Open fragrance chat" style="background-color: {{ block.settings.bubble_color }};">
-    <span aria-hidden="true">&#128172;</span>
-  </button>
-  <div id="dua-chat-panel" class="dua-chat-panel" hidden>
+  <div class="dua-chat-panel">
     <div class="dua-chat-header" style="background-color: {{ block.settings.bubble_color }};">
       <span>Fragrance Designer</span>
-      <button id="dua-chat-close" type="button" aria-label="Close chat">&times;</button>
     </div>
     <div id="dua-chat-messages" class="dua-chat-messages" role="log" aria-live="polite"></div>
     <form id="dua-chat-form" class="dua-chat-form">
@@ -26,7 +24,7 @@
 {% schema %}
 {
   "name": "DUA Fragrance Chat",
-  "target": "body",
+  "target": "section",
   "settings": [
     {
       "type": "text",
