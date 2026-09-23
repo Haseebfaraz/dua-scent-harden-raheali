@@ -25,7 +25,12 @@
   function appendMessage(role, text) {
     hideEmptyState();
     var el = document.createElement("div");
-    el.className = "dua-chat-message " + role;
+    if (role === "error") {
+      el.className = "dua-chat-error";
+    } else {
+      el.className = "shop-ai-message " + role;
+      if (role === "user") el.setAttribute("data-initial", "U");
+    }
     el.textContent = text;
     messagesEl.appendChild(el);
     messagesEl.scrollTop = messagesEl.scrollHeight;

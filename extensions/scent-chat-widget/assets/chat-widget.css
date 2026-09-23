@@ -797,6 +797,17 @@ body.shop-ai-overlay-open {
   max-width: 320px;
 }
 
+.dua-chat-error {
+  align-self: center;
+  max-width: 78%;
+  padding: 10px 16px;
+  border-radius: 14px;
+  font-size: 13px;
+  line-height: 1.4;
+  background: #fdecea;
+  color: #a4262c;
+}
+
 .shop-ai-login-gate-button {
   display: inline-block;
   background: var(--scent-accent);
