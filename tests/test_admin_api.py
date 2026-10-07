@@ -214,3 +214,11 @@ async def test_admin_logs_carry_no_token_or_customer_data(caplog):
             assert secret not in logged
     finally:
         await _cleanup(conversation_id)
+
+
+def test_embedded_load_of_the_root_url_opens_the_dashboard():
+    with TestClient(app) as client:
+        embedded = client.get("/", params={"shop": SHOP, "host": "abc", "embedded": "1"}, follow_redirects=False)
+        plain = client.get("/")
+    assert embedded.status_code == 302 and embedded.headers["location"].startswith("/admin?shop=")
+    assert plain.json()["status"] == "ok"

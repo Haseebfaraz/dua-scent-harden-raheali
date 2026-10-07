@@ -1,7 +1,8 @@
 from pathlib import Path
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import RedirectResponse
 from fastapi.staticfiles import StaticFiles
 
 from app.api import admin, chat, health, preview, recommendations, save_build, storefront
@@ -15,7 +16,13 @@ configure_logging(settings.log_level)
 
 app = FastAPI(title="DUA Scent AI Core Backend")
 @app.get("/")
-def read_root():
+def read_root(request: Request):
+    # The Shopify admin opens the app's configured App URL with ?shop=...&host=...&embedded=1.
+    # Until that URL points at /admin (shopify.app.toml, applied by `shopify app deploy`), send
+    # the embedded load to the dashboard shell. The shell holds no data; /admin/api still
+    # requires a verified session token.
+    if request.query_params.get("shop") and (request.query_params.get("host") or request.query_params.get("embedded")):
+        return RedirectResponse(f"/admin?{request.url.query}", status_code=302)
     return {"status": "ok", "message": "DUA Scent AI Core Backend is running"}
 
 

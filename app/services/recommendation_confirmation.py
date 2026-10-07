@@ -10,6 +10,7 @@ from typing import Any
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.config import settings
 from app.db.ids import new_id
 from app.db.models import ExistingCombination, FragranceProduct, FragranceRecommendation
 from app.db.time import utcnow
@@ -168,7 +169,7 @@ async def confirm_recommendation(
         await session.commit()
         return {"ok": False, "reasonCode": "expired", "reason": "This recommendation has expired — please generate a new one."}
 
-    if not customer_name or not customer_email:
+    if settings.require_customer_identity_for_build and (not customer_name or not customer_email):
         return {"ok": False, "reasonCode": "identity_missing", "reason": "Customer name and email must be available from the Shopify account before creating a product."}
 
     products = record.productsJson if isinstance(record.productsJson, list) else []

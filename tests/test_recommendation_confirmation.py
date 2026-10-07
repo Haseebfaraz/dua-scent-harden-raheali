@@ -266,3 +266,16 @@ async def test_dedup_does_not_match_expired_recommendation(db_session):
         assert fresh_id != old.id
     finally:
         await _cleanup(db_session, old.id, fresh_id)
+
+
+@pytest.mark.asyncio
+async def test_identity_requirement_can_be_switched_off(db_session, monkeypatch):
+    from app.config import settings
+
+    monkeypatch.setattr(settings, "require_customer_identity_for_build", False)
+    recommendation_id, _, _ = await _save_test_recommendation(db_session)
+    try:
+        result = await confirm_recommendation(db_session, recommendation_id=recommendation_id, customer_name=None, customer_email=None)
+        assert result.get("reasonCode") != "identity_missing"
+    finally:
+        await _cleanup(db_session, recommendation_id)
