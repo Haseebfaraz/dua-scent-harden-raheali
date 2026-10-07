@@ -1,0 +1,45 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="shopify-api-key" content="{{ api_key }}" />
+  <title>DUA Scent AI</title>
+  <script src="https://cdn.shopify.com/shopifycloud/app-bridge.js"></script>
+  <link rel="stylesheet" href="/static/css/admin.css" />
+</head>
+<body>
+  <nav class="tabs" aria-label="Sections">
+    <a href="#/customers" data-tab="customers">Customers</a>
+    <a href="#/activity" data-tab="activity">Activity</a>
+    <a href="#/readiness" data-tab="readiness">Readiness</a>
+    <a href="#/help" data-tab="help">Help</a>
+  </nav>
+  <main id="view" aria-live="polite"></main>
+
+  <template id="help-template">
+    <section class="card">
+      <h1>How DUA Scent AI works</h1>
+      <p>A deterministic engine chooses the products and ratios; the AI only holds the conversation and narrates. Customers always get a custom blend built from real catalog components.</p>
+      <h2>1. Collecting the profile</h2>
+      <p>The chat gathers likes, dislikes, style, occasion, performance preference and a verified city (for weather/season context). Signed-in customers' first name and email come from their Shopify account; guests can explore but must sign in before a build can be confirmed.</p>
+      <h2>2. Scoring candidates</h2>
+      <p>Products are scored from order history (city, state, country, season), note matches and classification. A high-severity dislike excludes a product; named notes count only on whole-word matches.</p>
+      <h2>3. Building combinations</h2>
+      <p>Anchors plus compatible supporting products form a Hybrid, Tribrid or Quadbrid. Combinations that already exist, that miss every named note or that conflict with a dislike are rejected.</p>
+      <h2>4. Confidence</h2>
+      <p>Five dimensions (data, historical, compatibility, novelty, customer fit) blend into one confidence, capped when evidence is thin. Risk factors carry penalty points; exact-note coverage shows which named notes were matched or missing. Open a combination on a customer page to see the breakdown.</p>
+      <h2>5. Preview, Recreate, Save Build, Add to Cart</h2>
+      <p>The best buildable combination is confirmed and opened as a preview. <b>Recreate</b> returns the customer to the chat. <b>Save Build</b> and <b>Add to Cart</b> create the Shopify product (draft first, then activated) with server-side pricing, but only after a fresh inventory check passes.</p>
+      <h2>6. Inventory</h2>
+      <p>Customer pages show the inventory snapshot stored when the recommendation was made: per-oil SKU, required ml, stock reported and status. Opening a page never queries Odoo again. Commerce re-checks stock live at the moment of saving and stays blocked if inventory is unavailable, insufficient or unconfirmed. A check is not a reservation.</p>
+      <h2>7. Builds that need review</h2>
+      <p><b>creating</b> means a product creation started; <b>pending_review</b> means its outcome is unknown or a later step failed. These are never retried automatically, because a retry could create a duplicate product. To recover: search Shopify products for the customer's build name and the recommendation id (stored on the product's metafields), then either finish/clean up that product or, if none exists, ask a developer to reset the build status. See <code>docs/FEATURE_RESTORATION.md</code>, section "Ambiguous builds".</p>
+      <h2>8. Diagnostics</h2>
+      <p>The Activity tab lists recent outcomes from stored state. Every server log line carries a <code>request_id</code>; storefront errors show the same id in the response's <code>X-Request-Id</code> header. Logs never contain tokens, customer messages or emails.</p>
+    </section>
+  </template>
+
+  <script src="/static/js/admin.js" defer></script>
+</body>
+</html>

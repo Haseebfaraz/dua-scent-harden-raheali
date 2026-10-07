@@ -71,6 +71,8 @@ request header, query parameter, or body can ever select a different shop. See
 
 ### Database
 
+A **fresh** database starts with `migrations/0000_base_schema.sql` (the shared business tables, consolidated from the old Prisma schema). Never apply it to an existing database; check one with the read-only `python -m scripts.check_schema_compat`. Reference-data imports, the merchant dashboard (`/admin`), account linking, My Builds and readiness (`/health/ready`) are described in [`docs/FEATURE_RESTORATION.md`](docs/FEATURE_RESTORATION.md).
+
 Four additive migrations are required (verify them against a disposable database with `make migrations`) before running this code against any database, in order
 (the fourth, `migrations/0004_conversation_deletion.sql`, adds the deletion tombstone table used by
 `POST /chat/delete` and the retention command -- `docs/DATA_RETENTION_AND_DELETION.md`; without it

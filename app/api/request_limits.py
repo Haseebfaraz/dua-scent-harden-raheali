@@ -56,7 +56,7 @@ class RequestBodyLimitMiddleware:
     Content-Length and chunked transfer is refused (411) on the limited paths: every legitimate
     caller (browser fetch, Node adapter) sends a Content-Length."""
 
-    def __init__(self, app: ASGIApp, *, limited_path_prefixes: tuple[str, ...] = ("/chat", "/internal/chat", "/api/", "/apps/scent-library/fragrance-preview")):
+    def __init__(self, app: ASGIApp, *, limited_path_prefixes: tuple[str, ...] = ("/chat", "/internal/chat", "/api/", "/apps/scent-library/", "/admin/")):
         self.app = app
         self.limited_path_prefixes = limited_path_prefixes
 

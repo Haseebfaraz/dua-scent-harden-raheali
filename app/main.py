@@ -4,7 +4,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
-from app.api import chat, health, preview, recommendations, save_build
+from app.api import admin, chat, health, preview, recommendations, save_build, storefront
 from app.api.request_limits import RequestBodyLimitMiddleware
 from app.config import settings
 from app.logging_config import RequestContextMiddleware, configure_logging
@@ -58,6 +58,8 @@ app.include_router(recommendations.router)
 app.include_router(shopify_webhooks.router)
 app.include_router(preview.router)
 app.include_router(save_build.router)
+app.include_router(storefront.router)
+app.include_router(admin.router)
 _static_dir = str(Path(__file__).resolve().parent / "static")
 app.mount("/static", StaticFiles(directory=_static_dir), name="static")
 # The preview page is only ever loaded through Shopify's App Proxy at /apps/scent-library/... --

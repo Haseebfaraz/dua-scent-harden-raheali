@@ -1,0 +1,31 @@
+<section class="dua-my-builds page-width">
+  <h2>{{ block.settings.heading }}</h2>
+  {%- if customer -%}
+    <div id="dua-my-builds" data-proxy-path="/apps/scent-library" {{ block.shopify_attributes }}>
+      <p data-dua-builds-status role="status" aria-live="polite"></p>
+      <ul class="dua-builds" data-dua-builds-list></ul>
+      <nav class="dua-builds-pager" data-dua-builds-pager aria-label="Fragrance pages"></nav>
+    </div>
+    <script src="{{ 'my-builds.js' | asset_url }}" defer="defer"></script>
+  {%- else -%}
+    <p><a href="{{ routes.account_login_url }}">Sign in</a> to see the fragrances you've created.</p>
+  {%- endif -%}
+</section>
+
+<style>
+  .dua-builds { list-style: none; padding: 0; display: grid; gap: 16px; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); }
+  .dua-build { border: 1px solid rgba(0,0,0,.12); border-radius: 8px; padding: 16px; }
+  .dua-build h3 { margin: 0 0 4px; }
+  .dua-build-meta { margin: 0 0 12px; opacity: .75; }
+  .dua-builds-pager { display: flex; gap: 8px; }
+</style>
+
+{% schema %}
+{
+  "name": "DUA My Builds",
+  "target": "section",
+  "settings": [
+    { "type": "text", "id": "heading", "label": "Heading", "default": "My fragrances" }
+  ]
+}
+{% endschema %}

@@ -1,0 +1,31 @@
+{%- comment -%}
+  Add to the product template used by custom-scent builds (template suffix "custom-scent").
+  Loads the save-build helper that uses the build capability from the preview link.
+  Existing theme sliders/buttons opt in with data attributes; see docs/FEATURE_RESTORATION.md.
+{%- endcomment -%}
+<div
+  id="dua-custom-scent-build"
+  data-backend-url="{{ block.settings.backend_url }}"
+  data-product-id="{{ product.id }}"
+  {{ block.shopify_attributes }}
+>
+  <p class="dua-custom-scent-message" data-dua-message role="status" aria-live="polite"></p>
+</div>
+<script src="{{ 'custom-scent-build.js' | asset_url }}" defer="defer"></script>
+
+{% schema %}
+{
+  "name": "DUA custom scent build",
+  "target": "section",
+  "templates": ["product"],
+  "settings": [
+    {
+      "type": "text",
+      "id": "backend_url",
+      "label": "Backend URL",
+      "default": "https://dua-scent-harden-raheali.onrender.com",
+      "info": "The DUA Scent AI service origin, no trailing slash. Its CORS allowlist must include this storefront's origin (ALLOWED_ORIGINS)."
+    }
+  ]
+}
+{% endschema %}

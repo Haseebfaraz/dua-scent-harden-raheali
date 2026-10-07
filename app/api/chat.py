@@ -201,13 +201,16 @@ async def public_chat_history(request: Request, history: str | None = None, conv
     try:
         await authorize_conversation(session, token=token, conversation_id=conversation_id)
     except ConversationNotAuthorized:
+        logger.info("HISTORY_NOT_AUTHORIZED %s", json.dumps({"reason": "conversation_not_authorized"}))  # expired/revoked/unknown: one reason
         return JSONResponse(_NOT_AUTHORIZED_BODY, status_code=401, headers=NO_STORE_HEADERS)
     ip_subject = hash_abuse_identity(client_ip(request))
     await _enforce_limits(session, [
         limit("history_read_conv", conversation_id, settings.rate_limit_history_read_per_conversation),
         limit("history_read_ip", ip_subject, settings.rate_limit_history_read_per_ip),
     ])
-    return JSONResponse(await _history_payload(session, conversation_id), headers=NO_STORE_HEADERS)
+    payload = await _history_payload(session, conversation_id)
+    logger.info("HISTORY_LOADED %s", json.dumps({"conversationId": conversation_id, "messageCount": len(payload["messages"])}))
+    return JSONResponse(payload, headers=NO_STORE_HEADERS)
 
 
 # ---------------------------------------------------------------------------
