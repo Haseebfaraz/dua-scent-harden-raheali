@@ -92,6 +92,12 @@ def _safe_json_for_script_tag(data: dict[str, Any]) -> str:
     return json.dumps(data).replace("</", "<\\/")
 
 
+def _unavailable_page(request: Request, status_code: int) -> HTMLResponse:
+    """Customer-facing page for an expired, revoked or unknown link (same status codes as before,
+    HTML instead of a raw JSON body). Reveals nothing about whether the recommendation exists."""
+    return templates.TemplateResponse(request, "preview_unavailable.html", {"message": _NOT_AUTHORIZED_MESSAGE}, status_code=status_code, headers=_SENSITIVE_HEADERS)
+
+
 @router.get("/apps/scent-library/fragrance-preview", response_class=HTMLResponse)
 async def preview_page(request: Request, signed: dict = Depends(verified_signed_params), session: AsyncSession = Depends(get_session)):
     recommendation_id = request.query_params.get("recommendationId")
@@ -103,11 +109,12 @@ async def preview_page(request: Request, signed: dict = Depends(verified_signed_
     try:
         await _authorize_preview(session, token=build_token, recommendation_id=recommendation_id, customer=verified_shopify_customer_from_signed_params(signed))
     except BuildNotAuthorized:
-        raise HTTPException(status_code=403, detail=_NOT_AUTHORIZED_MESSAGE, headers=_SENSITIVE_HEADERS) from None
+        logger.info("PREVIEW_LINK_REJECTED %s", json.dumps({"reason": "build_not_authorized"}))
+        return _unavailable_page(request, 403)
 
     recommendation = await get_recommendation(session, recommendation_id)
     if not recommendation:
-        raise HTTPException(status_code=404, detail="Recommendation not found")
+        return _unavailable_page(request, 404)
 
     internal_products = recommendation.productsJson if isinstance(recommendation.productsJson, list) else []
     customer_likes = (recommendation.customerProfileJson or {}).get("likes") or []

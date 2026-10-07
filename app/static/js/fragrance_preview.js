@@ -135,7 +135,12 @@
       return;
     }
     if (json.status === "recreate" && json.redirectUrl) {
-      window.location.href = json.redirectUrl;
+      // Back to the page the chat lives on (stored by the chat widget, same storefront origin),
+      // where it reloads the conversation including the Recreate question. Only a same-origin
+      // path is ever accepted; otherwise the server's storefront URL is used.
+      let returnPath = null;
+      try { returnPath = window.sessionStorage.getItem("duaChat:returnPath"); } catch (e) {}
+      window.location.href = returnPath && /^\/(?!\/)[^\s\\]*$/.test(returnPath) ? returnPath : json.redirectUrl;
     } else if (json.status === "saved" && json.productUrl) {
       // The capability travels to the product page in the URL fragment (never sent to any
       // server, never in referrers) so the theme's slider can call /api/save-build with it.

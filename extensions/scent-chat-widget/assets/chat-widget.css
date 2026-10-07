@@ -820,3 +820,39 @@ body.shop-ai-overlay-open {
   text-decoration: none;
   cursor: pointer;
 }
+/* Loading / notice / retry states (same shape as .dua-chat-error, neutral tones). */
+.dua-chat-loading,
+.dua-chat-notice {
+  align-self: center;
+  max-width: 78%;
+  padding: 10px 16px;
+  border-radius: 14px;
+  font-size: 13px;
+  line-height: 1.4;
+  background: #f4f1ec;
+  color: #5c5346;
+}
+
+.dua-chat-retry {
+  margin-left: 6px;
+  padding: 2px 10px;
+  border: 1px solid currentColor;
+  border-radius: 10px;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  cursor: pointer;
+}
+
+.dua-chat-signin-note {
+  margin: 0;
+  padding: 8px 16px;
+  font-size: 12px;
+  text-align: center;
+  color: #5c5346;
+}
+
+.dua-chat-signin-note a {
+  color: inherit;
+  text-decoration: underline;
+}

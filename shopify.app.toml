@@ -1,21 +1,42 @@
 # Learn more about configuring your app at https://shopify.dev/docs/apps/tools/cli/configuration
+#
+# Auth model (docs/FEATURE_RESTORATION.md, "Shopify configuration"): Shopify-managed install
+# (use_legacy_install_flow = false) + client-credentials grant for Admin API calls
+# (app/shopify/admin_auth.py) + App Bridge session tokens for the embedded merchant dashboard
+# (app/shopify/session_token.py). No OAuth authorization-code callback is processed by this
+# service, so the redirect URL points at the implemented admin page instead of a missing route.
+# Nothing here is applied until someone runs `shopify app deploy` deliberately.
 
 name = "DUA Scent AI raheali"
 client_id = "a98e2f95f121f364264776ded9e7fd63"
-application_url = "https://dua-scent-harden-raheali.onrender.com/"
+application_url = "https://dua-scent-harden-raheali.onrender.com/admin"
 embedded = true
 extension_directories = [ "extensions/*" ]
 
 [access_scopes]
 # Learn more at https://shopify.dev/docs/apps/tools/cli/configuration#access_scopes
-scopes = "read_products,read_publications,unauthenticated_read_product_listings,write_app_proxy,write_inventory,write_products,write_publications"
+# read_customers: the signed-in customer's first name/email for account context
+# (app/shopify/customers.py). Also requires protected customer data access (name, email) to be
+# requested and approved for this app in the Partner/Dev Dashboard.
+scopes = "read_customers,read_products,read_publications,unauthenticated_read_product_listings,write_app_proxy,write_inventory,write_products,write_publications"
 optional_scopes = [ ]
 use_legacy_install_flow = false
+
+[auth]
+redirect_urls = [
+  "https://dua-scent-harden-raheali.onrender.com/admin"
+]
 
 [webhooks]
 api_version = "2026-07"
 
-[auth]
-redirect_urls = [
-  "https://dua-scent-harden-raheali.onrender.com/api/shopify/auth/callback"
-]
+  [[webhooks.subscriptions]]
+  topics = [ "app/uninstalled" ]
+  uri = "https://dua-scent-harden-raheali.onrender.com/shopify/webhooks"
+
+# Storefront routes under https://<shop>/apps/scent-library/* are proxied (and signed) to
+# <url>/*: the fragrance preview, its static assets, account linking and My Builds.
+[app_proxy]
+url = "https://dua-scent-harden-raheali.onrender.com/apps/scent-library"
+subpath = "scent-library"
+prefix = "apps"

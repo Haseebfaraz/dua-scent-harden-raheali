@@ -6,7 +6,7 @@ BIN := $(VENV)/bin
 export OPENAI_API_KEY ?= test-placeholder-not-a-key
 export OPENAI_MODEL ?= test-model
 
-.PHONY: venv install install-dev lock audit lint test test-security test-reference migrations db-local db-stop startup-check image-check deploy-check
+.PHONY: venv install install-dev lock audit lint test test-security test-reference migrations schema-compat db-local db-stop startup-check image-check deploy-check
 
 venv:
 	$(PY) -m venv $(VENV) && $(BIN)/pip install --quiet --upgrade pip
@@ -29,8 +29,11 @@ audit:                 ## dependency vulnerability audit of BOTH locked sets (pu
 lint:
 	$(BIN)/ruff check app tests scripts/data_retention.py
 
-migrations:            ## apply migrations 0001-0004 to DATABASE_URL twice and verify the schema (disposable databases only)
+migrations:            ## apply migrations 0000-0004 to DATABASE_URL twice and verify the schema (disposable databases only)
 	$(BIN)/python -m scripts.verify_migrations
+
+schema-compat:         ## read-only: compare DATABASE_URL's schema with migrations/*.sql (safe on any database)
+	$(BIN)/python -m scripts.check_schema_compat
 
 test:                  ## the complete deterministic suite (live_ai and reference_data are deselected by pyproject)
 	$(BIN)/python -m pytest -q -p no:cacheprovider -rN

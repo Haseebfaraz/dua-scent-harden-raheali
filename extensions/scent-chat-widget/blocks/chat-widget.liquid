@@ -4,6 +4,9 @@
   id="dua-chat-widget"
   class="scent-architect-section-wrapper"
   data-backend-url="{{ block.settings.backend_url }}"
+  data-proxy-path="/apps/scent-library"
+  data-shop="{{ shop.permanent_domain }}"
+  data-customer-id="{% if customer %}{{ customer.id }}{% endif %}"
   {{ block.shopify_attributes }}
 >
   <div class="scent-architect-container">
@@ -50,6 +53,11 @@
               </svg>
             </button>
           </form>
+          {%- unless customer -%}
+            <p class="dua-chat-signin-note">
+              Exploring as a guest. <a href="{{ routes.account_login_url }}">Sign in</a> to save your creation to your account.
+            </p>
+          {%- endunless -%}
 
         </div>
       </div>
