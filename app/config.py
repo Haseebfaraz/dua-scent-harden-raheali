@@ -89,6 +89,12 @@ class Settings(BaseSettings):
 
     customer_key_hash_salt: str = ""
 
+    # Confirmation requires the customer's name AND email before a build can be finalized (the
+    # normal, secure default). Set REQUIRE_CUSTOMER_IDENTITY_FOR_BUILD=false to TEMPORARILY let
+    # guests / accounts without contact details finalize: the product is then created with empty
+    # customer name/email metafields. Nothing else (capabilities, inventory, pricing) changes.
+    require_customer_identity_for_build: bool = True
+
     # Real names from the reference app's shopify.server.js / shopify.app.toml -- not invented.
     # Empty defaults so import never fails where these aren't needed yet (e.g. non-Shopify tests);
     # every real call site must check for a real value before trusting it.

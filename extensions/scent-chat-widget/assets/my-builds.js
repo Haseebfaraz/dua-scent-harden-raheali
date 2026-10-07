@@ -15,6 +15,14 @@
 
   function setStatus(text) { status.textContent = text || ""; }
 
+  // The App Proxy answers with an HTML page (not JSON) when it is not configured for this app
+  // or the storefront password page intercepts the request.
+  async function readJson(res) {
+    var type = res.headers.get("content-type") || "";
+    if (type.indexOf("application/json") === -1) throw new Error("Your fragrances can't be loaded right now. Please try again later.");
+    return res.json();
+  }
+
   function card(build) {
     var item = document.createElement("li");
     item.className = "dua-build";
@@ -50,7 +58,7 @@
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ recommendationId: recommendationId }),
       });
-      var body = await res.json();
+      var body = await readJson(res);
       if (!res.ok || !body.previewUrl) throw new Error(body.error || "We couldn't open that fragrance.");
       window.location.href = body.previewUrl;
     } catch (err) {
@@ -65,7 +73,7 @@
     setStatus("Loading your fragrances…");
     try {
       var res = await fetch(PROXY_PATH + "/my-builds?page=" + page, { headers: { Accept: "application/json" } });
-      var body = await res.json();
+      var body = await readJson(res);
       if (!res.ok) throw new Error(body.error || "We couldn't load your fragrances.");
       list.replaceChildren.apply(list, body.builds.map(card));
       setStatus(body.builds.length ? "" : "You haven't created a fragrance yet.");
