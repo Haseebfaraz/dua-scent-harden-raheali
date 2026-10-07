@@ -57,6 +57,8 @@ def _informational() -> dict[str, bool]:
     checks = {f"inventory.{gap.lower()}": False for gap in gaps}
     checks["inventory.source_contract_satisfied"] = not gaps
     checks["inventory.manufacturing_bound_valid"] = bound_ok
+    # False while the temporary override is on: commerce is NOT checking stock.
+    checks["inventory.commerce_check_enabled"] = not settings.commerce_inventory_check_disabled
     checks["data.customer_key_hash_salt"] = bool(settings.customer_key_hash_salt)
     checks["shopify.internal_adapter_key"] = bool(settings.internal_api_key)
     return checks

@@ -422,6 +422,21 @@ def is_pleasantry(text: str) -> bool:
     return bool(cleaned) and (cleaned in _PLEASANTRIES or cleaned.replace("'", "") in _PLEASANTRIES)
 
 
+# A whole message that only asks to finish / show the design in progress ("okay create",
+# "yes create it", "show preview", "lock it in"). Anchored, short, closed vocabulary.
+_BUILD_COMMAND = re.compile(
+    r"^(?:(?:ok|okay|yes|yeah|yep|sure|alright|great|perfect|please|pls|now|then|go ahead(?: and)?|lets|let's)\s+)*"
+    r"(?:(?:create|build|make|generate|finali[sz]e|confirm|lock)(?:\s+(?:it|that|this|one|mine|my blend|the blend|in))*"
+    r"|(?:show|open|see|view)(?:\s+(?:me|my|the|it))*\s+(?:preview|it|blend|build|creation))"
+    r"(?:\s+(?:now|please|pls|then))*$"
+)
+
+
+def is_build_command(text: str) -> bool:
+    cleaned = _clean_words(text)
+    return bool(cleaned) and len(cleaned.split()) <= 8 and bool(_BUILD_COMMAND.match(cleaned))
+
+
 def is_small_talk(text: str) -> bool:
     """A pleasantry, or a very short message with no fragrance/off-topic signal."""
     cleaned = _clean_words(text)
@@ -508,6 +523,10 @@ def classify_deterministically(message: str, *, pending_question: bool = False, 
     if fragrance and off_topic:
         # e.g. "write a poem about my perfume": not confident either way.
         return None
+    if conversation_has_fragrance_context and is_build_command(base):
+        # "okay create", "show preview": a short instruction to continue the design the customer
+        # is already in. Reached only after every attack / service-meta / off-topic check above.
+        return GateDecision("FRAGRANCE", "CONTEXTUAL_ANSWER", None)
     if is_pleasantry(base):
         return GateDecision("SMALL_TALK", "SMALL_TALK", None)
     if is_contextual_answer(base, pending_question=pending_question):

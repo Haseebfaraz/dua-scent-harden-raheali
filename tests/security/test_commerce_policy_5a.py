@@ -149,6 +149,8 @@ async def test_observation_is_recorded_separately_from_the_decision(catalog, odo
 def test_no_setting_is_a_bypass():
     names = [n.lower() for n in Settings.model_fields]
     assert not [n for n in names if any(w in n for w in ("inventory_approved", "skip_inventory", "bypass", "allow_unknown", "fail_open", "inventory_optional", "disable_inventory"))]
+    # The single owner-requested operator override is explicit and off by default.
+    assert Settings.model_fields["commerce_inventory_check_disabled"].default is False
     # The declared facts are descriptive; none of them is boolean.
     for name in ("odoo_inventory_location_scope", "odoo_inventory_quantity_semantics", "manufacturing_max_oil_ml_per_bottle"):
         assert Settings.model_fields[name].annotation is not bool

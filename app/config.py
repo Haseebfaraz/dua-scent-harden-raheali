@@ -33,6 +33,12 @@ class Settings(BaseSettings):
     # long. Commerce never uses the recommendation cache above. There is deliberately NO setting
     # that lets unknown or unavailable inventory authorize a commerce write.
     commerce_inventory_max_age_seconds: int = 30
+    # TEMPORARY OPERATOR OVERRIDE (owner decision while the Odoo contract is not ready). Default
+    # false = the policy above applies in full. true = Save Build / Add to Cart / re-price DO NOT
+    # check ingredient stock at all: builds can be sold without confirmed inventory. Every use is
+    # logged (COMMERCE_INVENTORY_CHECK_DISABLED, WARNING) and readiness reports it. Turn it off
+    # as soon as the inventory source contract is configured.
+    commerce_inventory_check_disabled: bool = False
 
     # ---- Phase 6 (F11): data lifecycle. PROVISIONAL defaults pending operator / policy review ----
     # None of these is a legal retention period. They are engineering defaults for a guest chat

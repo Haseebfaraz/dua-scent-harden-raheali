@@ -106,6 +106,7 @@ class ReportedStock(str, Enum):
 
 # Internal reason codes (logs only; never returned to a customer or a model).
 INTEGRATION_NOT_CONFIGURED = "INTEGRATION_NOT_CONFIGURED"
+CHECK_DISABLED_BY_OPERATOR = "CHECK_DISABLED_BY_OPERATOR"
 SOURCE_SCOPE_UNDECLARED = "SOURCE_SCOPE_UNDECLARED"
 SOURCE_SCOPE_UNCONFIRMED = "SOURCE_SCOPE_UNCONFIRMED"
 RESERVATION_SEMANTICS_UNDECLARED = "RESERVATION_SEMANTICS_UNDECLARED"
@@ -415,6 +416,10 @@ async def require_commerce_inventory(session: AsyncSession, *, recommendation: A
     """THE gate. Called by the Shopify write layer (app/shopify/builds.py) immediately before the
     first write of every commerce path, so no route and no future service caller can skip it. It
     takes no decision object from anyone: it always performs its own verification."""
+    if settings.commerce_inventory_check_disabled:
+        # Operator override (config.py): no lookup, no stock claim. Logged on every use.
+        logger.warning("COMMERCE_INVENTORY_CHECK_DISABLED %s", json.dumps({"recommendationId": getattr(recommendation, "id", None)}))
+        return _decision(InventoryState.POLICY_SATISFIED, [CHECK_DISABLED_BY_OPERATOR], CHECK_DISABLED_BY_OPERATOR)
     fingerprint, decision = await verify_build_inventory(session, recommendation=recommendation, ratios=ratios, quantity=quantity)
     allowed, reason = decision.authorizes(fingerprint)
     logger.info("COMMERCE_INVENTORY_DECISION %s", json.dumps({
@@ -432,6 +437,8 @@ async def ensure_still_satisfied(session: AsyncSession, decision: InventoryDecis
     """For a multi-step operation: before the step that makes a build purchasable, the evidence
     must still be inside its freshness window. If it has expired it is NOT silently reused: one
     new verification is made, and anything but POLICY_SATISFIED raises."""
+    if settings.commerce_inventory_check_disabled:
+        return decision
     if decision.authorizes(decision.operation_fingerprint)[0]:
         return decision
     return await require_commerce_inventory(session, recommendation=recommendation, ratios=ratios, quantity=quantity)

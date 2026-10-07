@@ -108,6 +108,19 @@ Touched with reason:
   the "authorize before revealing anything" order are unchanged; the page reveals nothing.
 * `app/api/request_limits.py` — new App Proxy and admin routes needed the same body limit.
 * `fragrance_preview.js` — Recreate return navigation (§7); design untouched.
+* `app/ai/security_gate.py` (approved by the owner after rollout testing) — short build commands
+  ("okay create", "show preview", "lock it in") were classified SMALL_TALK, so generation never
+  re-ran and the model claimed a preview that was never produced. With fragrance context they now
+  route as FRAGRANCE (`CONTEXTUAL_ANSWER`). Anchored, closed vocabulary, checked after every
+  attack / service-meta / off-topic rule; tests in `tests/security/test_gate_build_commands.py`.
+* `app/services/recommendation_confirmation.py` (owner request) — the name+email requirement is
+  behind `REQUIRE_CUSTOMER_IDENTITY_FOR_BUILD` (default `true`, unchanged behavior). `false`
+  temporarily lets builds confirm without contact details (empty customer metafields).
+* `app/services/commerce_inventory.py` (owner explicitly accepted selling without stock checks
+  for now) — `COMMERCE_INVENTORY_CHECK_DISABLED` (default `false`, full policy). `true` makes the
+  commerce gate approve without any Odoo lookup; every use logs `COMMERCE_INVENTORY_CHECK_DISABLED`
+  at WARNING and Readiness shows `inventory.commerce_check_enabled = false`. Orders placed while
+  it is on must be checked against real stock by hand. Remove the variable once Odoo is configured.
 
 Profile rule preserved: account details only fill **empty** `name`/`email` profile fields (the
 same rule `prompt.py` applies to known customer details); no profiling question, readiness

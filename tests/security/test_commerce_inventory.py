@@ -512,8 +512,27 @@ async def test_recommendation_time_fallback_semantics_are_not_commerce_approval(
 
 
 def test_there_is_no_setting_that_turns_unknown_into_approval():
+    """One explicit, owner-requested operator override exists (commerce_inventory_check_disabled,
+    default False). No other setting may weaken the gate."""
     names = [n.lower() for n in type(settings).model_fields]
-    assert not [n for n in names if "inventory" in n and any(w in n for w in ("bypass", "skip", "disable", "allow_unknown", "fail_open", "optional"))]
+    found = [n for n in names if "inventory" in n and any(w in n for w in ("bypass", "skip", "disable", "allow_unknown", "fail_open", "optional"))]
+    assert found == ["commerce_inventory_check_disabled"]
+    assert type(settings).model_fields["commerce_inventory_check_disabled"].default is False
+
+
+async def test_operator_override_is_off_by_default_and_logged_when_on(monkeypatch, caplog):
+    from types import SimpleNamespace
+
+    from app.services.commerce_inventory import require_commerce_inventory
+
+    rec = SimpleNamespace(id="override-test", productsJson=None, ratiosJson=None)
+    with pytest.raises(Exception):
+        await require_commerce_inventory(None, recommendation=rec, ratios={"top": 30, "middle": 30, "base": 40})
+    monkeypatch.setattr(settings, "commerce_inventory_check_disabled", True)
+    with caplog.at_level("WARNING"):
+        decision = await require_commerce_inventory(None, recommendation=rec, ratios={"top": 30, "middle": 30, "base": 40})
+    assert decision.authorizes(decision.operation_fingerprint)[0] is True
+    assert "COMMERCE_INVENTORY_CHECK_DISABLED" in caplog.text
 
 
 # ===========================================================================
